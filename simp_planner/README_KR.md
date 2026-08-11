@@ -25,4 +25,4 @@ colcon build --symlink-install --packages-select \
 source install/setup.bash
 ```
 
-검증 결과는 최상위 `VALIDATION_KR.md`를 참고하십시오.
+현재 적용 파라미터와 사용 여부는 최상위 `PARAMETERS_KR.md`를 참고하십시오.

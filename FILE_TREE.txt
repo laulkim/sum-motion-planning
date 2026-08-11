@@ -1,7 +1,5 @@
-CHANGELOG_KR.md
 FILE_TREE.txt
-README_KR.md
-VALIDATION_KR.md
+PARAMETERS_KR.md
 planar_velocity_sim/package.xml
 planar_velocity_sim/planar_velocity_sim/__init__.py
 planar_velocity_sim/planar_velocity_sim/kinematics.py
