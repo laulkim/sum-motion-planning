@@ -1,0 +1,11 @@
+build/
+install/
+log/
+simp_planner_debug/
+.claude/
+
+*.o
+*.a
+*.so
+__pycache__/
+*.pyc

@@ -1,0 +1,40 @@
+{
+  "version": "v8",
+  "scenario_types": 13,
+  "cases": 35,
+  "expected_behavior_passed": 35,
+  "expected_behavior_failed": 0,
+  "normal_cases_passed": 32,
+  "normal_cases": 32,
+  "expected_safe_stop_cases_passed": 3,
+  "expected_safe_stop_cases": 3,
+  "safety_collisions": 0,
+  "path_replans": 23,
+  "path_replan_successes": 7,
+  "raw_maximum_plan_ms": 499.116374,
+  "raw_maximum_plan_case": "narrow_28m_corridor @ 3.000000000 m/s",
+  "raw_maximum_plan_time_s": 4.0,
+  "raw_maximum_plan_progress_m": 3.642162817,
+  "raw_maximum_plan_replans": 0,
+  "isolated_repeat_timing": {
+    "narrow_28m_corridor @ 3.0 m/s": {
+      "runs": 5,
+      "min_ms": 25.149239,
+      "median_ms": 25.907053,
+      "max_ms": 37.313579
+    },
+    "s_curve_obstacles @ 5.0 m/s": {
+      "runs": 5,
+      "min_ms": 286.139591,
+      "median_ms": 299.829628,
+      "max_ms": 325.91959
+    }
+  },
+  "notes": [
+    "The 2.80 m narrow_28m_corridor is the primary fixed-specification narrow-corridor pass scenario at 1, 3, and 5 m/s.",
+    "The 2.20 m narrow_22m_stop_corridor is stop-only and passed the pre-entry stop criteria at 0.2, 1, and 3 m/s.",
+    "The raw all-case maximum is an OS scheduling outlier with zero path replans; isolated repeats are reported separately.",
+    "The reproducible algorithmic timing peak occurs in s_curve_obstacles at 5 m/s, t=16.5 s, s=42.4 m, with 12 path replans.",
+    "No executed swept-footprint collision was observed."
+  ]
+}

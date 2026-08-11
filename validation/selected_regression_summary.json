@@ -1,0 +1,29 @@
+{
+  "version": "v8",
+  "cases": 26,
+  "passed": 26,
+  "failed": 0,
+  "safety_collisions": 0,
+  "minimum_clearance_m": 0.102266202,
+  "raw_maximum_plan_ms": 499.116374,
+  "raw_maximum_plan_case": "narrow_28m_corridor @ 3.000000000 m/s",
+  "raw_maximum_plan_time_s": 4.0,
+  "raw_maximum_plan_progress_m": 3.642162817,
+  "raw_maximum_plan_replans": 0,
+  "path_replans": 23,
+  "path_replan_successes": 7,
+  "isolated_repeat_timing": {
+    "narrow_28m_corridor @ 3.0 m/s": {
+      "runs": 5,
+      "min_ms": 25.149239,
+      "median_ms": 25.907053,
+      "max_ms": 37.313579
+    },
+    "s_curve_obstacles @ 5.0 m/s": {
+      "runs": 5,
+      "min_ms": 286.139591,
+      "median_ms": 299.829628,
+      "max_ms": 325.91959
+    }
+  }
+}

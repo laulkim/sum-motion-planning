@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>simp_planner_cpp</name>
+  <version>1.0.0</version>
+  <description>C++17 numerical core for the SIMP path-velocity planner and motion-body allocator.</description>
+  <maintainer email="ske03005@cbnu.ac.kr">Jaepoong Lee</maintainer>
+  <license>Proprietary</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>simp_planner_msgs</depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

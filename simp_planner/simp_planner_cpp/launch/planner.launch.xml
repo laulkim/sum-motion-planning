@@ -1,0 +1,7 @@
+<launch>
+  <node
+    pkg="simp_planner_cpp"
+    exec="planner_node_cpp"
+    name="planner_node"
+    output="screen" />
+</launch>

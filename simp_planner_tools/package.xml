@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>simp_planner_tools</name>
+  <version>1.0.0</version>
+  <description>Scenario input publishers and debug visualization for simp_planner_cpp.</description>
+  <maintainer email="ske03005@cbnu.ac.kr">Jaepoong Lee</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>simp_planner_msgs</exec_depend>
+  <exec_depend>simp_planner_cpp</exec_depend>
+  <exec_depend>planar_velocity_sim</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-matplotlib</exec_depend>
+
+  <test_depend>ament_pytest</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

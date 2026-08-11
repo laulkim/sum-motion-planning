@@ -1,0 +1,96 @@
+SIMP Local Trajectory Planner v8 — 실행 명령어 모음
+====================================================
+
+0. 사전 소싱 (모든 명령 실행 전 필수)
+------------------------------------
+source /opt/ros/jazzy/setup.bash
+source /home/sum/Desktop/simp_planner/install/setup.bash
+
+
+1. 빌드
+-------
+cd /home/sum/Desktop/simp_planner
+colcon build --symlink-install --packages-select \
+  planar_velocity_sim simp_planner_msgs simp_planner_cpp simp_planner_tools
+
+
+2. 시나리오 시뮬레이션 실행 (simulation.launch.py)
+--------------------------------------------------
+planar_velocity_sim_node + scenario_manager_node + planner_node_cpp + debug_plot_node 를
+한 번에 실행합니다.
+
+ros2 launch simp_planner_tools simulation.launch.py \
+  scenario:=narrow_28m_corridor \
+  target_speed:=3.0
+
+사용 가능한 scenario 값 (13종, simp_planner_tools/scenario_definition.py):
+  stadium
+  crab_switch
+  reverse_switch
+  s_curve
+  s_curve_obstacles
+  obstacle_avoidance
+  terminal_safe_region
+  alternating_gate_corridor
+  curved_gate_maze
+  narrow_22m_stop_corridor
+  narrow_28m_corridor
+  narrow_offset_corridor
+  winding_obstacle_course
+
+호환용 alias:
+  narrow_10pct_corridor      -> narrow_22m_stop_corridor
+  narrow_28m_coarse_corridor -> narrow_28m_corridor
+
+simulation.launch.py 주요 launch 인자 (전부 :=값 형태로 override 가능):
+  scenario                                (기본값 stadium)
+  target_speed                            (기본값 -1.0, 음수면 시나리오 기본값 사용)
+  path_update_distance                    (기본값 1.0)
+  mode_transition_duration_sec            (기본값 2.0)
+  command_frequency_hz                    (기본값 100.0)
+  oriented_footprint_circle_count         (기본값 0, 0=시나리오 권장값)
+  costmap_resolution                      (기본값 -1.0, 음수=시나리오 권장값)
+  oriented_footprint_translation_step_m   (기본값 0.20)
+  oriented_footprint_yaw_step_deg         (기본값 2.0)
+  save_period                             (기본값 10.0)
+  debug_output_dir                        (기본값 ~/simp_planner_debug)
+
+
+3. 커스텀 트랙맵 실행 (track_map.launch.py)
+--------------------------------------------
+코드로 정의된 scenario 대신 CSV 트랙맵 파일로 구동합니다.
+
+ros2 launch simp_planner_tools track_map.launch.py \
+  map_file:=/path/to/track.csv \
+  target_speed:=2.0
+
+track_map.launch.py 주요 launch 인자:
+  map_file        (기본값 simp_planner_tools/maps/stadium_track.csv)
+  target_speed    (기본값 2.0)
+  save_period     (기본값 10.0)
+  debug_output_dir(기본값 ~/simp_planner_debug)
+
+
+4. 개별 노드 직접 실행 (디버그용)
+----------------------------------
+ros2 run planar_velocity_sim planar_velocity_sim_node
+ros2 run simp_planner_tools scenario_manager_node --ros-args -p scenario:=stadium
+ros2 run simp_planner_tools track_map_provider_node
+ros2 run simp_planner_tools debug_plot_node
+ros2 run simp_planner_cpp planner_node_cpp
+
+
+5. 검증(validation) 재현
+--------------------------
+ROS2 소싱 불필요 (독립 C++ 바이너리를 g++로 직접 빌드/실행). 어느 디렉터리에서 실행해도 무방.
+
+# 선택 회귀 13개 시나리오
+python3 /home/sum/Desktop/simp_planner/validation/run_validation.py [--skip-build] [--jobs N]
+결과: validation/selected_regression_results.csv / .json
+
+# 13개 시나리오 정의 전체 35개 사례
+python3 /home/sum/Desktop/simp_planner/validation/run_all_scenarios.py [--skip-build] [--jobs N]
+결과: validation/all_scenarios_results.csv / .json
+
+# 단일 시나리오를 검증기용 .svd 바이너리로 export (수동 디버그용)
+python3 /home/sum/Desktop/simp_planner/validation/export_scenario_input.py <scenario_name> <output.svd> [--narrow-gap-width W]

@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>simp_planner_msgs</name>
+  <version>0.1.0</version>
+  <description>Custom interfaces for the SIMP trajectory planner.</description>
+  <maintainer email="ske03005@cbnu.ac.kr">Jaepoong Lee</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <depend>std_msgs</depend>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
