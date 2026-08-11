@@ -1,11 +1,72 @@
+# ROS2 workspace build artifacts
 build/
 install/
 log/
 simp_planner_debug/
 .claude/
 
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
+# C extensions
+*.so
 *.o
 *.a
-*.so
-__pycache__/
-*.pyc
+
+# Distribution / packaging
+.Python
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Environments
+.env
+.envrc
+.venv
+env/
+venv/
+ENV/
+
+# mypy / type checkers
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# IDE
+# .idea/
+# .vscode/
+
+# Jupyter
+.ipynb_checkpoints
