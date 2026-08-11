@@ -155,8 +155,6 @@ max(1.35 × preview + preview_extra,
 | `cruise_acceleration` | 0.8 | m/s² | 활성, nominal 가속도 상한 |
 | `service_deceleration` | 1.0 | m/s² | 활성, nominal 감속도 크기 |
 | `comfort_jerk` | 0.8 | m/s³ | 활성, nominal jerk 상한 |
-| `terminal_position_gain_far` | 0.25 | - | 미사용 |
-| `terminal_speed_gain` | 1.20 | - | 미사용 |
 | `terminal_acceleration_response_time` | 1.00 | s | 활성, terminal jerk feedback 응답 |
 | `terminal_braking_deceleration` | 1.60 | m/s² | 활성, terminal 감속 명령 상한 |
 | `terminal_braking_curve_deceleration` | 0.85 | m/s² | 활성, terminal braking speed envelope |
@@ -167,13 +165,9 @@ max(1.35 × preview + preview_extra,
 | `curvature_lookahead_time` | 2.0 | s | 활성, curve-speed lookahead 시간 |
 | `curvature_lookahead_min` | 8.0 | m | 활성, curve-speed 최소 lookahead 거리 |
 | `lateral_jerk_speed_margin` | 0.30 | ratio | 활성, 횡 jerk 기반 speed limit 안전 배율 |
-| `stop_preview_time` | 0.30 | s | 미사용 |
 | `stop_target_offset` | 0.06 | m | 활성, 실제 path end 전 정지 목표 offset |
-| `stop_distance_margin` | 0.05 | m | 미사용 |
 | `stop_position_tolerance` | 0.05 | m | 활성, terminal capture/회복 위치 허용치 |
 | `stop_speed_threshold` | 0.03 | m/s | 활성, stationary command 판단 |
-| `motion_started_speed` | 0.20 | m/s | 미사용 |
-| `motion_started_progress` | 0.50 | m | 미사용 |
 | `obstacle_speed_backoff_factor` | 0.50 | ratio | 활성, 실패 후 다음 target speed 배율 |
 | `obstacle_speed_recovery_step` | 0.25 | m/s | 활성, feasible speed cap 회복 step |
 | `obstacle_speed_minimum` | 0.50 | m/s | 활성, speed trial 최저값 |

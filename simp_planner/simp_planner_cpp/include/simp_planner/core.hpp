@@ -101,8 +101,6 @@ struct LongitudinalConfig {
   double cruise_acceleration{0.8};
   double service_deceleration{1.0};
   double comfort_jerk{0.8};
-  double terminal_position_gain_far{0.25};
-  double terminal_speed_gain{1.20};
   double terminal_acceleration_response_time{1.00};
   double terminal_braking_deceleration{1.60};
   double terminal_braking_curve_deceleration{0.85};
@@ -113,13 +111,9 @@ struct LongitudinalConfig {
   double curvature_lookahead_time{2.0};
   double curvature_lookahead_min{8.0};
   double lateral_jerk_speed_margin{0.30};
-  double stop_preview_time{0.30};
   double stop_target_offset{0.06};
-  double stop_distance_margin{0.05};
   double stop_position_tolerance{0.05};
   double stop_speed_threshold{0.03};
-  double motion_started_speed{0.20};
-  double motion_started_progress{0.50};
   double obstacle_speed_backoff_factor{0.50};
   double obstacle_speed_recovery_step{0.25};
   double obstacle_speed_minimum{0.50};
