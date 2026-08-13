@@ -13,6 +13,8 @@
 namespace simp_planner {
 namespace {
 
+PlanningCallCounts g_planning_call_counts;
+
 constexpr double kInf = std::numeric_limits<double>::infinity();
 
 template <typename T>
@@ -918,6 +920,10 @@ TerminalRollout TerminalFeedbackController::rollout(
 }  // namespace
 
 // Public utilities and basic classes follow.
+
+void reset_planning_call_counts() { g_planning_call_counts = PlanningCallCounts{}; }
+
+PlanningCallCounts planning_call_counts() { return g_planning_call_counts; }
 
 double wrap_angle(double angle) {
   double wrapped = std::fmod(angle + kPi, 2.0 * kPi);
@@ -2185,6 +2191,18 @@ PlanResult PathVelocityPlanner::plan_at_speed(
   std::vector<Entry> entries;
   std::vector<Entry> all_spatial;
   int candidate_id = 0;
+  // Phase 1: generate every spatial-path candidate across all lateral
+  // targets/length options first. Screening (Phase 2 below) only starts once
+  // this full generation pass is complete.
+  struct GeneratedCandidate {
+    SpatialPathCandidate path;
+    std::string path_mode;
+    int candidate_id{0};
+    double n_target{0.0};
+    bool active_target{false};
+  };
+  std::vector<GeneratedCandidate> generated;
+  ++g_planning_call_counts.spatial_path_generation;
   for (double n_target : config_.lateral.n_targets) {
     auto options = lateral_length_options(state, fr, n_target, config_);
     if (terminal_safe_region_active) {
@@ -2240,42 +2258,48 @@ PlanResult PathVelocityPlanner::plan_at_speed(
       const int generated_candidate_id = candidate_id;
       ++candidate_id;
       if (!candidate) continue;
-      const bool excluded_id = std::find(
-          excluded_candidate_ids.begin(), excluded_candidate_ids.end(),
-          generated_candidate_id) != excluded_candidate_ids.end();
-      const bool excluded_target = std::any_of(
-          excluded_lateral_targets.begin(), excluded_lateral_targets.end(),
-          [n_target](double value) {
-            return std::abs(n_target - value) <= 1.0e-9;
-          });
-      if (excluded_id || excluded_target) continue;
-      auto screen = screen_spatial_candidate(*candidate, state, config_,
-          costmap_ ? &*costmap_ : nullptr, target_speed,
-          terminal_safe_region_active);
-      if (adaptive_replan_active) {
-        screen.screening_cost += (clearance_scale - 1.0) * screen.obstacle_cost;
-        screen.screening_cost -= (1.0 - reference_scale)
-            * candidate->reference_offset_cost;
-        if (failed_lateral_target_) {
-          const double sigma = std::max(
-              config_.adaptive_replan.failed_target_sigma, 1.0e-3);
-          const double normalized = (n_target - *failed_lateral_target_) / sigma;
-          screen.screening_cost += config_.adaptive_replan.failed_target_weight
-              * allocation_failure_severity_
-              * std::exp(-0.5 * normalized * normalized);
-        }
-      }
-      if (active_target && !adaptive_replan_active) {
-        // A safe active maneuver is evaluated first and retained.  Alternative
-        // targets remain available as fallbacks when its temporal rollout is
-        // infeasible, while Allocation-triggered adaptive replanning disables
-        // this lock and may choose a different path.
-        screen.screening_cost -= 1.0e6;
-      }
-      Entry entry{std::move(*candidate), path_mode, screen, false};
-      all_spatial.push_back(entry);
-      if (screen.preview_collision_free) entries.push_back(std::move(entry));
+      generated.push_back(GeneratedCandidate{std::move(*candidate), path_mode,
+          generated_candidate_id, n_target, active_target});
     }
+  }
+
+  // Phase 2: screen every generated candidate now that generation is done.
+  for (auto& gen : generated) {
+    const bool excluded_id = std::find(
+        excluded_candidate_ids.begin(), excluded_candidate_ids.end(),
+        gen.candidate_id) != excluded_candidate_ids.end();
+    const bool excluded_target = std::any_of(
+        excluded_lateral_targets.begin(), excluded_lateral_targets.end(),
+        [&gen](double value) {
+          return std::abs(gen.n_target - value) <= 1.0e-9;
+        });
+    if (excluded_id || excluded_target) continue;
+    auto screen = screen_spatial_candidate(gen.path, state, config_,
+        costmap_ ? &*costmap_ : nullptr, target_speed,
+        terminal_safe_region_active);
+    if (adaptive_replan_active) {
+      screen.screening_cost += (clearance_scale - 1.0) * screen.obstacle_cost;
+      screen.screening_cost -= (1.0 - reference_scale)
+          * gen.path.reference_offset_cost;
+      if (failed_lateral_target_) {
+        const double sigma = std::max(
+            config_.adaptive_replan.failed_target_sigma, 1.0e-3);
+        const double normalized = (gen.n_target - *failed_lateral_target_) / sigma;
+        screen.screening_cost += config_.adaptive_replan.failed_target_weight
+            * allocation_failure_severity_
+            * std::exp(-0.5 * normalized * normalized);
+      }
+    }
+    if (gen.active_target && !adaptive_replan_active) {
+      // A safe active maneuver is evaluated first and retained.  Alternative
+      // targets remain available as fallbacks when its temporal rollout is
+      // infeasible, while Allocation-triggered adaptive replanning disables
+      // this lock and may choose a different path.
+      screen.screening_cost -= 1.0e6;
+    }
+    Entry entry{std::move(gen.path), gen.path_mode, screen, false};
+    all_spatial.push_back(entry);
+    if (screen.preview_collision_free) entries.push_back(std::move(entry));
   }
 
   bool short_path_fallback_active = false;
@@ -2286,6 +2310,7 @@ PlanResult PathVelocityPlanner::plan_at_speed(
         required_stop_distance + config_.lateral.short_path_stop_reserve
             + config_.longitudinal.stop_target_offset);
     std::vector<Entry> short_entries;
+    ++g_planning_call_counts.spatial_path_generation;
     for (const auto& source : all_spatial) {
       if (!source.screen.curvature_valid
           || !std::isfinite(source.screen.first_coarse_collision_length)) {
@@ -2392,6 +2417,7 @@ PlanResult PathVelocityPlanner::plan_at_speed(
   std::vector<FullCandidate> full;
   std::size_t cursor = 0;
   bool first_batch = true;
+  if (!entries.empty()) ++g_planning_call_counts.trajectory_planning;
   while (cursor < entries.size()) {
     const int batch_size = first_batch
         ? std::max(1, terminal_safe_region_active ? config_.lateral.terminal_shortlist_size
@@ -2541,6 +2567,7 @@ PlanResult PathVelocityPlanner::plan_at_speed(
     bool braking_fallback_safe = false;
     if (best != full.end()) {
       const bool local_stop = best->short_path_stop;
+      ++g_planning_call_counts.trajectory_planning;
       auto braking = generate_open_loop_trajectory(
           best->path, state, previous_action, map_end_mode || local_stop, config_,
           costmap_ ? &*costmap_ : nullptr, true,
@@ -2964,6 +2991,7 @@ AllocationSelectionResult allocate_with_oriented_collision_search(
     const CostConfig& cost,
     std::optional<AllocatorInitialState> initial_state,
     const OrientedFootprintConfig& footprint) {
+  ++g_planning_call_counts.allocation;
   const bool crab_mode = std::any_of(
       trajectory.drive_mode.begin(), trajectory.drive_mode.end(),
       [](DriveMode mode) { return mode == DriveMode::Left || mode == DriveMode::Right; });

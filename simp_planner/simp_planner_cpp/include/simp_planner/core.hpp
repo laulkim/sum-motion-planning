@@ -22,6 +22,17 @@ struct PlanningCommand {
   DriveMode drive_mode{DriveMode::Forward};
 };
 
+// Per-cycle call counters for the three core planning stages, used for
+// runtime profiling/visualization (not part of the planning logic itself).
+struct PlanningCallCounts {
+  int spatial_path_generation{0};
+  int trajectory_planning{0};
+  int allocation{0};
+};
+
+void reset_planning_call_counts();
+PlanningCallCounts planning_call_counts();
+
 struct PlannerState {
   double x{0.0};
   double y{0.0};

@@ -81,6 +81,9 @@ struct ExecutablePlan {
   int outer_speed_attempts{1};
   int path_replans{0};
   double compute_ms{0.0};
+  int spatial_path_generation_calls{0};
+  int trajectory_planning_calls{0};
+  int allocation_calls{0};
 };
 
 struct InputSnapshot {
@@ -599,6 +602,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
     if (!token) return;
 
     try {
+      simp_planner::reset_planning_call_counts();
       ensure_planner(*input);
       const auto start_wall = std::chrono::steady_clock::now();
       const auto scheduled_start = align_time_ns(
@@ -738,6 +742,10 @@ class PlannerNodeCpp final : public rclcpp::Node {
       executable->outer_speed_attempts = outer_speed_attempts;
       executable->path_replans = path_replans;
       executable->compute_ms = elapsed_sec * 1000.0;
+      const auto call_counts = simp_planner::planning_call_counts();
+      executable->spatial_path_generation_calls = call_counts.spatial_path_generation;
+      executable->trajectory_planning_calls = call_counts.trajectory_planning;
+      executable->allocation_calls = call_counts.allocation;
       bool registration_stale = false;
       {
         // Register the plan atomically with respect to input revision updates
@@ -1150,7 +1158,11 @@ class PlannerNodeCpp final : public rclcpp::Node {
            << plan.allocation_candidates_evaluated
            << ",\"footprint_circle_count\":" << plan.footprint_circle_count
            << ",\"outer_speed_attempts\":" << plan.outer_speed_attempts
-           << ",\"path_replans\":" << plan.path_replans << "}"
+           << ",\"path_replans\":" << plan.path_replans
+           << ",\"spatial_path_generation_calls\":"
+           << plan.spatial_path_generation_calls
+           << ",\"trajectory_planning_calls\":" << plan.trajectory_planning_calls
+           << ",\"allocation_calls\":" << plan.allocation_calls << "}"
            << ",\"timing\":{"
            << "\"deadline_ms\":100.0"
            << ",\"handover_lead_sec\":"
