@@ -28,10 +28,30 @@ struct PlanningCallCounts {
   int spatial_path_generation{0};
   int trajectory_planning{0};
   int allocation{0};
+  // Raw number of generate_spatial_path_candidate() invocations, including
+  // every curvature-violation retry (up to 8x recursive re-attempts with an
+  // extended length) and the short-path fallback pass. Unlike
+  // spatial_path_generation above (one per generation-phase entry), this
+  // counts every individual candidate-generation attempt.
+  int spatial_candidate_generation_attempts{0};
+};
+
+// Per-cycle accumulated wall-clock time (milliseconds) for the same three
+// stages. Spatial path generation and trajectory generation each split into
+// a "normal" and a "terminal/stop" bucket, since the two take different
+// code paths with different cost; allocation (which also performs the
+// trajectory-level collision check) has a single bucket.
+struct PlanningBlockTimings {
+  double spatial_normal_ms{0.0};
+  double spatial_terminal_ms{0.0};
+  double trajectory_normal_ms{0.0};
+  double trajectory_terminal_ms{0.0};
+  double allocation_ms{0.0};
 };
 
 void reset_planning_call_counts();
 PlanningCallCounts planning_call_counts();
+PlanningBlockTimings planning_block_timings();
 
 struct PlannerState {
   double x{0.0};

@@ -14,6 +14,25 @@ namespace simp_planner {
 namespace {
 
 PlanningCallCounts g_planning_call_counts;
+PlanningBlockTimings g_planning_block_timings;
+
+// Accumulates elapsed wall-clock time into `bucket_ms` for the lifetime of
+// the scope it's declared in, regardless of how that scope is exited.
+class ScopedBlockTimer {
+ public:
+  explicit ScopedBlockTimer(double& bucket_ms)
+      : bucket_ms_(bucket_ms), start_(std::chrono::steady_clock::now()) {}
+  ~ScopedBlockTimer() {
+    bucket_ms_ += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start_).count();
+  }
+  ScopedBlockTimer(const ScopedBlockTimer&) = delete;
+  ScopedBlockTimer& operator=(const ScopedBlockTimer&) = delete;
+
+ private:
+  double& bucket_ms_;
+  std::chrono::steady_clock::time_point start_;
+};
 
 constexpr double kInf = std::numeric_limits<double>::infinity();
 
@@ -476,6 +495,7 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
     const ManeuverProfileState* maneuver_profile = nullptr,
     int curvature_retry_depth = 0,
     bool hard_preview_limit = false) {
+  ++g_planning_call_counts.spatial_candidate_generation_attempts;
   const double real_end_s = reference.s_max() - cfg.simulation.path_end_margin;
   const double remaining_real = std::max(real_end_s - fr.s, 0.0);
   const auto boundary = initial_spatial_boundaries(state, previous_action, fr, cfg, reference);
@@ -921,9 +941,14 @@ TerminalRollout TerminalFeedbackController::rollout(
 
 // Public utilities and basic classes follow.
 
-void reset_planning_call_counts() { g_planning_call_counts = PlanningCallCounts{}; }
+void reset_planning_call_counts() {
+  g_planning_call_counts = PlanningCallCounts{};
+  g_planning_block_timings = PlanningBlockTimings{};
+}
 
 PlanningCallCounts planning_call_counts() { return g_planning_call_counts; }
+
+PlanningBlockTimings planning_block_timings() { return g_planning_block_timings; }
 
 double wrap_angle(double angle) {
   double wrapped = std::fmod(angle + kPi, 2.0 * kPi);
@@ -2191,6 +2216,12 @@ PlanResult PathVelocityPlanner::plan_at_speed(
   std::vector<Entry> entries;
   std::vector<Entry> all_spatial;
   int candidate_id = 0;
+  bool short_path_fallback_active = false;
+  double short_path_length = 0.0;
+  {
+  ScopedBlockTimer spatial_block_timer(terminal_safe_region_active
+      ? g_planning_block_timings.spatial_terminal_ms
+      : g_planning_block_timings.spatial_normal_ms);
   // Phase 1: generate every spatial-path candidate across all lateral
   // targets/length options first. Screening (Phase 2 below) only starts once
   // this full generation pass is complete.
@@ -2302,8 +2333,6 @@ PlanResult PathVelocityPlanner::plan_at_speed(
     if (screen.preview_collision_free) entries.push_back(std::move(entry));
   }
 
-  bool short_path_fallback_active = false;
-  double short_path_length = 0.0;
   if (entries.empty() && config_.lateral.short_path_fallback_enabled && costmap_) {
     const double minimum_stop_length = std::max(
         config_.lateral.min_length,
@@ -2342,6 +2371,7 @@ PlanResult PathVelocityPlanner::plan_at_speed(
       short_path_fallback_active = true;
     }
   }
+  }  // end spatial_block_timer scope
 
   std::vector<std::size_t> center_indices;
   for (std::size_t i = 0; i < entries.size(); ++i) {
@@ -2418,6 +2448,10 @@ PlanResult PathVelocityPlanner::plan_at_speed(
   std::size_t cursor = 0;
   bool first_batch = true;
   if (!entries.empty()) ++g_planning_call_counts.trajectory_planning;
+  {
+  ScopedBlockTimer trajectory_block_timer(terminal_mode_active
+      ? g_planning_block_timings.trajectory_terminal_ms
+      : g_planning_block_timings.trajectory_normal_ms);
   while (cursor < entries.size()) {
     const int batch_size = first_batch
         ? std::max(1, terminal_safe_region_active ? config_.lateral.terminal_shortlist_size
@@ -2444,6 +2478,7 @@ PlanResult PathVelocityPlanner::plan_at_speed(
     first_batch = false;
     if (batch_safe) break;
   }
+  }  // end trajectory_block_timer scope
 
   int selected = -1;
   for (std::size_t i = 0; i < full.size(); ++i) {
@@ -2568,11 +2603,17 @@ PlanResult PathVelocityPlanner::plan_at_speed(
     if (best != full.end()) {
       const bool local_stop = best->short_path_stop;
       ++g_planning_call_counts.trajectory_planning;
-      auto braking = generate_open_loop_trajectory(
+      TimeTrajectory braking;
+      {
+      ScopedBlockTimer braking_block_timer(terminal_mode_active
+          ? g_planning_block_timings.trajectory_terminal_ms
+          : g_planning_block_timings.trajectory_normal_ms);
+      braking = generate_open_loop_trajectory(
           best->path, state, previous_action, map_end_mode || local_stop, config_,
           costmap_ ? &*costmap_ : nullptr, true,
           terminal_constraint_active || local_stop,
           terminal_mode_active || local_stop, target_speed, false);
+      }  // end braking_block_timer scope
       if (braking.safe()) {
         result.trajectory = std::move(braking);
         braking_fallback_safe = true;
@@ -2992,6 +3033,7 @@ AllocationSelectionResult allocate_with_oriented_collision_search(
     std::optional<AllocatorInitialState> initial_state,
     const OrientedFootprintConfig& footprint) {
   ++g_planning_call_counts.allocation;
+  ScopedBlockTimer allocation_block_timer(g_planning_block_timings.allocation_ms);
   const bool crab_mode = std::any_of(
       trajectory.drive_mode.begin(), trajectory.drive_mode.end(),
       [](DriveMode mode) { return mode == DriveMode::Left || mode == DriveMode::Right; });

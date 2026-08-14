@@ -84,6 +84,12 @@ struct ExecutablePlan {
   int spatial_path_generation_calls{0};
   int trajectory_planning_calls{0};
   int allocation_calls{0};
+  int spatial_candidate_generation_attempts{0};
+  double spatial_normal_ms{0.0};
+  double spatial_terminal_ms{0.0};
+  double trajectory_normal_ms{0.0};
+  double trajectory_terminal_ms{0.0};
+  double allocation_block_ms{0.0};
 };
 
 struct InputSnapshot {
@@ -746,6 +752,14 @@ class PlannerNodeCpp final : public rclcpp::Node {
       executable->spatial_path_generation_calls = call_counts.spatial_path_generation;
       executable->trajectory_planning_calls = call_counts.trajectory_planning;
       executable->allocation_calls = call_counts.allocation;
+      executable->spatial_candidate_generation_attempts =
+          call_counts.spatial_candidate_generation_attempts;
+      const auto block_timings = simp_planner::planning_block_timings();
+      executable->spatial_normal_ms = block_timings.spatial_normal_ms;
+      executable->spatial_terminal_ms = block_timings.spatial_terminal_ms;
+      executable->trajectory_normal_ms = block_timings.trajectory_normal_ms;
+      executable->trajectory_terminal_ms = block_timings.trajectory_terminal_ms;
+      executable->allocation_block_ms = block_timings.allocation_ms;
       bool registration_stale = false;
       {
         // Register the plan atomically with respect to input revision updates
@@ -1162,7 +1176,14 @@ class PlannerNodeCpp final : public rclcpp::Node {
            << ",\"spatial_path_generation_calls\":"
            << plan.spatial_path_generation_calls
            << ",\"trajectory_planning_calls\":" << plan.trajectory_planning_calls
-           << ",\"allocation_calls\":" << plan.allocation_calls << "}"
+           << ",\"allocation_calls\":" << plan.allocation_calls
+           << ",\"spatial_candidate_generation_attempts\":"
+           << plan.spatial_candidate_generation_attempts
+           << ",\"spatial_normal_ms\":" << plan.spatial_normal_ms
+           << ",\"spatial_terminal_ms\":" << plan.spatial_terminal_ms
+           << ",\"trajectory_normal_ms\":" << plan.trajectory_normal_ms
+           << ",\"trajectory_terminal_ms\":" << plan.trajectory_terminal_ms
+           << ",\"allocation_block_ms\":" << plan.allocation_block_ms << "}"
            << ",\"timing\":{"
            << "\"deadline_ms\":100.0"
            << ",\"handover_lead_sec\":"

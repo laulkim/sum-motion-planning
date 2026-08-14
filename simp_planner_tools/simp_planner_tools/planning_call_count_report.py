@@ -26,12 +26,60 @@ CATEGORIES = (
     ("allocation_calls", "Allocation"),
 )
 
+# Per-activated-plan accumulated wall-clock time (ms) for each measured
+# block. Spatial path generation and trajectory generation each take a
+# different code path (and cost) depending on whether the cycle is a normal
+# cruise cycle or a terminal/stop-point cycle, so those two are split into
+# separate series. Allocation (which also performs the trajectory-level
+# collision check) is a single series.
+BLOCK_TIMING_PANELS = (
+    (
+        "Spatial path generation + collision check",
+        (
+            ("spatial_normal_ms", "normal", "tab:blue"),
+            ("spatial_terminal_ms", "terminal / stop-region", "tab:orange"),
+        ),
+    ),
+    (
+        "Trajectory generation",
+        (
+            ("trajectory_normal_ms", "cruise", "tab:blue"),
+            ("trajectory_terminal_ms", "stop", "tab:orange"),
+        ),
+    ),
+    (
+        "Motion allocation + collision check",
+        (
+            ("allocation_block_ms", "allocation", "tab:green"),
+        ),
+    ),
+)
+
+# Raw generate_spatial_path_candidate() invocation count, including every
+# curvature-violation retry (up to 8x recursive re-attempts with an extended
+# length) and the short-path fallback pass. Plotted against the Spatial path
+# generation + collision check block time to check whether the two are
+# proportional.
+SPATIAL_ATTEMPTS_KEY = "spatial_candidate_generation_attempts"
+
+REQUIRED_KEYS = (
+    tuple(key for key, _ in CATEGORIES)
+    + tuple(key for _, series in BLOCK_TIMING_PANELS for key, _, _ in series)
+    + (SPATIAL_ATTEMPTS_KEY,)
+)
+
 
 def create_call_count_figure(samples: list[dict[str, float | int]]) -> Figure:
-    """Build a time-aligned call-count and planning-time figure."""
+    """Build a time-aligned call-count/compute-time figure plus one
+    sub-plot per measured planner block."""
     time_sec = [float(sample["time_s"]) for sample in samples]
 
-    fig, count_ax = plt.subplots(figsize=(10, 5.0))
+    panel_count = 1 + len(BLOCK_TIMING_PANELS) + 1
+    fig, axes = plt.subplots(
+        panel_count, 1, figsize=(10, 4.5 + 3.0 * (panel_count - 1)),
+        sharex=True,
+    )
+    count_ax = axes[0]
     for key, label in CATEGORIES:
         values = [int(sample[key]) for sample in samples]
         count_ax.plot(
@@ -41,7 +89,6 @@ def create_call_count_figure(samples: list[dict[str, float | int]]) -> Figure:
     count_ax.yaxis.set_major_locator(MultipleLocator(1))
     count_ax.yaxis.set_major_formatter(lambda value, _pos: f"{value:.0f}")
     count_ax.set_ylim(bottom=0)
-    count_ax.set_xlabel("time [s]")
     count_ax.set_ylabel("stage invocations per activated plan")
     count_ax.grid(True, alpha=0.3)
 
@@ -72,6 +119,59 @@ def create_call_count_figure(samples: list[dict[str, float | int]]) -> Figure:
         f"Planner stage invocations and computation time "
         f"({len(samples)} activated plans)"
     )
+
+    for panel_ax, (title, series) in zip(axes[1:], BLOCK_TIMING_PANELS):
+        for key, label, color in series:
+            values = [float(sample[key]) for sample in samples]
+            panel_ax.plot(
+                time_sec, values, label=f"{label} (mean {mean(values):.2f} ms)",
+                color=color, marker="o", markersize=2, linewidth=1,
+            )
+        panel_ax.set_ylim(bottom=0)
+        panel_ax.set_ylabel("block time [ms]")
+        panel_ax.set_title(title)
+        panel_ax.grid(True, alpha=0.3)
+        panel_ax.legend(loc="best", fontsize=8)
+
+    # Debug panel: raw candidate-generation attempt count (every
+    # generate_spatial_path_candidate() call, including curvature retries)
+    # against the Spatial path generation + collision check block time, to
+    # see at a glance whether the two track each other.
+    attempts_ax = axes[-1]
+    attempts = [int(sample[SPATIAL_ATTEMPTS_KEY]) for sample in samples]
+    attempts_line = attempts_ax.plot(
+        time_sec, attempts, color="tab:red", marker="o", markersize=2, linewidth=1,
+        label=f"Spatial candidate-generation attempts (mean {mean(attempts):.1f})",
+    )
+    attempts_ax.set_ylim(bottom=0)
+    attempts_ax.set_ylabel("candidate-generation attempts", color="tab:red")
+    attempts_ax.tick_params(axis="y", labelcolor="tab:red")
+    attempts_ax.grid(True, alpha=0.3)
+
+    spatial_time_ax = attempts_ax.twinx()
+    spatial_ms = [
+        float(sample["spatial_normal_ms"]) + float(sample["spatial_terminal_ms"])
+        for sample in samples
+    ]
+    spatial_time_line = spatial_time_ax.plot(
+        time_sec, spatial_ms, color="tab:blue", alpha=0.7,
+        marker=".", markersize=3, linewidth=1,
+        label=f"Spatial gen+check time (mean {mean(spatial_ms):.2f} ms)",
+    )
+    spatial_time_ax.set_ylim(bottom=0)
+    spatial_time_ax.set_ylabel("spatial gen+check time [ms]", color="tab:blue")
+    spatial_time_ax.tick_params(axis="y", labelcolor="tab:blue")
+
+    attempts_ax.set_title(
+        "Spatial candidate-generation attempts vs. block time (proportionality check)"
+    )
+    attempts_ax.legend(
+        attempts_line + spatial_time_line,
+        [line.get_label() for line in attempts_line + spatial_time_line],
+        loc="best", fontsize=8,
+    )
+
+    axes[-1].set_xlabel("time [s]")
     fig.tight_layout()
     return fig
 
@@ -86,7 +186,8 @@ def render_call_count_report(
 
 class PlanningCallCountReportNode(Node):
     """Counts how often spatial-path-generation / trajectory-planning /
-    allocation run per activated plan, then renders a summary PNG on shutdown."""
+    allocation run per activated plan, and how much wall-clock time each
+    block spends, then renders a summary PNG on shutdown."""
 
     def __init__(self) -> None:
         super().__init__("planning_call_count_report_node")
@@ -124,7 +225,7 @@ class PlanningCallCountReportNode(Node):
         except json.JSONDecodeError:
             return
         plan = value.get("plan", {})
-        if not all(key in plan for key, _ in CATEGORIES):
+        if not all(key in plan for key in REQUIRED_KEYS):
             return
         if "total_compute_time_ms" not in plan:
             return
@@ -133,6 +234,11 @@ class PlanningCallCountReportNode(Node):
             "total_compute_time_ms": float(plan["total_compute_time_ms"]),
         }
         sample.update({key: int(plan[key]) for key, _ in CATEGORIES})
+        sample.update(
+            {key: float(plan[key])
+             for _, series in BLOCK_TIMING_PANELS for key, _, _ in series}
+        )
+        sample[SPATIAL_ATTEMPTS_KEY] = int(plan[SPATIAL_ATTEMPTS_KEY])
         self.samples.append(sample)
 
     def save_report(self) -> None:
