@@ -291,7 +291,9 @@ bool JerkLimitedSafetyStop::stopped() const {
 
 double JerkLimitedSafetyStop::current_jerk(double dt) const {
   if (stopped()) return 0.0;
-  const double release_speed = std::pow(std::min(acceleration_, 0.0), 2) / (2.0 * jerk_limit_);
+  const double braking_acceleration = std::min(acceleration_, 0.0);
+  const double release_speed = braking_acceleration * braking_acceleration /
+      (2.0 * jerk_limit_);
   const double release_margin = std::max(0.5 * std::abs(acceleration_) * dt, 1.0e-5);
   if (acceleration_ < -1.0e-9 && speed_ <= release_speed + release_margin) return jerk_limit_;
   if (acceleration_ > -deceleration_limit_ + 1.0e-9) return -jerk_limit_;

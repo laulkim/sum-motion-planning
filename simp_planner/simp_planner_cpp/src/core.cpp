@@ -1,6 +1,7 @@
 #include "simp_planner/core.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -144,6 +145,32 @@ struct ProfileResult {
   std::vector<double> dddp;
 };
 
+double multiply_add(double multiplicand, double multiplier, double addend) {
+#if defined(__FMA__)
+  return std::fma(multiplicand, multiplier, addend);
+#else
+  return multiplicand * multiplier + addend;
+#endif
+}
+
+template <std::size_t N>
+double evaluate_polynomial_horner(const std::array<double, N>& coefficients,
+                                  double value) {
+  static_assert(N > 0, "a polynomial must contain at least one coefficient");
+  double result = coefficients.back();
+  for (std::size_t index = N - 1; index > 0; --index) {
+    result = multiply_add(result, value, coefficients[index - 1]);
+  }
+  return result;
+}
+
+double jerk_integrated_distance(double speed, double acceleration,
+                                double jerk, double duration) {
+  const double quadratic = multiply_add(
+      jerk / 6.0, duration, 0.5 * acceleration);
+  return duration * multiply_add(quadratic, duration, speed);
+}
+
 ProfileResult septic_boundary_profile(const std::vector<double>& q,
                                       double length,
                                       double p0,
@@ -167,6 +194,18 @@ ProfileResult septic_boundary_profile(const std::vector<double>& q,
   const double b6 = 70.0 * rhs[0] - 34.0 * rhs[1] + 6.5 * rhs[2] - 0.5 * rhs[3];
   const double b7 = -20.0 * rhs[0] + 10.0 * rhs[1] - 2.0 * rhs[2] + rhs[3] / 6.0;
   const std::array<double, 8> c{{b0, b1, b2, b3, b4, b5, b6, b7}};
+  const std::array<double, 7> dc{{
+      b1, 2.0 * b2, 3.0 * b3, 4.0 * b4,
+      5.0 * b5, 6.0 * b6, 7.0 * b7}};
+  const std::array<double, 6> ddc{{
+      2.0 * b2, 6.0 * b3, 12.0 * b4,
+      20.0 * b5, 30.0 * b6, 42.0 * b7}};
+  const std::array<double, 5> dddc{{
+      6.0 * b3, 24.0 * b4, 60.0 * b5,
+      120.0 * b6, 210.0 * b7}};
+  const double inv_L = 1.0 / L;
+  const double inv_L2 = inv_L * inv_L;
+  const double inv_L3 = inv_L2 * inv_L;
 
   ProfileResult result;
   result.p.resize(q.size());
@@ -175,33 +214,18 @@ ProfileResult septic_boundary_profile(const std::vector<double>& q,
   result.dddp.resize(q.size());
   for (std::size_t k = 0; k < q.size(); ++k) {
     const bool active = q[k] <= L;
+    if (!active) {
+      result.p[k] = p1;
+      result.dp[k] = 0.0;
+      result.ddp[k] = 0.0;
+      result.dddp[k] = 0.0;
+      continue;
+    }
     const double tau = clamp_value(q[k] / L, 0.0, 1.0);
-    double p = 0.0;
-    double dp = 0.0;
-    double ddp = 0.0;
-    double dddp = 0.0;
-    double power = 1.0;
-    for (int i = 0; i < 8; ++i) {
-      p += c[static_cast<std::size_t>(i)] * power;
-      power *= tau;
-    }
-    for (int i = 1; i < 8; ++i) {
-      dp += static_cast<double>(i) * c[static_cast<std::size_t>(i)] *
-            std::pow(tau, i - 1) / L;
-    }
-    for (int i = 2; i < 8; ++i) {
-      ddp += static_cast<double>(i * (i - 1)) * c[static_cast<std::size_t>(i)] *
-             std::pow(tau, i - 2) / (L * L);
-    }
-    for (int i = 3; i < 8; ++i) {
-      dddp += static_cast<double>(i * (i - 1) * (i - 2)) *
-              c[static_cast<std::size_t>(i)] * std::pow(tau, i - 3) /
-              (L * L * L);
-    }
-    result.p[k] = active ? p : p1;
-    result.dp[k] = active ? dp : 0.0;
-    result.ddp[k] = active ? ddp : 0.0;
-    result.dddp[k] = active ? dddp : 0.0;
+    result.p[k] = evaluate_polynomial_horner(c, tau);
+    result.dp[k] = evaluate_polynomial_horner(dc, tau) * inv_L;
+    result.ddp[k] = evaluate_polynomial_horner(ddc, tau) * inv_L2;
+    result.dddp[k] = evaluate_polynomial_horner(dddc, tau) * inv_L3;
   }
   return result;
 }
@@ -244,22 +268,27 @@ ProfileResult terminal_position_profile(const std::vector<double>& q,
                                         double p1,
                                         double blend) {
   const double L = std::max(length, 1.0e-6);
+  const double L2 = L * L;
+  const double L4 = L2 * L2;
   const double c4 = (p1 - p0 - dp0 * L - 0.5 * ddp0 * L * L
                     - (1.0 / 6.0) * dddp0 * L * L * L) /
-                    std::pow(L, 4.0);
+                    L4;
   const auto seventh = septic_boundary_profile(q, L, p0, dp0, ddp0, dddp0, p1);
   const double b = clamp_value(blend, 0.0, 1.0);
   ProfileResult out;
   out.p.resize(q.size()); out.dp.resize(q.size()); out.ddp.resize(q.size()); out.dddp.resize(q.size());
   for (std::size_t i = 0; i < q.size(); ++i) {
     const double qc = clamp_value(q[i], 0.0, L);
-    const double p4 = p0 + dp0 * qc + 0.5 * ddp0 * qc * qc
-                    + (1.0 / 6.0) * dddp0 * std::pow(qc, 3.0)
-                    + c4 * std::pow(qc, 4.0);
-    const double dp4 = dp0 + ddp0 * qc + 0.5 * dddp0 * qc * qc
-                     + 4.0 * c4 * std::pow(qc, 3.0);
-    const double ddp4 = ddp0 + dddp0 * qc + 12.0 * c4 * qc * qc;
-    const double dddp4 = dddp0 + 24.0 * c4 * qc;
+    double p4 = multiply_add(c4, qc, dddp0 / 6.0);
+    p4 = multiply_add(p4, qc, 0.5 * ddp0);
+    p4 = multiply_add(p4, qc, dp0);
+    p4 = multiply_add(p4, qc, p0);
+    double dp4 = multiply_add(4.0 * c4, qc, 0.5 * dddp0);
+    dp4 = multiply_add(dp4, qc, ddp0);
+    dp4 = multiply_add(dp4, qc, dp0);
+    const double ddp4 = multiply_add(
+        multiply_add(12.0 * c4, qc, dddp0), qc, ddp0);
+    const double dddp4 = multiply_add(24.0 * c4, qc, dddp0);
     out.p[i] = (1.0 - b) * p4 + b * seventh.p[i];
     out.dp[i] = (1.0 - b) * dp4 + b * seventh.dp[i];
     out.ddp[i] = (1.0 - b) * ddp4 + b * seventh.ddp[i];
@@ -396,9 +425,10 @@ std::pair<double, double> offset_path_curvature(double n, double n1, double n2,
   const double A = 1.0 - kappa_ref * n;
   const double B = n1;
   const double D = std::max(A * A + B * B, 1.0e-10);
+  const double sqrt_D = std::sqrt(D);
   const double A_prime = -kappa_ref_s * n - kappa_ref * B;
   const double numerator = kappa_ref * D + A * n2 - B * A_prime;
-  return {numerator / std::pow(D, 1.5), std::sqrt(D)};
+  return {numerator / (D * sqrt_D), sqrt_D};
 }
 
 InitialSpatialBoundary initial_spatial_boundaries(
@@ -421,8 +451,9 @@ InitialSpatialBoundary initial_spatial_boundaries(
       + motion_weight * measured_curvature;
   const double B = result.n1;
   const double D = A * A + B * B;
+  const double D_to_three_halves = D * std::sqrt(D);
   const double A_prime = -fr.kappa_s * result.n0 - fr.kappa * B;
-  result.n2 = clamp_value((k_vehicle * std::pow(D, 1.5) - fr.kappa * D + B * A_prime) / A,
+  result.n2 = clamp_value((k_vehicle * D_to_three_halves - fr.kappa * D + B * A_prime) / A,
                           -0.35, 0.35);
   const double measured_kappa_l = (previous_action.motion_heading_acceleration
       - state.acceleration * k_vehicle) /
@@ -615,7 +646,7 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
     const double D = std::max(A * A + profile.dp[i] * profile.dp[i], 1.0e-10);
     const double A_prime = -ref.kappa_s[i] * profile.p[i] - ref.kappa[i] * profile.dp[i];
     kappa[i] = (ref.kappa[i] * D + A * profile.ddp[i] - profile.dp[i] * A_prime) /
-               std::pow(D, 1.5);
+               (D * std::sqrt(D));
   }
   auto kappa_l = gradient(kappa, arc, false);
   if (maneuver_profile == nullptr) {
@@ -768,8 +799,8 @@ class TerminalFeedbackController {
         : std::min(c.jerk_max, lc.terminal_jerk_limit), 1.0e-6);
     double ramp_time = std::max((a + curve_deceleration) / jerk_limit, 0.0);
     ramp_time = std::min(ramp_time, 2.0);
-    const double ramp_distance = std::max(v * ramp_time + 0.5 * a * ramp_time * ramp_time
-        - jerk_limit * std::pow(ramp_time, 3.0) / 6.0, 0.0);
+    const double ramp_distance = std::max(
+        jerk_integrated_distance(v, a, -jerk_limit, ramp_time), 0.0);
     const double speed_after = std::max(v + a * ramp_time - 0.5 * jerk_limit * ramp_time * ramp_time, 0.0);
     return ramp_distance + speed_after * speed_after / (2.0 * curve_deceleration)
         + lc.terminal_braking_distance_buffer + cfg_.terminal.activation_margin;
@@ -811,8 +842,8 @@ class TerminalFeedbackController {
     double ramp_time = std::max((a + curve_deceleration) /
                                 std::max(jerk_limit, 1.0e-6), 0.0);
     ramp_time = std::min(ramp_time, 2.0);
-    const double ramp_distance = std::max(v * ramp_time + 0.5 * a * ramp_time * ramp_time
-        - jerk_limit * std::pow(ramp_time, 3.0) / 6.0, 0.0);
+    const double ramp_distance = std::max(
+        jerk_integrated_distance(v, a, -jerk_limit, ramp_time), 0.0);
     const double effective_error = std::max(e - lc.terminal_braking_distance_buffer - ramp_distance, 0.0);
     const double braking_speed = std::sqrt(2.0 * curve_deceleration * effective_error);
     // The requested speed is a required planner input.  The braking envelope
@@ -918,13 +949,13 @@ TerminalRollout TerminalFeedbackController::rollout(
     double v_next = 0.0;
     if (stop_time || v_trial <= 0.0) {
       const double use = stop_time ? *stop_time : dt;
-      distance = std::max(v * use + 0.5 * a * use * use
-          + effective_jerk * std::pow(use, 3.0) / 6.0, 0.0);
+      distance = std::max(
+          jerk_integrated_distance(v, a, effective_jerk, use), 0.0);
       v_next = 0.0; a_next = 0.0;
     } else {
       v_next = clamp_value(v_trial, c.v_min, c.v_max);
-      distance = std::max(v * dt + 0.5 * a * dt * dt
-          + effective_jerk * std::pow(dt, 3.0) / 6.0, 0.0);
+      distance = std::max(
+          jerk_integrated_distance(v, a, effective_jerk, dt), 0.0);
     }
     const double s_next = s + distance;
     if (s_next > stop_target + tc.longitudinal_tolerance) {
@@ -1572,14 +1603,12 @@ TimeTrajectory generate_open_loop_trajectory(
     double v_next = 0.0;
     if (stop_time || v_trial <= 0.0) {
       const double use = stop_time ? *stop_time : dt;
-      distance = std::max(v * use + 0.5 * a * use * use
-          + jerk * std::pow(use, 3.0) / 6.0, 0.0);
+      distance = std::max(jerk_integrated_distance(v, a, jerk, use), 0.0);
       v_next = 0.0;
       a_next = 0.0;
     } else {
       v_next = clamp_value(v_trial, c.v_min, c.v_max);
-      distance = std::max(v * dt + 0.5 * a * dt * dt
-          + jerk * std::pow(dt, 3.0) / 6.0, 0.0);
+      distance = std::max(jerk_integrated_distance(v, a, jerk, dt), 0.0);
     }
     const double l_next = l_progress + distance;
     const double q_next = interpolate_reference_progress(path, l_next);
@@ -1669,8 +1698,8 @@ TimeTrajectory generate_open_loop_trajectory(
       double speed = std::max(state.speed + state.acceleration * tau
           + 0.5 * action.longitudinal_jerk * tau * tau, 0.0);
       double acceleration = state.acceleration + action.longitudinal_jerk * tau;
-      double distance = std::max(state.speed * tau + 0.5 * state.acceleration * tau * tau
-          + action.longitudinal_jerk * std::pow(tau, 3.0) / 6.0, 0.0);
+      double distance = std::max(jerk_integrated_distance(
+          state.speed, state.acceleration, action.longitudinal_jerk, tau), 0.0);
       double progress = std::min(trajectory.progress[static_cast<std::size_t>(k)] + distance,
                                  trajectory.progress[static_cast<std::size_t>(k + 1)]);
       if (stop_time && tau >= *stop_time - 1.0e-12) {
@@ -2398,9 +2427,11 @@ PlanResult PathVelocityPlanner::plan_at_speed(
   }
   if (lateral_target_hint_) {
     for (auto& entry : entries) {
+      const double target_error =
+          entry.path.n_target - *lateral_target_hint_;
       entry.screen.continuity_cost = continuity_scale
           * config_.lateral.target_continuity_weight
-          * std::pow(entry.path.n_target - *lateral_target_hint_, 2.0);
+          * target_error * target_error;
       entry.screen.screening_cost += entry.screen.continuity_cost;
     }
   }

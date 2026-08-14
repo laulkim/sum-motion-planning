@@ -5,6 +5,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+option(
+  SIMP_PLANNER_ENABLE_FMA
+  "Use hardware FMA for planner polynomial and motion integration kernels"
+  ON
+)
+
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -20,8 +26,20 @@ target_include_directories(simp_planner_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 target_compile_options(simp_planner_core PRIVATE
-  -Wall -Wextra -Wpedantic -O3
+  -Wall -Wextra -Wpedantic -O3 -ffp-contract=off
 )
+if(SIMP_PLANNER_ENABLE_FMA)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"
+      AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    # Keep contraction disabled for ordinary a*b+c expressions so enabling
+    # this option only changes the explicitly written multiply-add kernels.
+    target_compile_options(simp_planner_core PRIVATE -mfma)
+  else()
+    message(WARNING
+      "SIMP_PLANNER_ENABLE_FMA requested, but this compiler/architecture "
+      "does not support the configured FMA flags; using portable math")
+  endif()
+endif()
 
 add_executable(planner_node_cpp
   src/planner_node.cpp
