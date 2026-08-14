@@ -345,10 +345,12 @@ class PlannerNodeCpp final : public rclcpp::Node {
           current_state_.x, current_state_.y, current_state_.chi);
       const auto new_projection = new_path.project(
           current_state_.x, current_state_.y, current_state_.chi);
-      double old_x = 0.0, old_y = 0.0, old_heading = 0.0, old_kappa = 0.0;
-      double new_x = 0.0, new_y = 0.0, new_heading = 0.0, new_kappa = 0.0;
-      reference_path_->evaluate(old_projection.s, old_x, old_y, old_heading, old_kappa);
-      new_path.evaluate(new_projection.s, new_x, new_y, new_heading, new_kappa);
+      double old_x = 0.0, old_y = 0.0, old_heading = 0.0, old_kappa = 0.0, old_kappa_s = 0.0;
+      double new_x = 0.0, new_y = 0.0, new_heading = 0.0, new_kappa = 0.0, new_kappa_s = 0.0;
+      reference_path_->evaluate(old_projection.s, old_x, old_y, old_heading, old_kappa, old_kappa_s);
+      new_path.evaluate(new_projection.s, new_x, new_y, new_heading, new_kappa, new_kappa_s);
+      (void)old_kappa_s;
+      (void)new_kappa_s;
       const double reference_position_difference = std::hypot(old_x - new_x, old_y - new_y);
       const double heading_difference = std::abs(wrap_angle(old_heading - new_heading));
       const double curvature_difference = std::abs(old_kappa - new_kappa);

@@ -268,7 +268,8 @@ class ReferencePath {
   double s_min() const;
   double s_max() const;
   std::size_t size() const;
-  void evaluate(double s_query, double& x, double& y, double& psi, double& kappa) const;
+  void evaluate(double s_query, double& x, double& y, double& psi, double& kappa,
+                double& kappa_s) const;
   FrenetProjection project(double px, double py, double psi) const;
   FrenetProjection project_local(double px, double py, double psi, double s_hint,
                                   double search_back = 2.0,

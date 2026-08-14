@@ -380,9 +380,8 @@ ReferenceEvaluation evaluate_reference_with_virtual_extension(
   const std::size_t n = s_query.size();
   out.x.resize(n); out.y.resize(n); out.psi.resize(n); out.kappa.resize(n); out.kappa_s.resize(n); out.is_virtual.resize(n);
   real_end_s = clamp_value(real_end_s, path.s_min(), path.s_max());
-  double xe, ye, psie, kappae;
-  path.evaluate(real_end_s, xe, ye, psie, kappae);
-  const double kappase = interp_scalar(path.s(), path.kappa_s(), real_end_s);
+  double xe, ye, psie, kappae, kappase;
+  path.evaluate(real_end_s, xe, ye, psie, kappae, kappase);
   const double B = std::max(blend_length, 1.0e-3);
   double previous_d = 0.0;
   double previous_psi = psie;
@@ -391,8 +390,7 @@ ReferenceEvaluation evaluate_reference_with_virtual_extension(
   double previous_kappa = kappae;
   for (std::size_t i = 0; i < n; ++i) {
     if (s_query[i] <= real_end_s + 1.0e-12) {
-      path.evaluate(s_query[i], out.x[i], out.y[i], out.psi[i], out.kappa[i]);
-      out.kappa_s[i] = interp_scalar(path.s(), path.kappa_s(), s_query[i]);
+      path.evaluate(s_query[i], out.x[i], out.y[i], out.psi[i], out.kappa[i], out.kappa_s[i]);
       out.is_virtual[i] = 0;
       continue;
     }
@@ -669,8 +667,9 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
   const double real_end_l = interp_scalar(q, arc, real_end_q);
   const double real_end_n = interp_scalar(q, profile.p, real_end_q);
   const double real_end_psi = interp_scalar(q, psi, real_end_q);
-  double end_x, end_y, ref_end_psi, end_kappa;
-  reference.evaluate(real_end_s, end_x, end_y, ref_end_psi, end_kappa);
+  double end_x, end_y, ref_end_psi, end_kappa, end_kappa_s;
+  reference.evaluate(real_end_s, end_x, end_y, ref_end_psi, end_kappa, end_kappa_s);
+  (void)end_kappa_s;
   const double real_end_heading_error = wrap_angle(real_end_psi - ref_end_psi);
   const double virtual_extension_length = std::max(0.0, q.back() - remaining_real);
   std::vector<std::size_t> actual;
@@ -1053,12 +1052,26 @@ double ReferencePath::s_max() const { return s_.back(); }
 std::size_t ReferencePath::size() const { return s_.size(); }
 
 void ReferencePath::evaluate(double query, double& x, double& y,
-                             double& psi, double& kappa) const {
+                             double& psi, double& kappa, double& kappa_s) const {
   query = clamp_value(query, s_min(), s_max());
-  x = interp_scalar(s_, x_, query);
-  y = interp_scalar(s_, y_, query);
-  psi = wrap_angle(interp_scalar(s_, psi_, query));
-  kappa = interp_scalar(s_, kappa_, query);
+  if (s_.size() == 1 || query <= s_.front()) {
+    x = x_.front(); y = y_.front(); psi = wrap_angle(psi_.front());
+    kappa = kappa_.front(); kappa_s = kappa_s_.front();
+    return;
+  }
+  if (query >= s_.back()) {
+    x = x_.back(); y = y_.back(); psi = wrap_angle(psi_.back());
+    kappa = kappa_.back(); kappa_s = kappa_s_.back();
+    return;
+  }
+  const std::size_t i = lower_interval(s_, query);
+  const double dx = std::max(s_[i + 1] - s_[i], 1.0e-15);
+  const double alpha = (query - s_[i]) / dx;
+  x = (1.0 - alpha) * x_[i] + alpha * x_[i + 1];
+  y = (1.0 - alpha) * y_[i] + alpha * y_[i + 1];
+  psi = wrap_angle((1.0 - alpha) * psi_[i] + alpha * psi_[i + 1]);
+  kappa = (1.0 - alpha) * kappa_[i] + alpha * kappa_[i + 1];
+  kappa_s = (1.0 - alpha) * kappa_s_[i] + alpha * kappa_s_[i + 1];
 }
 
 FrenetProjection ReferencePath::project(double px, double py, double heading) const {
@@ -2176,10 +2189,11 @@ PlanResult PathVelocityPlanner::plan_at_speed(
       const double query_s = clamp_value(
           terminal_goal_s - half_length + 2.0 * half_length * alpha,
           path_.s_min(), real_end_s);
-      double x = 0.0, y = 0.0, psi = 0.0, kappa = 0.0;
-      path_.evaluate(query_s, x, y, psi, kappa);
+      double x = 0.0, y = 0.0, psi = 0.0, kappa = 0.0, kappa_s = 0.0;
+      path_.evaluate(query_s, x, y, psi, kappa, kappa_s);
       (void)psi;
       (void)kappa;
+      (void)kappa_s;
       minimum_clearance = std::min(
           minimum_clearance,
           costmap_->clearance_single_circle(x, y, radius));
