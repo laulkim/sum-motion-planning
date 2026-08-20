@@ -12,6 +12,7 @@ from typing import Optional
 
 import numpy as np
 import rclpy
+from ament_index_python.packages import get_package_share_directory
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as PathMessage
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -21,6 +22,7 @@ from std_msgs.msg import Float64, String, UInt8
 
 from .debug_allocation_metrics import compute_allocation_debug_sample
 from .debug_plot_renderer import render_debug_snapshot
+from .debug_scenario_geometry import scenario_obstacle_polygons
 from .debug_signal_history import SourceTimeAligner
 from .diagnostic_metrics import OpenPathGeometry, tracking_error_to_executed_segment
 from .path_geometry import PathProjection, project_open_path, wrap_angle
@@ -62,6 +64,9 @@ class DebugPlotNode(Node):
         self.declare_parameter("dynamic_topic_timeout", 2.0)
 
         self.scenario_name = str(self.get_parameter("scenario").value)
+        self.costmap_vehicle_centered = (
+            self.scenario_name.strip().lower() != "track_map"
+        )
         self.frame_id = str(self.get_parameter("frame_id").value)
         self.save_period = float(self.get_parameter("save_period").value)
         self.vehicle_length = float(self.get_parameter("vehicle_length").value)
@@ -86,6 +91,11 @@ class DebugPlotNode(Node):
         )
         self.dynamic_topic_timeout = float(
             self.get_parameter("dynamic_topic_timeout").value
+        )
+
+        self.scenario_obstacle_polygons = scenario_obstacle_polygons(
+            Path(get_package_share_directory("simp_planner_tools")),
+            self.scenario_name,
         )
 
         base = Path(str(self.get_parameter("output_dir").value)).expanduser()
@@ -254,6 +264,10 @@ class DebugPlotNode(Node):
 
         self.costmap_data: Optional[np.ndarray] = None
         self.costmap_extent: Optional[tuple[float, float, float, float]] = None
+        self.costmap_origin: Optional[dict[str, float]] = None
+        self.costmap_resolution: Optional[float] = None
+        self.costmap_width: Optional[int] = None
+        self.costmap_height: Optional[int] = None
         self.target_speed: Optional[float] = None
         self.mode: Optional[int] = None
         self.requested_mode: Optional[int] = None
@@ -405,6 +419,22 @@ class DebugPlotNode(Node):
         x0 = float(message.info.origin.position.x)
         y0 = float(message.info.origin.position.y)
         resolution = float(message.info.resolution)
+        orientation = message.info.origin.orientation
+        self.costmap_origin = {
+            "x": x0,
+            "y": y0,
+            "yaw": quaternion_to_yaw(
+                orientation.x,
+                orientation.y,
+                orientation.z,
+                orientation.w,
+            ),
+        }
+        self.costmap_resolution = resolution
+        self.costmap_width = width
+        self.costmap_height = height
+        # Retain the old axis-aligned extent for snapshots produced/consumed by
+        # older tooling. New renderers prefer costmap_origin plus grid metadata.
         self.costmap_extent = (
             x0, x0 + width * resolution, y0, y0 + height * resolution
         )
@@ -971,8 +1001,16 @@ class DebugPlotNode(Node):
             "global_x": self.global_x.copy(), "global_y": self.global_y.copy(),
             "reference_x": self.reference_x.copy(), "reference_y": self.reference_y.copy(),
             "selected_x": self.selected_x.copy(), "selected_y": self.selected_y.copy(),
+            "scenario_obstacles": tuple(
+                vertices.copy() for vertices in self.scenario_obstacle_polygons
+            ),
+            "costmap_vehicle_centered": self.costmap_vehicle_centered,
             "costmap_data": None if self.costmap_data is None else self.costmap_data.copy(),
             "costmap_extent": self.costmap_extent,
+            "costmap_origin": copy.deepcopy(self.costmap_origin),
+            "costmap_resolution": self.costmap_resolution,
+            "costmap_width": self.costmap_width,
+            "costmap_height": self.costmap_height,
             "current_state": copy.deepcopy(self.current_state),
             "current_projection": self.projection_payload(self.current_projection),
             "selected_projection": self.projection_payload(self.selected_projection),

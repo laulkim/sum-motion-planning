@@ -48,6 +48,25 @@ double quaternion_to_yaw(double x, double y, double z, double w) {
   return std::atan2(siny_cosp, cosy_cosp);
 }
 
+double occupancy_grid_origin_yaw(const geometry_msgs::msg::Quaternion& q) {
+  if (!std::isfinite(q.x) || !std::isfinite(q.y) ||
+      !std::isfinite(q.z) || !std::isfinite(q.w)) {
+    throw std::invalid_argument("OccupancyGrid origin quaternion is non-finite");
+  }
+  const double norm = std::hypot(std::hypot(q.x, q.y), std::hypot(q.z, q.w));
+  if (!(norm > 1.0e-12)) {
+    throw std::invalid_argument("OccupancyGrid origin quaternion has zero norm");
+  }
+  const double x = q.x / norm;
+  const double y = q.y / norm;
+  const double z = q.z / norm;
+  const double w = q.w / norm;
+  if (std::abs(x) > 1.0e-6 || std::abs(y) > 1.0e-6) {
+    throw std::invalid_argument("OccupancyGrid origin must be planar");
+  }
+  return quaternion_to_yaw(x, y, z, w);
+}
+
 geometry_msgs::msg::Quaternion yaw_to_quaternion(double yaw) {
   geometry_msgs::msg::Quaternion q;
   q.z = std::sin(0.5 * yaw);
@@ -372,7 +391,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
   }
 
   static std::uint64_t costmap_fingerprint(
-      const nav_msgs::msg::OccupancyGrid& message) {
+      const nav_msgs::msg::OccupancyGrid& message, double origin_yaw) {
     std::uint64_t hash = 1469598103934665603ULL;
     const auto mix = [&hash](std::uint64_t value) {
       hash ^= value;
@@ -385,6 +404,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
         message.info.origin.position.x * 1.0e6)));
     mix(static_cast<std::uint64_t>(std::llround(
         message.info.origin.position.y * 1.0e6)));
+    mix(static_cast<std::uint64_t>(std::llround(origin_yaw * 1.0e9)));
+    mix(message.header.frame_id.size());
+    for (const unsigned char value : message.header.frame_id) mix(value);
     for (const auto value : message.data) {
       mix(static_cast<std::uint8_t>(value));
     }
@@ -440,18 +462,30 @@ class PlannerNodeCpp final : public rclcpp::Node {
       if (width < 2 || height < 2 || static_cast<int>(msg->data.size()) != width * height)
         throw std::invalid_argument("invalid OccupancyGrid dimensions");
       const auto& q = msg->info.origin.orientation;
-      if (std::abs(quaternion_to_yaw(q.x, q.y, q.z, q.w)) > 1.0e-6)
-        throw std::invalid_argument("rotated OccupancyGrid origins are unsupported");
-      const auto fingerprint = costmap_fingerprint(*msg);
+      const double origin_yaw = occupancy_grid_origin_yaw(q);
+      if (msg->header.frame_id.empty())
+        throw std::invalid_argument("OccupancyGrid frame_id must not be empty");
+      const auto fingerprint = costmap_fingerprint(*msg, origin_yaw);
       {
         std::lock_guard<std::mutex> lock(input_mutex_);
+        if (received_odom_ && !odom_frame_.empty() &&
+            msg->header.frame_id != odom_frame_) {
+          throw std::invalid_argument(
+              "OccupancyGrid frame does not match odometry frame");
+        }
+        if (received_path_ && !path_frame_.empty() &&
+            msg->header.frame_id != path_frame_) {
+          throw std::invalid_argument(
+              "OccupancyGrid frame does not match reference-path frame");
+        }
         if (received_costmap_ && fingerprint == costmap_fingerprint_) return;
       }
       std::vector<std::int8_t> data(msg->data.begin(), msg->data.end());
       const auto build_start = std::chrono::steady_clock::now();
       auto map = std::make_shared<Costmap2D>(
           std::move(data), width, height, msg->info.resolution,
-          msg->info.origin.position.x, msg->info.origin.position.y);
+          msg->info.origin.position.x, msg->info.origin.position.y,
+          origin_yaw);
       const double build_ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - build_start).count();
       {

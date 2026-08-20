@@ -78,6 +78,48 @@ void test_math_and_projection() {
   require(std::abs(projection.n - 0.40) < 1e-12, "continuous projection n mismatch");
 }
 
+void test_rotated_costmap_registration() {
+  constexpr int width = 40;
+  constexpr int height = 30;
+  constexpr double resolution = 0.5;
+  constexpr double origin_x = 10.0;
+  constexpr double origin_y = -4.0;
+  constexpr double origin_yaw = 0.5 * simp_planner::kPi;
+  constexpr int occupied_x = 12;
+  constexpr int occupied_y = 8;
+  std::vector<std::int8_t> data(width * height, 0);
+  data[static_cast<std::size_t>(occupied_y * width + occupied_x)] = 100;
+  simp_planner::Costmap2D costmap(
+      std::move(data), width, height, resolution,
+      origin_x, origin_y, origin_yaw);
+
+  const double occupied_local_x =
+      (static_cast<double>(occupied_x) + 0.5) * resolution;
+  const double occupied_local_y =
+      (static_cast<double>(occupied_y) + 0.5) * resolution;
+  const double occupied_world_x = origin_x - occupied_local_y;
+  const double occupied_world_y = origin_y + occupied_local_x;
+  require(costmap.distance_at_world(occupied_world_x, occupied_world_y) < 1.0e-12,
+          "rotated costmap did not register occupied cell in world frame");
+
+  const double free_local_x = 4.25;
+  const double free_local_y = 6.25;
+  const double free_world_x = origin_x - free_local_y;
+  const double free_world_y = origin_y + free_local_x;
+  require(costmap.distance_at_world(free_world_x, free_world_y) > 0.5,
+          "rotated costmap mapped a free world point to the obstacle");
+
+  simp_planner::AllocationResult allocation;
+  allocation.trajectory.x = {occupied_world_x};
+  allocation.trajectory.y = {occupied_world_y};
+  allocation.trajectory.speed = {0.0};
+  allocation.psi = {origin_yaw};
+  const auto collision = simp_planner::check_oriented_allocation_collision(
+      allocation, costmap, {}, {});
+  require(!collision.collision_free,
+          "oriented collision gate ignored rotated costmap registration");
+}
+
 void test_nominal_planning_and_allocation() {
   simp_planner::EnvConfig config;
   require(config.lateral.n_targets.size() == 65, "lateral exploration count mismatch");
@@ -407,6 +449,8 @@ simp_planner::Costmap2D two_bottleneck_costmap() {
 
 void test_bottleneck_limiter_and_low_speed_maneuver_latch() {
   simp_planner::EnvConfig config;
+  // This fixture needs its original 32 m horizon to include both bottlenecks.
+  config.adaptive_replan.minimum_spatial_preview = 32.0;
   simp_planner::PathVelocityPlanner planner(
       config, straight_path(), two_bottleneck_costmap());
   simp_planner::PlannerState state;
@@ -734,6 +778,7 @@ void test_scheduler_and_safety_tail() {
 int main() {
   try {
     test_math_and_projection();
+    test_rotated_costmap_registration();
     test_nominal_planning_and_allocation();
     test_stationary_hold();
     test_runtime_execution_and_handover();

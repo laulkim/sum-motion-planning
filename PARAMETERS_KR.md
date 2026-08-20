@@ -23,9 +23,10 @@ planar simulator, scenario 도구의 기본 파라미터를 한곳에 정리한�
 | 횡방향 목표 | -8.0~+8.0 m, 0.25 m 간격 | 총 65개 |
 | 신규 횡 transition 길이 | 3.0~50.0 m | 속도·offset·곡률에 따라 동적 결정; 기존 maneuver 재계획 시 남은 길이는 0.10 m까지 가능 |
 | 공간 경로 sampling | 0.25 m | `spatial_ds` |
-| 기본 최소 spatial preview | 32.0 m | adaptive bottleneck preview |
-| 기본 preview 후보 preliminary extent | 45.2 m 이상 | `1.35 × 32.0 + 2.0` |
+| 기본 최소 spatial preview | 28.0 m | 30 m local-map 반경 안의 안전 preview |
+| 기본 preview 후보 preliminary extent | 39.8 m 이상 | `1.35 × 28.0 + 2.0`; 최종 preview로 truncate |
 | local reference window | 뒤 5.0 m / 앞 45.0 m | Scenario/Track provider 기본값 |
+| Scenario local costmap | 차량 중심 60 m × 60 m, 5 Hz | 캡처 시점 Body 축 정렬 |
 | 진행 속도 범위 | 0.0~5.8 m/s | Body 축별 속도 제한이 아님 |
 | 진행 가속도 범위 | -2.0~+1.2 m/s² | nominal 운용은 -1.0~+0.8 m/s² |
 | 진행 jerk 상한 | 3.0 m/s³ | nominal comfort 상한은 0.8 m/s³ |
@@ -134,7 +135,7 @@ max(0.20 m,
 ```
 
 현재 `V <= 5.8 m/s`, `horizon=4 s`에서 `1.10 × 23.2 = 25.52 m`이므로
-`minimum_spatial_preview=32 m`가 기본적으로 지배한다.
+`minimum_spatial_preview=28 m`가 기본적으로 지배한다.
 
 새 후보의 preliminary extent는 다음과 같다.
 
@@ -268,7 +269,7 @@ max(minimum_activation_distance,
 | 파라미터 | 기본값 | 단위 | 상태 및 의미 |
 |---|---:|---:|---|
 | `enabled` | true | bool | 활성, bottleneck 탐색 및 최소 preview |
-| `minimum_spatial_preview` | 32.0 | m | 활성 |
+| `minimum_spatial_preview` | 28.0 | m | 활성, 30 m local-map 반경 안의 여유 반영 |
 | `bottleneck_trigger_extra` | 1.50 | m | 활성, bottleneck 진입 여유 |
 | `bottleneck_release_extra` | 2.00 | m | 활성, bottleneck 해제 여유 |
 | `bottleneck_post_buffer` | 8.0 | m | 활성, bottleneck 뒤 decision buffer |
@@ -483,6 +484,8 @@ Planner의 `mode_change_stop_speed_mps`와 simulator의
 | `command_frequency_hz` | 100.0 Hz | Planner command frequency만 override |
 | `oriented_footprint_circle_count` | 0 | sentinel, scenario 권장값 사용 |
 | `costmap_resolution` | -1.0 | sentinel, scenario 권장값 사용 |
+| `costmap_size_m` | 60.0 m | 차량 중심 정사각형 local costmap 한 변 |
+| `costmap_publish_hz` | 5.0 Hz | local costmap 발행률 |
 | `oriented_footprint_translation_step_m` | 0.20 m | Planner final swept check |
 | `oriented_footprint_yaw_step_deg` | 2.0° | Planner final swept check |
 | `save_period` | 10.0 s | debug snapshot 저장 주기 |
@@ -519,7 +522,9 @@ initial_body_yaw   = first_path.yaw[0] - beta_center(mode)
 | `path_ahead_length` | 45.0 | m | local reference 앞쪽 길이 |
 | `path_update_distance` | 1.0 | m | reference 재발행 이동거리 |
 | `costmap_resolution` | -1.0 | m/cell | sentinel, scenario 값 사용 |
-| `costmap_margin` | 10.0 | m | path/obstacle bounds 외곽 여유 |
+| `costmap_margin` | 10.0 | m | 기존 설정 호환용; 차량 기준 local costmap에는 미사용 |
+| `costmap_size_m` | 60.0 | m | 차량 중심 정사각형 local costmap의 한 변 |
+| `costmap_publish_hz` | 5.0 | Hz | 최신 odom capture 기준 local costmap 발행률 |
 | `stop_speed_threshold` | 0.03 | m/s | phase 종료 정지 판정 |
 | `terminal_capture_distance` | 0.20 | m | phase stop 위치 허용치 |
 | `projection_search_back` | 20 | segment | local projection 뒤 검색 |
@@ -529,6 +534,7 @@ initial_body_yaw   = first_path.yaw[0] - beta_center(mode)
 추가 하드코딩 동작:
 
 - heartbeat: 0.5 s
+- local costmap은 유효 odom을 받은 뒤부터 5 Hz로 발행
 - odom 수신 전 static input 재발행: 최대 10회
 - 일반 phase 실행 끝: `path.total_length - terminal_margin`
 - mode-change phase 실행 끝: 지정된 `switch_s`
@@ -626,6 +632,33 @@ Conservative correction은 distance field에서 `0.5 × sqrt(2) × resolution`�
 separating-axis 검사를 사용한다. `narrow_offset_corridor`만 scenario 기본
 resolution이 0.05 m/cell이다.
 
+### 11.3 차량 기준 local costmap 계약
+
+Scenario Manager는 시나리오 장애물을 캡처 시점 차량 Body 축에 정렬된 고정
+`60 m × 60 m` 정사각형으로 rasterize하고 5 Hz로 발행한다. 차량은 정사각형의
+중앙에 있으며 셀 수는 한 축당 `ceil(costmap_size_m / resolution)`이다. 따라서
+0.20 m/cell에서는 `300 × 300`, 0.05 m/cell에서는 `1200 × 1200`이다.
+
+`OccupancyGrid.header.frame_id`는 `odom`이고 `header.stamp`는 발행 타이머 시각이
+아니라 grid 생성에 실제 사용한 `Odometry.header.stamp`와 동일하다. 이로써 pose와
+grid contents가 하나의 capture 시점을 나타낸다.
+
+`OccupancyGrid.info.origin`은 차량 위치가 아니라 cell `(0, 0)`의 좌하단 corner를
+`odom`으로 표현한 pose다. 캡처 차량 pose를 `(x, y, yaw)`, 실제 grid 한 변을
+`L = ceil(size / resolution) × resolution`, `h = L / 2`라 하면 다음과 같다.
+
+```text
+origin_position = [x, y] + R(yaw) × [-h, -h]
+origin_yaw      = yaw
+```
+
+Planner와 debug plot은 이 position과 orientation을 함께 사용해 grid 좌표를
+`odom`으로 변환한다. 즉 차량이 다음 costmap 발행 전에 이동하거나 회전해도 기존
+grid는 해당 capture 시점 pose에 고정된다.
+
+30 m 반경과 spatial preview가 겹치지 않도록 Planner의
+`minimum_spatial_preview` 기본값은 `28.0 m`로 설정한다.
+
 ## 12. 대체 Track Map 실행 경로
 
 `simp_planner_tools/launch/track_map.launch.py`는 main scenario launch와 별개다.
@@ -677,6 +710,11 @@ Provider heartbeat는 1.0 s이고 costmap은 전체 free cell이다. 이 launch�
 | `tracking_motion_limit_deg` | 3° | tracking heading 진단 |
 | `planning_deadline_ms` | 100 ms | 진단 threshold |
 | `dynamic_topic_timeout` | 2.0 s | stale topic 진단 |
+
+Debug map은 시나리오에 정의된 모든 장애물을 전역 `odom` 폴리곤으로 표시한다.
+현재 local costmap은 회전된 외곽선, 캡처 시점 차량 중심, 실제 가로·세로 크기와
+차량 Body 축 기준 전/후/좌/우 반경을 함께 표시한다. 기본 60 m 정사각형에서는
+Body x/y 범위가 각각 `-30 .. +30 m`이다.
 
 출력 위치는 `<output_dir>/<scenario>/<timestamp>/`이며 CSV history, status JSON,
 PNG snapshot을 생성한다.

@@ -207,7 +207,7 @@ struct AdaptiveReplanConfig {
   // Preserve long-range obstacle awareness at low speed.  The first active
   // bottleneck limiter below prevents a single-target path from being judged
   // against multiple alternating gates at once.
-  double minimum_spatial_preview{32.0};
+  double minimum_spatial_preview{28.0};
   double bottleneck_trigger_extra{1.50};
   double bottleneck_release_extra{2.00};
   double bottleneck_post_buffer{8.0};
@@ -299,12 +299,18 @@ class Costmap2D {
             int occupied_threshold = 50, int unknown_value = -1,
             bool unknown_is_occupied = true,
             bool conservative_cell_correction = true);
+  Costmap2D(std::vector<std::int8_t> data, int width, int height,
+            double resolution, double origin_x, double origin_y,
+            double origin_yaw, int occupied_threshold = 50,
+            int unknown_value = -1, bool unknown_is_occupied = true,
+            bool conservative_cell_correction = true);
 
   double distance_at_world(double x, double y) const;
   double clearance_single_circle(double x, double y, double radius) const;
   int width() const { return width_; }
   int height() const { return height_; }
   double resolution() const { return resolution_; }
+  double origin_yaw() const { return origin_yaw_; }
   bool empty() const { return distance_field_.empty(); }
 
  private:
@@ -313,6 +319,9 @@ class Costmap2D {
   double resolution_{0.1};
   double origin_x_{0.0};
   double origin_y_{0.0};
+  double origin_yaw_{0.0};
+  double cos_origin_yaw_{1.0};
+  double sin_origin_yaw_{0.0};
   std::vector<std::int8_t> data_;
   std::vector<double> distance_field_;
 };

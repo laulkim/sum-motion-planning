@@ -565,6 +565,83 @@ def obstacle_vertices(obstacle: ScenarioObstacle) -> np.ndarray:
     return local @ rotation.T + np.asarray([obstacle.x, obstacle.y])
 
 
+def _rasterize_obstacle_into_grid(
+    grid: np.ndarray,
+    obstacle: ScenarioObstacle,
+    *,
+    resolution: float,
+    origin_x: float,
+    origin_y: float,
+) -> None:
+    """Conservatively mark cells intersected by one rectangular obstacle."""
+    height, width = grid.shape
+    vertices = obstacle_vertices(obstacle)
+    minimum_x = float(np.min(vertices[:, 0]))
+    maximum_x = float(np.max(vertices[:, 0]))
+    minimum_y = float(np.min(vertices[:, 1]))
+    maximum_y = float(np.max(vertices[:, 1]))
+    x_start = max(
+        0,
+        min(width, int(math.floor((minimum_x - origin_x) / resolution)) - 1),
+    )
+    x_stop = max(
+        0,
+        min(width, int(math.ceil((maximum_x - origin_x) / resolution)) + 1),
+    )
+    y_start = max(
+        0,
+        min(height, int(math.floor((minimum_y - origin_y) / resolution)) - 1),
+    )
+    y_stop = max(
+        0,
+        min(height, int(math.ceil((maximum_y - origin_y) / resolution)) + 1),
+    )
+    if x_start >= x_stop or y_start >= y_stop:
+        return
+
+    xs = origin_x + (np.arange(x_start, x_stop) + 0.5) * resolution
+    ys = origin_y + (np.arange(y_start, y_stop) + 0.5) * resolution
+    xx, yy = np.meshgrid(xs, ys)
+    dx = xx - float(obstacle.x)
+    dy = yy - float(obstacle.y)
+    c = math.cos(float(obstacle.yaw))
+    s = math.sin(float(obstacle.yaw))
+    local_x = c * dx + s * dy
+    local_y = -s * dx + c * dy
+
+    # Exact separating-axis test between the rotated obstacle rectangle and
+    # each axis-aligned costmap cell. A cell is occupied whenever its area
+    # intersects the obstacle, not only when its centre lies inside.
+    cell_half = 0.5 * resolution
+    half_length = 0.5 * float(obstacle.length)
+    half_width = 0.5 * float(obstacle.width)
+    abs_c = abs(c)
+    abs_s = abs(s)
+    overlap_obstacle_x = (
+        np.abs(local_x)
+        <= half_length + cell_half * (abs_c + abs_s) + 1.0e-12
+    )
+    overlap_obstacle_y = (
+        np.abs(local_y)
+        <= half_width + cell_half * (abs_c + abs_s) + 1.0e-12
+    )
+    overlap_grid_x = (
+        np.abs(dx)
+        <= cell_half + half_length * abs_c + half_width * abs_s + 1.0e-12
+    )
+    overlap_grid_y = (
+        np.abs(dy)
+        <= cell_half + half_length * abs_s + half_width * abs_c + 1.0e-12
+    )
+    intersects = (
+        overlap_obstacle_x
+        & overlap_obstacle_y
+        & overlap_grid_x
+        & overlap_grid_y
+    )
+    grid[y_start:y_stop, x_start:x_stop][intersects] = 100
+
+
 def rasterize_scenario_costmap(
     scenario: ScenarioDefinition,
     *,
@@ -601,61 +678,70 @@ def rasterize_scenario_costmap(
     grid = np.zeros((height, width), dtype=np.int8)
 
     for obstacle in scenario.obstacles:
-        vertices = obstacle_vertices(obstacle)
-        minimum_x = float(np.min(vertices[:, 0]))
-        maximum_x = float(np.max(vertices[:, 0]))
-        minimum_y = float(np.min(vertices[:, 1]))
-        maximum_y = float(np.max(vertices[:, 1]))
-        x_start = max(0, int(math.floor((minimum_x - origin_x) / resolution)) - 1)
-        x_stop = min(width, int(math.ceil((maximum_x - origin_x) / resolution)) + 1)
-        y_start = max(0, int(math.floor((minimum_y - origin_y) / resolution)) - 1)
-        y_stop = min(height, int(math.ceil((maximum_y - origin_y) / resolution)) + 1)
-
-        xs = origin_x + (np.arange(x_start, x_stop) + 0.5) * resolution
-        ys = origin_y + (np.arange(y_start, y_stop) + 0.5) * resolution
-        xx, yy = np.meshgrid(xs, ys)
-        dx = xx - float(obstacle.x)
-        dy = yy - float(obstacle.y)
-        c = math.cos(float(obstacle.yaw))
-        s = math.sin(float(obstacle.yaw))
-        local_x = c * dx + s * dy
-        local_y = -s * dx + c * dy
-
-        # Exact separating-axis test between the rotated obstacle rectangle
-        # and each axis-aligned costmap cell.  A cell is occupied whenever
-        # its area intersects the obstacle, rather than only when its centre
-        # lies inside.  This makes the rasterized obstacle a conservative
-        # superset of the continuous obstacle geometry.
-        cell_half = 0.5 * resolution
-        half_length = 0.5 * float(obstacle.length)
-        half_width = 0.5 * float(obstacle.width)
-        abs_c = abs(c)
-        abs_s = abs(s)
-        overlap_obstacle_x = (
-            np.abs(local_x)
-            <= half_length + cell_half * (abs_c + abs_s) + 1.0e-12
+        _rasterize_obstacle_into_grid(
+            grid,
+            obstacle,
+            resolution=resolution,
+            origin_x=origin_x,
+            origin_y=origin_y,
         )
-        overlap_obstacle_y = (
-            np.abs(local_y)
-            <= half_width + cell_half * (abs_c + abs_s) + 1.0e-12
-        )
-        overlap_world_x = (
-            np.abs(dx)
-            <= cell_half + half_length * abs_c + half_width * abs_s + 1.0e-12
-        )
-        overlap_world_y = (
-            np.abs(dy)
-            <= cell_half + half_length * abs_s + half_width * abs_c + 1.0e-12
-        )
-        intersects = (
-            overlap_obstacle_x
-            & overlap_obstacle_y
-            & overlap_world_x
-            & overlap_world_y
-        )
-        grid[y_start:y_stop, x_start:x_stop][intersects] = 100
 
     return grid, origin_x, origin_y
+
+
+def rasterize_vehicle_costmap(
+    scenario: ScenarioDefinition,
+    *,
+    vehicle_x: float,
+    vehicle_y: float,
+    vehicle_yaw: float,
+    resolution: float = 0.2,
+    size_m: float = 60.0,
+) -> tuple[np.ndarray, float, float, float]:
+    """Rasterize a vehicle-centred costmap whose cell axes follow body yaw.
+
+    The returned origin is the lower-left grid corner expressed in the
+    scenario's odom frame. Together with the returned yaw it is directly
+    suitable for ``OccupancyGrid.info.origin``.
+    """
+    values = (vehicle_x, vehicle_y, vehicle_yaw, resolution, size_m)
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError("Vehicle costmap inputs must be finite")
+    if resolution <= 0.0 or size_m <= 0.0:
+        raise ValueError("Vehicle costmap resolution and size must be positive")
+
+    cell_count = max(2, int(math.ceil(size_m / resolution)))
+    extent = cell_count * resolution
+    local_origin = -0.5 * extent
+    grid = np.zeros((cell_count, cell_count), dtype=np.int8)
+
+    vehicle_c = math.cos(vehicle_yaw)
+    vehicle_s = math.sin(vehicle_yaw)
+    for obstacle in scenario.obstacles:
+        dx = float(obstacle.x) - vehicle_x
+        dy = float(obstacle.y) - vehicle_y
+        body_obstacle = ScenarioObstacle(
+            x=vehicle_c * dx + vehicle_s * dy,
+            y=-vehicle_s * dx + vehicle_c * dy,
+            length=float(obstacle.length),
+            width=float(obstacle.width),
+            yaw=float(obstacle.yaw) - vehicle_yaw,
+        )
+        _rasterize_obstacle_into_grid(
+            grid,
+            body_obstacle,
+            resolution=resolution,
+            origin_x=local_origin,
+            origin_y=local_origin,
+        )
+
+    origin_x = (
+        vehicle_x + vehicle_c * local_origin - vehicle_s * local_origin
+    )
+    origin_y = (
+        vehicle_y + vehicle_s * local_origin + vehicle_c * local_origin
+    )
+    return grid, float(origin_x), float(origin_y), float(vehicle_yaw)
 
 
 def global_display_segments(

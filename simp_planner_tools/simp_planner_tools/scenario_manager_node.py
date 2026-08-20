@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 from typing import Optional
@@ -22,7 +23,7 @@ from .scenario_definition import (
     ScenarioDefinition,
     global_display_segments,
     load_scenario_definition,
-    rasterize_scenario_costmap,
+    rasterize_vehicle_costmap,
 )
 from .scenario_path import ScenarioPath
 
@@ -47,6 +48,15 @@ class ScenarioState(Enum):
     COMPLETE = auto()
 
 
+@dataclass(frozen=True)
+class OdomPoseSnapshot:
+    stamp_sec: int
+    stamp_nanosec: int
+    x: float
+    y: float
+    body_yaw: float
+
+
 class ScenarioManagerNode(Node):
     """Publish scenario-dependent path, mode, speed, and occupancy costmap."""
 
@@ -60,7 +70,11 @@ class ScenarioManagerNode(Node):
         self.declare_parameter("path_ahead_length", 45.0)
         self.declare_parameter("path_update_distance", 1.0)
         self.declare_parameter("costmap_resolution", -1.0)
+        # Retained for compatibility with existing launch/config files. Local
+        # costmaps now have their own fixed sensor extent and do not use it.
         self.declare_parameter("costmap_margin", 10.0)
+        self.declare_parameter("costmap_size_m", 60.0)
+        self.declare_parameter("costmap_publish_hz", 5.0)
         self.declare_parameter("stop_speed_threshold", 0.03)
         self.declare_parameter("terminal_capture_distance", 0.20)
         self.declare_parameter("projection_search_back", 20)
@@ -78,6 +92,10 @@ class ScenarioManagerNode(Node):
             self.get_parameter("costmap_resolution").value
         )
         self.costmap_margin = float(self.get_parameter("costmap_margin").value)
+        self.costmap_size_m = float(self.get_parameter("costmap_size_m").value)
+        self.costmap_publish_hz = float(
+            self.get_parameter("costmap_publish_hz").value
+        )
         self.stop_speed_threshold = float(
             self.get_parameter("stop_speed_threshold").value
         )
@@ -113,6 +131,10 @@ class ScenarioManagerNode(Node):
             raise ValueError("path_update_distance must be positive")
         if self.costmap_resolution <= 0.0 or self.costmap_margin <= 0.0:
             raise ValueError("Costmap resolution and margin must be positive")
+        if self.costmap_size_m <= 0.0:
+            raise ValueError("costmap_size_m must be positive")
+        if self.costmap_publish_hz <= 0.0:
+            raise ValueError("costmap_publish_hz must be positive")
         static_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -161,6 +183,7 @@ class ScenarioManagerNode(Node):
         self.current_remaining = math.nan
         self.current_stop_error = math.nan
         self.current_measured_speed = 0.0
+        self.costmap_odom_snapshot: Optional[OdomPoseSnapshot] = None
         self.received_odom = False
         self.startup_republish_count = 0
         self.current_map_yaw = math.nan
@@ -171,6 +194,9 @@ class ScenarioManagerNode(Node):
         self.vehicle_transition_complete = False
 
         self.heartbeat_timer = self.create_timer(0.5, self.publish_heartbeat)
+        self.costmap_timer = self.create_timer(
+            1.0 / self.costmap_publish_hz, self.publish_costmap
+        )
         self.publish_costmap()
         self.publish_global_path()
         self.publish_active_reference(0.0, force=True)
@@ -250,28 +276,41 @@ class ScenarioManagerNode(Node):
         # subscribers.  Re-publish them for the first few heartbeats as an
         # additional startup safeguard and to make launch ordering irrelevant.
         if not self.received_odom and self.startup_republish_count < 10:
-            self.publish_costmap()
             self.publish_global_path()
             self.publish_active_reference(0.0, force=True)
             self.startup_republish_count += 1
         self.publish_status()
 
     def publish_costmap(self) -> None:
-        grid, origin_x, origin_y = rasterize_scenario_costmap(
+        snapshot = self.costmap_odom_snapshot
+        if snapshot is None:
+            return
+        grid, origin_x, origin_y, origin_yaw = rasterize_vehicle_costmap(
             self.scenario,
+            vehicle_x=snapshot.x,
+            vehicle_y=snapshot.y,
+            vehicle_yaw=snapshot.body_yaw,
             resolution=self.costmap_resolution,
-            margin=self.costmap_margin,
+            size_m=self.costmap_size_m,
         )
+
         message = OccupancyGrid()
-        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.stamp.sec = snapshot.stamp_sec
+        message.header.stamp.nanosec = snapshot.stamp_nanosec
         message.header.frame_id = self.frame_id
+        message.info.map_load_time.sec = snapshot.stamp_sec
+        message.info.map_load_time.nanosec = snapshot.stamp_nanosec
         message.info.resolution = self.costmap_resolution
         message.info.width = int(grid.shape[1])
         message.info.height = int(grid.shape[0])
         message.info.origin.position.x = origin_x
         message.info.origin.position.y = origin_y
-        message.info.origin.orientation.w = 1.0
-        message.data = grid.reshape(-1).astype(int).tolist()
+        qx, qy, qz, qw = yaw_to_quaternion(origin_yaw)
+        message.info.origin.orientation.x = qx
+        message.info.origin.orientation.y = qy
+        message.info.origin.orientation.z = qz
+        message.info.origin.orientation.w = qw
+        message.data = grid.reshape(-1).tolist()
         self.costmap_pub.publish(message)
 
     def publish_global_path(self) -> None:
@@ -513,6 +552,13 @@ class ScenarioManagerNode(Node):
             return
         speed = math.hypot(vx, vy)
         self.current_measured_speed = speed
+        self.costmap_odom_snapshot = OdomPoseSnapshot(
+            stamp_sec=int(message.header.stamp.sec),
+            stamp_nanosec=int(message.header.stamp.nanosec),
+            x=x,
+            y=y,
+            body_yaw=body_yaw,
+        )
         self.received_odom = True
 
         projection = self.active_path.project(

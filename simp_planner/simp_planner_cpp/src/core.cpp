@@ -1137,10 +1137,27 @@ Costmap2D::Costmap2D(std::vector<std::int8_t> data, int width, int height,
                      int occupied_threshold, int unknown_value,
                      bool unknown_is_occupied,
                      bool conservative_cell_correction)
+    : Costmap2D(std::move(data), width, height, resolution, origin_x, origin_y,
+                0.0, occupied_threshold, unknown_value, unknown_is_occupied,
+                conservative_cell_correction) {}
+
+Costmap2D::Costmap2D(std::vector<std::int8_t> data, int width, int height,
+                     double resolution, double origin_x, double origin_y,
+                     double origin_yaw,
+                     int occupied_threshold, int unknown_value,
+                     bool unknown_is_occupied,
+                     bool conservative_cell_correction)
     : width_(width), height_(height), resolution_(resolution),
-      origin_x_(origin_x), origin_y_(origin_y), data_(std::move(data)) {
-  if (width_ < 2 || height_ < 2 || data_.size() != static_cast<std::size_t>(width_ * height_)
-      || !(resolution_ > 0.0)) {
+      origin_x_(origin_x), origin_y_(origin_y),
+      origin_yaw_(wrap_angle(origin_yaw)),
+      cos_origin_yaw_(std::cos(origin_yaw_)),
+      sin_origin_yaw_(std::sin(origin_yaw_)), data_(std::move(data)) {
+  const auto expected_size = static_cast<std::size_t>(width_) *
+      static_cast<std::size_t>(height_);
+  if (width_ < 2 || height_ < 2 || data_.size() != expected_size ||
+      !(resolution_ > 0.0) || !std::isfinite(resolution_) ||
+      !std::isfinite(origin_x_) || !std::isfinite(origin_y_) ||
+      !std::isfinite(origin_yaw)) {
     throw std::invalid_argument("invalid costmap");
   }
   std::vector<std::uint8_t> occupied(data_.size(), 0);
@@ -1156,8 +1173,15 @@ Costmap2D::Costmap2D(std::vector<std::int8_t> data, int width, int height,
 
 double Costmap2D::distance_at_world(double x, double y) const {
   if (distance_field_.empty()) return 1.0e6;
-  const double gx = (x - origin_x_) / resolution_ - 0.5;
-  const double gy = (y - origin_y_) / resolution_ - 0.5;
+  if (!std::isfinite(x) || !std::isfinite(y)) return 0.0;
+  const double dx = x - origin_x_;
+  const double dy = y - origin_y_;
+  // OccupancyGrid cells are expressed in the grid axes at capture time.
+  // Bring an odom/world query back into those axes before indexing the EDT.
+  const double local_x = cos_origin_yaw_ * dx + sin_origin_yaw_ * dy;
+  const double local_y = -sin_origin_yaw_ * dx + cos_origin_yaw_ * dy;
+  const double gx = local_x / resolution_ - 0.5;
+  const double gy = local_y / resolution_ - 0.5;
   const int x0 = static_cast<int>(std::floor(gx));
   const int y0 = static_cast<int>(std::floor(gy));
   const int x1 = x0 + 1;

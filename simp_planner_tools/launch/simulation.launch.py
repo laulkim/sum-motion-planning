@@ -29,6 +29,12 @@ def _resolved_nodes(context):
     requested_costmap_resolution = float(
         LaunchConfiguration("costmap_resolution").perform(context)
     )
+    costmap_size_m = float(
+        LaunchConfiguration("costmap_size_m").perform(context)
+    )
+    costmap_publish_hz = float(
+        LaunchConfiguration("costmap_publish_hz").perform(context)
+    )
     footprint_translation_step = float(
         LaunchConfiguration("oriented_footprint_translation_step_m").perform(context)
     )
@@ -85,6 +91,8 @@ def _resolved_nodes(context):
                     "target_speed": target_speed,
                     "path_update_distance": path_update_distance,
                     "costmap_resolution": costmap_resolution,
+                    "costmap_size_m": costmap_size_m,
+                    "costmap_publish_hz": costmap_publish_hz,
                 }
             ],
         ),
@@ -141,6 +149,14 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "costmap_resolution", default_value="-1.0",
                 description="Negative value uses the scenario-recommended costmap resolution.",
+            ),
+            DeclareLaunchArgument(
+                "costmap_size_m", default_value="60.0",
+                description="Vehicle-centred square costmap side length in metres.",
+            ),
+            DeclareLaunchArgument(
+                "costmap_publish_hz", default_value="5.0",
+                description="Vehicle-frame costmap publication rate.",
             ),
             DeclareLaunchArgument(
                 "oriented_footprint_translation_step_m", default_value="0.20"
