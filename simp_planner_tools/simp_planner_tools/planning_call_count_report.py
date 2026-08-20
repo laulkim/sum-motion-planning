@@ -12,26 +12,34 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import rclpy
 from matplotlib.figure import Figure
-from matplotlib.ticker import MultipleLocator
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
 # These are stage-level counts, not the number of candidates generated inside
 # each stage.  Spatial/trajectory fallback passes and allocation searches may
-# add another invocation within the same activated plan.
+# add another invocation within the same activated plan.  Not plotted on the
+# summary panel (only computation time is), but still required/collected
+# since the per-block timing panels below depend on the same JSON payload.
 CATEGORIES = (
     ("spatial_path_generation_calls", "Spatial path generation"),
     ("trajectory_planning_calls", "Trajectory planning"),
     ("allocation_calls", "Allocation"),
 )
 
+# Matches the hardcoded "deadline_ms" the planner node publishes in its
+# status JSON (10 Hz planning rate -> 100 ms budget per cycle).
+PLANNING_DEADLINE_MS = 100.0
+
 # Per-activated-plan accumulated wall-clock time (ms) for each measured
 # block. Spatial path generation and trajectory generation each take a
 # different code path (and cost) depending on whether the cycle is a normal
 # cruise cycle or a terminal/stop-point cycle, so those two are split into
 # separate series. Allocation (which also performs the trajectory-level
-# collision check) is a single series.
+# collision check) is a single series. Handover state prediction is the
+# pre-planning step that forward-integrates the currently active trajectory
+# to the scheduled handover time -- it runs once per planning cycle, same
+# cadence as the other three, so it is plotted the same way.
 BLOCK_TIMING_PANELS = (
     (
         "Spatial path generation + collision check",
@@ -53,6 +61,12 @@ BLOCK_TIMING_PANELS = (
             ("allocation_block_ms", "allocation", "tab:green"),
         ),
     ),
+    (
+        "Handover state prediction",
+        (
+            ("handover_prediction_ms", "handover prediction", "tab:purple"),
+        ),
+    ),
 )
 
 # Raw generate_spatial_path_candidate() invocation count, including every
@@ -62,65 +76,84 @@ BLOCK_TIMING_PANELS = (
 # proportional.
 SPATIAL_ATTEMPTS_KEY = "spatial_candidate_generation_attempts"
 
+# Costmap distance-field rebuild cost. Unlike the four panels above, this is
+# event-driven (only runs when a new /costmap message arrives, on a
+# completely different callback than planning), not once per activated plan.
+# It is published as "the most recently known rebuild cost/count at the time
+# of this plan" rather than something that happened during this plan cycle,
+# so most samples will simply repeat the last observed value.
+COSTMAP_BUILD_MS_KEY = "costmap_build_ms"
+COSTMAP_REBUILD_COUNT_KEY = "costmap_rebuild_count"
+
 REQUIRED_KEYS = (
     tuple(key for key, _ in CATEGORIES)
     + tuple(key for _, series in BLOCK_TIMING_PANELS for key, _, _ in series)
-    + (SPATIAL_ATTEMPTS_KEY,)
+    + (SPATIAL_ATTEMPTS_KEY, COSTMAP_BUILD_MS_KEY, COSTMAP_REBUILD_COUNT_KEY)
 )
+
+# Detail panels are laid out in a grid below the summary panel instead of a
+# single ever-growing column: BLOCK_TIMING_PANELS fill the grid in order,
+# then the two dual-axis debug panels (candidate-generation attempts, and
+# costmap rebuild cost/count) take the remaining slots.
+_DETAIL_PANEL_COUNT = len(BLOCK_TIMING_PANELS) + 2
+_DETAIL_GRID_COLUMNS = 2
+_DETAIL_GRID_ROWS = -(-_DETAIL_PANEL_COUNT // _DETAIL_GRID_COLUMNS)
 
 
 def create_call_count_figure(samples: list[dict[str, float | int]]) -> Figure:
-    """Build a time-aligned call-count/compute-time figure plus one
-    sub-plot per measured planner block."""
+    """Build a time-aligned call-count/compute-time summary panel plus a
+    grid of one sub-plot per measured planner block."""
     time_sec = [float(sample["time_s"]) for sample in samples]
 
-    panel_count = 1 + len(BLOCK_TIMING_PANELS) + 1
-    fig, axes = plt.subplots(
-        panel_count, 1, figsize=(10, 4.5 + 3.0 * (panel_count - 1)),
-        sharex=True,
+    fig = plt.figure(
+        figsize=(7.0 * _DETAIL_GRID_COLUMNS, 4.5 + 3.2 * _DETAIL_GRID_ROWS)
     )
-    count_ax = axes[0]
-    for key, label in CATEGORIES:
-        values = [int(sample[key]) for sample in samples]
-        count_ax.plot(
-            time_sec, values, label=f"{label} (mean {mean(values):.2f})",
-            marker="o", markersize=2, linewidth=1,
-        )
-    count_ax.yaxis.set_major_locator(MultipleLocator(1))
-    count_ax.yaxis.set_major_formatter(lambda value, _pos: f"{value:.0f}")
-    count_ax.set_ylim(bottom=0)
-    count_ax.set_ylabel("stage invocations per activated plan")
-    count_ax.grid(True, alpha=0.3)
+    gs = fig.add_gridspec(1 + _DETAIL_GRID_ROWS, _DETAIL_GRID_COLUMNS)
 
-    compute_ax = count_ax.twinx()
+    top_ax = fig.add_subplot(gs[0, :])
     compute_ms = [float(sample["total_compute_time_ms"]) for sample in samples]
-    compute_ax.plot(
+    top_ax.plot(
         time_sec,
         compute_ms,
         color="black",
-        alpha=0.65,
+        alpha=0.75,
         marker=".",
         markersize=3,
         linewidth=1,
         label="Planning computation time",
-    )
-    compute_ax.set_ylim(bottom=0)
-    compute_ax.set_ylabel("planning computation time [ms]")
-
-    count_lines, count_labels = count_ax.get_legend_handles_labels()
-    compute_lines, compute_labels = compute_ax.get_legend_handles_labels()
-    count_ax.legend(
-        count_lines + compute_lines,
-        count_labels + compute_labels,
-        loc="best",
-        fontsize=8,
-    )
-    count_ax.set_title(
-        f"Planner stage invocations and computation time "
-        f"({len(samples)} activated plans)"
+        zorder=3,
     )
 
-    for panel_ax, (title, series) in zip(axes[1:], BLOCK_TIMING_PANELS):
+    max_ms = max(compute_ms)
+    min_ms = min(compute_ms)
+    top_ax.axhspan(PLANNING_DEADLINE_MS, max(max_ms, PLANNING_DEADLINE_MS) * 1.05,
+                   color="tab:red", alpha=0.08, zorder=0)
+    top_ax.axhline(PLANNING_DEADLINE_MS, color="tab:red", linestyle="--", linewidth=1.3,
+                   label=f"{PLANNING_DEADLINE_MS:.0f} ms deadline", zorder=1)
+    top_ax.axhspan(max_ms * 0.985, max_ms * 1.015, color="tab:orange", alpha=0.20, zorder=0)
+    top_ax.axhline(max_ms, color="tab:orange", linestyle=":", linewidth=1.3,
+                   label=f"max {max_ms:.2f} ms", zorder=1)
+    top_ax.axhspan(min_ms * 0.985, min_ms * 1.015, color="tab:blue", alpha=0.20, zorder=0)
+    top_ax.axhline(min_ms, color="tab:blue", linestyle=":", linewidth=1.3,
+                   label=f"min {min_ms:.2f} ms", zorder=1)
+
+    top_ax.set_ylim(bottom=0)
+    top_ax.set_ylabel("planning computation time [ms]")
+    top_ax.grid(True, alpha=0.3)
+    top_ax.legend(loc="best", fontsize=8)
+    top_ax.set_title(
+        f"Planner computation time ({len(samples)} activated plans)"
+    )
+
+    detail_axes = [
+        fig.add_subplot(
+            gs[1 + slot // _DETAIL_GRID_COLUMNS, slot % _DETAIL_GRID_COLUMNS],
+            sharex=top_ax,
+        )
+        for slot in range(_DETAIL_PANEL_COUNT)
+    ]
+
+    for panel_ax, (title, series) in zip(detail_axes, BLOCK_TIMING_PANELS):
         for key, label, color in series:
             values = [float(sample[key]) for sample in samples]
             panel_ax.plot(
@@ -137,7 +170,7 @@ def create_call_count_figure(samples: list[dict[str, float | int]]) -> Figure:
     # generate_spatial_path_candidate() call, including curvature retries)
     # against the Spatial path generation + collision check block time, to
     # see at a glance whether the two track each other.
-    attempts_ax = axes[-1]
+    attempts_ax = detail_axes[len(BLOCK_TIMING_PANELS)]
     attempts = [int(sample[SPATIAL_ATTEMPTS_KEY]) for sample in samples]
     attempts_line = attempts_ax.plot(
         time_sec, attempts, color="tab:red", marker="o", markersize=2, linewidth=1,
@@ -171,7 +204,42 @@ def create_call_count_figure(samples: list[dict[str, float | int]]) -> Figure:
         loc="best", fontsize=8,
     )
 
-    axes[-1].set_xlabel("time [s]")
+    # Debug panel: costmap distance-field rebuild cost against how many
+    # rebuilds have happened so far. This is event-driven (a new /costmap
+    # message), not once-per-plan like every other panel here, so most
+    # samples repeat the last observed value and the count only steps up
+    # when an actual rebuild lands.
+    costmap_ax = detail_axes[len(BLOCK_TIMING_PANELS) + 1]
+    costmap_ms = [float(sample[COSTMAP_BUILD_MS_KEY]) for sample in samples]
+    costmap_ms_line = costmap_ax.plot(
+        time_sec, costmap_ms, color="tab:brown", marker=".", markersize=3, linewidth=1,
+        label=f"Distance-field rebuild time (mean {mean(costmap_ms):.2f} ms)",
+    )
+    costmap_ax.set_ylim(bottom=0)
+    costmap_ax.set_ylabel("rebuild time [ms]", color="tab:brown")
+    costmap_ax.tick_params(axis="y", labelcolor="tab:brown")
+    costmap_ax.grid(True, alpha=0.3)
+
+    costmap_count_ax = costmap_ax.twinx()
+    costmap_counts = [int(sample[COSTMAP_REBUILD_COUNT_KEY]) for sample in samples]
+    costmap_count_line = costmap_count_ax.step(
+        time_sec, costmap_counts, color="tab:gray", alpha=0.7, where="post",
+        linewidth=1, label="Cumulative rebuild count",
+    )
+    costmap_count_ax.set_ylabel("cumulative rebuild count", color="tab:gray")
+    costmap_count_ax.tick_params(axis="y", labelcolor="tab:gray")
+
+    costmap_ax.set_title("Costmap distance-field rebuild (event-driven, not per-plan)")
+    costmap_ax.legend(
+        costmap_ms_line + costmap_count_line,
+        [line.get_label() for line in costmap_ms_line + costmap_count_line],
+        loc="best", fontsize=8,
+    )
+
+    for slot in range(_DETAIL_PANEL_COUNT):
+        if slot // _DETAIL_GRID_COLUMNS == _DETAIL_GRID_ROWS - 1:
+            detail_axes[slot].set_xlabel("time [s]")
+
     fig.tight_layout()
     return fig
 
@@ -239,6 +307,8 @@ class PlanningCallCountReportNode(Node):
              for _, series in BLOCK_TIMING_PANELS for key, _, _ in series}
         )
         sample[SPATIAL_ATTEMPTS_KEY] = int(plan[SPATIAL_ATTEMPTS_KEY])
+        sample[COSTMAP_BUILD_MS_KEY] = float(plan[COSTMAP_BUILD_MS_KEY])
+        sample[COSTMAP_REBUILD_COUNT_KEY] = int(plan[COSTMAP_REBUILD_COUNT_KEY])
         self.samples.append(sample)
 
     def save_report(self) -> None:

@@ -90,6 +90,7 @@ struct ExecutablePlan {
   double trajectory_normal_ms{0.0};
   double trajectory_terminal_ms{0.0};
   double allocation_block_ms{0.0};
+  double handover_prediction_ms{0.0};
 };
 
 struct InputSnapshot {
@@ -109,6 +110,11 @@ struct InputSnapshot {
   std::uint64_t structural_revision{0};
   std::uint64_t command_revision{0};
   std::string frame_id{"map"};
+};
+
+struct CostmapBuildSnapshot {
+  double last_costmap_build_ms{0.0};
+  std::uint64_t costmap_rebuild_count{0};
 };
 
 struct ModeStatusSnapshot {
@@ -442,9 +448,12 @@ class PlannerNodeCpp final : public rclcpp::Node {
         if (received_costmap_ && fingerprint == costmap_fingerprint_) return;
       }
       std::vector<std::int8_t> data(msg->data.begin(), msg->data.end());
+      const auto build_start = std::chrono::steady_clock::now();
       auto map = std::make_shared<Costmap2D>(
           std::move(data), width, height, msg->info.resolution,
           msg->info.origin.position.x, msg->info.origin.position.y);
+      const double build_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - build_start).count();
       {
         std::lock_guard<std::mutex> lock(input_mutex_);
         costmap_ = std::move(map);
@@ -452,6 +461,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
         costmap_fingerprint_ = fingerprint;
         received_costmap_ = true;
         ++structural_revision_;
+        last_costmap_build_ms_ = build_ms;
+        ++costmap_rebuild_count_;
       }
       invalidate_pending_plan();
       request_replan("COSTMAP_CHANGED", true);
@@ -622,6 +633,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
         std::lock_guard<std::mutex> lock(execution_mutex_);
         active = active_plan_;
       }
+      const auto handover_start = std::chrono::steady_clock::now();
       const auto handover = predict_handover_state(
           input->state, input->body_yaw, input->state_time_ns, scheduled_start,
           active ? std::optional<std::int64_t>(active->start_ns) : std::nullopt,
@@ -630,6 +642,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
           command_dt_, std::min(std::abs(config_.constraints.a_min),
                                 config_.longitudinal.service_deceleration),
           std::min(config_.constraints.jerk_max, config_.longitudinal.comfort_jerk));
+      const double handover_prediction_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - handover_start).count();
 
       if (active) {
         const auto handover_projection = planner_->path().project(
@@ -762,6 +776,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       executable->trajectory_normal_ms = block_timings.trajectory_normal_ms;
       executable->trajectory_terminal_ms = block_timings.trajectory_terminal_ms;
       executable->allocation_block_ms = block_timings.allocation_ms;
+      executable->handover_prediction_ms = handover_prediction_ms;
       bool registration_stale = false;
       {
         // Register the plan atomically with respect to input revision updates
@@ -1051,6 +1066,11 @@ class PlannerNodeCpp final : public rclcpp::Node {
     trajectory_data_pub_->publish(data_message);
   }
 
+  CostmapBuildSnapshot costmap_build_snapshot() const {
+    std::lock_guard<std::mutex> lock(input_mutex_);
+    return {last_costmap_build_ms_, costmap_rebuild_count_};
+  }
+
   ModeStatusSnapshot mode_status_snapshot() const {
     std::lock_guard<std::mutex> lock(input_mutex_);
     ModeStatusSnapshot status;
@@ -1074,6 +1094,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
     const auto& diagnostics = plan.result.diagnostics;
     const auto& trajectory = plan.result.trajectory;
     const auto mode_status = mode_status_snapshot();
+    const auto costmap_build = costmap_build_snapshot();
     std_msgs::msg::String message;
     std::ostringstream stream;
     const double selected_n_target =
@@ -1185,7 +1206,10 @@ class PlannerNodeCpp final : public rclcpp::Node {
            << ",\"spatial_terminal_ms\":" << plan.spatial_terminal_ms
            << ",\"trajectory_normal_ms\":" << plan.trajectory_normal_ms
            << ",\"trajectory_terminal_ms\":" << plan.trajectory_terminal_ms
-           << ",\"allocation_block_ms\":" << plan.allocation_block_ms << "}"
+           << ",\"allocation_block_ms\":" << plan.allocation_block_ms
+           << ",\"handover_prediction_ms\":" << plan.handover_prediction_ms
+           << ",\"costmap_build_ms\":" << costmap_build.last_costmap_build_ms
+           << ",\"costmap_rebuild_count\":" << costmap_build.costmap_rebuild_count << "}"
            << ",\"timing\":{"
            << "\"deadline_ms\":100.0"
            << ",\"handover_lead_sec\":"
@@ -1273,6 +1297,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
   std::uint64_t command_revision_{0};
   std::uint64_t mode_revision_{0};
   std::uint64_t costmap_fingerprint_{0};
+  double last_costmap_build_ms_{0.0};
+  std::uint64_t costmap_rebuild_count_{0};
 
   std::shared_ptr<const ExecutablePlan> active_plan_;
   std::shared_ptr<const ExecutablePlan> pending_plan_;

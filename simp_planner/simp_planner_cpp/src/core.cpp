@@ -2123,6 +2123,10 @@ TimeTrajectory PathVelocityPlanner::emergency_stop(
                                   remaining);
   auto path = generate_spatial_path_candidate(state, previous_action, fr, fr.n,
       config_.lateral.min_length, std::max(preview, 0.2), config_, path_, -1);
+  // Every branch below produces a stopping trajectory (the last-resort
+  // fallback once no cruise-safe candidate survived), so its cost belongs in
+  // the "stop" bucket regardless of terminal_mode_active.
+  ScopedBlockTimer emergency_trajectory_timer(g_planning_block_timings.trajectory_terminal_ms);
   if (!path) {
     auto tr = stationary_time_trajectory(state, config_, costmap_ ? &*costmap_ : nullptr);
     tr.valid_dynamic = false;
@@ -2650,9 +2654,10 @@ PlanResult PathVelocityPlanner::plan_at_speed(
       ++g_planning_call_counts.trajectory_planning;
       TimeTrajectory braking;
       {
-      ScopedBlockTimer braking_block_timer(terminal_mode_active
-          ? g_planning_block_timings.trajectory_terminal_ms
-          : g_planning_block_timings.trajectory_normal_ms);
+      // This is itself a braking/stopping rollout (the cruise batch already
+      // failed), so it always belongs in the "stop" bucket, regardless of
+      // terminal_mode_active.
+      ScopedBlockTimer braking_block_timer(g_planning_block_timings.trajectory_terminal_ms);
       braking = generate_open_loop_trajectory(
           best->path, state, previous_action, map_end_mode || local_stop, config_,
           costmap_ ? &*costmap_ : nullptr, true,
@@ -2669,6 +2674,7 @@ PlanResult PathVelocityPlanner::plan_at_speed(
       }
     }
     if (!braking_fallback_safe) {
+      ++g_planning_call_counts.trajectory_planning;
       auto braking = emergency_stop(state, previous_action, target_speed, terminal_mode_active);
       if (braking.safe()) {
         result.selected_path.reset();

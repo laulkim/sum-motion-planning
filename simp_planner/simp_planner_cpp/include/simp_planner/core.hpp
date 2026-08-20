@@ -107,7 +107,7 @@ struct LateralPathConfig {
       8.0};
   double min_length{3.0};
   double max_length{50.0};
-  double spatial_ds{0.25};
+  double spatial_ds{0.5};
   double dynamic_margin{1.08};
   double preview_extra{2.0};
   int normal_shortlist_size{9};
