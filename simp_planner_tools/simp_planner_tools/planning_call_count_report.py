@@ -303,8 +303,16 @@ def create_stage_breakdown_figure(samples: list[dict[str, float | int]]) -> Figu
         values = [float(sample[key]) for sample in samples]
         ax.plot(
             time_sec, values, color=color, marker="o", markersize=2, linewidth=1,
-            label=f"mean {mean(values):.2f} ms",
+            label=f"mean {mean(values):.2f} ms", zorder=3,
         )
+        max_v = max(values)
+        min_v = min(values)
+        ax.axhspan(max_v * 0.985, max_v * 1.015, color="tab:orange", alpha=0.20, zorder=0)
+        ax.axhline(max_v, color="tab:orange", linestyle=":", linewidth=1.3,
+                   label=f"max {max_v:.2f} ms", zorder=1)
+        ax.axhspan(min_v * 0.985, min_v * 1.015, color="tab:blue", alpha=0.20, zorder=0)
+        ax.axhline(min_v, color="tab:blue", linestyle=":", linewidth=1.3,
+                   label=f"min {min_v:.2f} ms", zorder=1)
         ax.set_ylim(bottom=0)
         ax.set_ylabel("time [ms]")
         ax.set_title(label)

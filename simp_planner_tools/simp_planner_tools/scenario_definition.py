@@ -221,6 +221,20 @@ def load_scenario_definition(
         )
         return ScenarioDefinition(name=name, phases=(phase,))
 
+    if name == "straight_long":
+        # A pure 300 m straight reference path with no obstacles or gates,
+        # for sustained high-speed cruise/tracking checks without any
+        # avoidance maneuver in the way.
+        phase = ScenarioPhase(
+            name="straight_long_cruise",
+            path=ScenarioPath.load_csv(
+                _map_path(share_directory, "straight_long.csv"),
+                closed_loop=False,
+            ),
+            cruise_speed=2.0,
+        )
+        return ScenarioDefinition(name=name, phases=(phase,))
+
 
     if name == "s_curve_obstacles":
         path = ScenarioPath.load_csv(
@@ -540,7 +554,7 @@ def load_scenario_definition(
         )
 
     supported = (
-        "stadium, crab_switch, reverse_switch, s_curve, obstacle_avoidance, "
+        "stadium, crab_switch, reverse_switch, s_curve, straight_long, obstacle_avoidance, "
         "terminal_safe_region, s_curve_obstacles, alternating_gate_corridor, curved_gate_maze, "
         "winding_obstacle_course, narrow_22m_stop_corridor, narrow_28m_corridor, narrow_offset_corridor"
     )
