@@ -179,53 +179,61 @@ ProfileResult septic_boundary_profile(const std::vector<double>& q,
                                       double dddp0,
                                       double p1) {
   const double L = std::max(length, 1.0e-6);
-  const double b0 = p0;
-  const double b1 = dp0 * L;
-  const double b2 = 0.5 * ddp0 * L * L;
-  const double b3 = (1.0 / 6.0) * dddp0 * L * L * L;
-  const std::array<double, 4> rhs{{
-      p1 - (b0 + b1 + b2 + b3),
-      -(b1 + 2.0 * b2 + 3.0 * b3),
-      -(2.0 * b2 + 6.0 * b3),
-      -6.0 * b3,
-  }};
-  const double b4 = 35.0 * rhs[0] - 15.0 * rhs[1] + 2.5 * rhs[2] - rhs[3] / 6.0;
-  const double b5 = -84.0 * rhs[0] + 39.0 * rhs[1] - 7.0 * rhs[2] + 0.5 * rhs[3];
-  const double b6 = 70.0 * rhs[0] - 34.0 * rhs[1] + 6.5 * rhs[2] - 0.5 * rhs[3];
-  const double b7 = -20.0 * rhs[0] + 10.0 * rhs[1] - 2.0 * rhs[2] + rhs[3] / 6.0;
-  const std::array<double, 8> c{{b0, b1, b2, b3, b4, b5, b6, b7}};
-  const std::array<double, 7> dc{{
-      b1, 2.0 * b2, 3.0 * b3, 4.0 * b4,
-      5.0 * b5, 6.0 * b6, 7.0 * b7}};
-  const std::array<double, 6> ddc{{
-      2.0 * b2, 6.0 * b3, 12.0 * b4,
-      20.0 * b5, 30.0 * b6, 42.0 * b7}};
-  const std::array<double, 5> dddc{{
-      6.0 * b3, 24.0 * b4, 60.0 * b5,
-      120.0 * b6, 210.0 * b7}};
-  const double inv_L = 1.0 / L;
-  const double inv_L2 = inv_L * inv_L;
-  const double inv_L3 = inv_L2 * inv_L;
+  std::array<double, 8> c;
+  std::array<double, 7> dc;
+  std::array<double, 6> ddc;
+  std::array<double, 5> dddc;
+  double inv_L, inv_L2, inv_L3;
+  {
+    ScopedBlockTimer polynomial_fit_timer(g_planning_block_timings.candidate_polynomial_fit_ms);
+    const double b0 = p0;
+    const double b1 = dp0 * L;
+    const double b2 = 0.5 * ddp0 * L * L;
+    const double b3 = (1.0 / 6.0) * dddp0 * L * L * L;
+    const std::array<double, 4> rhs{{
+        p1 - (b0 + b1 + b2 + b3),
+        -(b1 + 2.0 * b2 + 3.0 * b3),
+        -(2.0 * b2 + 6.0 * b3),
+        -6.0 * b3,
+    }};
+    const double b4 = 35.0 * rhs[0] - 15.0 * rhs[1] + 2.5 * rhs[2] - rhs[3] / 6.0;
+    const double b5 = -84.0 * rhs[0] + 39.0 * rhs[1] - 7.0 * rhs[2] + 0.5 * rhs[3];
+    const double b6 = 70.0 * rhs[0] - 34.0 * rhs[1] + 6.5 * rhs[2] - 0.5 * rhs[3];
+    const double b7 = -20.0 * rhs[0] + 10.0 * rhs[1] - 2.0 * rhs[2] + rhs[3] / 6.0;
+    c = {{b0, b1, b2, b3, b4, b5, b6, b7}};
+    dc = {{b1, 2.0 * b2, 3.0 * b3, 4.0 * b4,
+           5.0 * b5, 6.0 * b6, 7.0 * b7}};
+    ddc = {{2.0 * b2, 6.0 * b3, 12.0 * b4,
+            20.0 * b5, 30.0 * b6, 42.0 * b7}};
+    dddc = {{6.0 * b3, 24.0 * b4, 60.0 * b5,
+             120.0 * b6, 210.0 * b7}};
+    inv_L = 1.0 / L;
+    inv_L2 = inv_L * inv_L;
+    inv_L3 = inv_L2 * inv_L;
+  }
 
   ProfileResult result;
   result.p.resize(q.size());
   result.dp.resize(q.size());
   result.ddp.resize(q.size());
   result.dddp.resize(q.size());
-  for (std::size_t k = 0; k < q.size(); ++k) {
-    const bool active = q[k] <= L;
-    if (!active) {
-      result.p[k] = p1;
-      result.dp[k] = 0.0;
-      result.ddp[k] = 0.0;
-      result.dddp[k] = 0.0;
-      continue;
+  {
+    ScopedBlockTimer sample_points_timer(g_planning_block_timings.candidate_sample_points_ms);
+    for (std::size_t k = 0; k < q.size(); ++k) {
+      const bool active = q[k] <= L;
+      if (!active) {
+        result.p[k] = p1;
+        result.dp[k] = 0.0;
+        result.ddp[k] = 0.0;
+        result.dddp[k] = 0.0;
+        continue;
+      }
+      const double tau = clamp_value(q[k] / L, 0.0, 1.0);
+      result.p[k] = evaluate_polynomial_horner(c, tau);
+      result.dp[k] = evaluate_polynomial_horner(dc, tau) * inv_L;
+      result.ddp[k] = evaluate_polynomial_horner(ddc, tau) * inv_L2;
+      result.dddp[k] = evaluate_polynomial_horner(dddc, tau) * inv_L3;
     }
-    const double tau = clamp_value(q[k] / L, 0.0, 1.0);
-    result.p[k] = evaluate_polynomial_horner(c, tau);
-    result.dp[k] = evaluate_polynomial_horner(dc, tau) * inv_L;
-    result.ddp[k] = evaluate_polynomial_horner(ddc, tau) * inv_L2;
-    result.dddp[k] = evaluate_polynomial_horner(dddc, tau) * inv_L3;
   }
   return result;
 }
@@ -268,31 +276,38 @@ ProfileResult terminal_position_profile(const std::vector<double>& q,
                                         double p1,
                                         double blend) {
   const double L = std::max(length, 1.0e-6);
-  const double L2 = L * L;
-  const double L4 = L2 * L2;
-  const double c4 = (p1 - p0 - dp0 * L - 0.5 * ddp0 * L * L
-                    - (1.0 / 6.0) * dddp0 * L * L * L) /
-                    L4;
+  double c4;
+  {
+    ScopedBlockTimer polynomial_fit_timer(g_planning_block_timings.candidate_polynomial_fit_ms);
+    const double L2 = L * L;
+    const double L4 = L2 * L2;
+    c4 = (p1 - p0 - dp0 * L - 0.5 * ddp0 * L * L
+         - (1.0 / 6.0) * dddp0 * L * L * L) /
+         L4;
+  }
   const auto seventh = septic_boundary_profile(q, L, p0, dp0, ddp0, dddp0, p1);
   const double b = clamp_value(blend, 0.0, 1.0);
   ProfileResult out;
   out.p.resize(q.size()); out.dp.resize(q.size()); out.ddp.resize(q.size()); out.dddp.resize(q.size());
-  for (std::size_t i = 0; i < q.size(); ++i) {
-    const double qc = clamp_value(q[i], 0.0, L);
-    double p4 = multiply_add(c4, qc, dddp0 / 6.0);
-    p4 = multiply_add(p4, qc, 0.5 * ddp0);
-    p4 = multiply_add(p4, qc, dp0);
-    p4 = multiply_add(p4, qc, p0);
-    double dp4 = multiply_add(4.0 * c4, qc, 0.5 * dddp0);
-    dp4 = multiply_add(dp4, qc, ddp0);
-    dp4 = multiply_add(dp4, qc, dp0);
-    const double ddp4 = multiply_add(
-        multiply_add(12.0 * c4, qc, dddp0), qc, ddp0);
-    const double dddp4 = multiply_add(24.0 * c4, qc, dddp0);
-    out.p[i] = (1.0 - b) * p4 + b * seventh.p[i];
-    out.dp[i] = (1.0 - b) * dp4 + b * seventh.dp[i];
-    out.ddp[i] = (1.0 - b) * ddp4 + b * seventh.ddp[i];
-    out.dddp[i] = (1.0 - b) * dddp4 + b * seventh.dddp[i];
+  {
+    ScopedBlockTimer sample_points_timer(g_planning_block_timings.candidate_sample_points_ms);
+    for (std::size_t i = 0; i < q.size(); ++i) {
+      const double qc = clamp_value(q[i], 0.0, L);
+      double p4 = multiply_add(c4, qc, dddp0 / 6.0);
+      p4 = multiply_add(p4, qc, 0.5 * ddp0);
+      p4 = multiply_add(p4, qc, dp0);
+      p4 = multiply_add(p4, qc, p0);
+      double dp4 = multiply_add(4.0 * c4, qc, 0.5 * dddp0);
+      dp4 = multiply_add(dp4, qc, ddp0);
+      dp4 = multiply_add(dp4, qc, dp0);
+      const double ddp4 = multiply_add(
+          multiply_add(12.0 * c4, qc, dddp0), qc, ddp0);
+      const double dddp4 = multiply_add(24.0 * c4, qc, dddp0);
+      out.p[i] = (1.0 - b) * p4 + b * seventh.p[i];
+      out.dp[i] = (1.0 - b) * dp4 + b * seventh.dp[i];
+      out.ddp[i] = (1.0 - b) * ddp4 + b * seventh.ddp[i];
+      out.dddp[i] = (1.0 - b) * dddp4 + b * seventh.dddp[i];
+    }
   }
   return out;
 }
@@ -525,18 +540,24 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
     int curvature_retry_depth = 0,
     bool hard_preview_limit = false) {
   ++g_planning_call_counts.spatial_candidate_generation_attempts;
-  const double real_end_s = reference.s_max() - cfg.simulation.path_end_margin;
-  const double remaining_real = std::max(real_end_s - fr.s, 0.0);
-  const auto boundary = initial_spatial_boundaries(state, previous_action, fr, cfg, reference);
-  start_delay = std::max(start_delay, 0.0);
-  const double profile_elapsed = maneuver_profile
-      ? clamp_value(maneuver_profile->elapsed_length, 0.0,
-                    maneuver_profile->start_delay + maneuver_profile->lateral_length)
-      : 0.0;
-  const double profile_total_length = maneuver_profile
-      ? maneuver_profile->start_delay + maneuver_profile->lateral_length
-      : start_delay + lateral_length;
-  const double total_lateral_length = std::max(profile_total_length - profile_elapsed, 0.0);
+  double real_end_s, remaining_real;
+  InitialSpatialBoundary boundary;
+  double profile_elapsed, profile_total_length, total_lateral_length;
+  {
+    ScopedBlockTimer boundary_setup_timer(g_planning_block_timings.candidate_boundary_setup_ms);
+    real_end_s = reference.s_max() - cfg.simulation.path_end_margin;
+    remaining_real = std::max(real_end_s - fr.s, 0.0);
+    boundary = initial_spatial_boundaries(state, previous_action, fr, cfg, reference);
+    start_delay = std::max(start_delay, 0.0);
+    profile_elapsed = maneuver_profile
+        ? clamp_value(maneuver_profile->elapsed_length, 0.0,
+                      maneuver_profile->start_delay + maneuver_profile->lateral_length)
+        : 0.0;
+    profile_total_length = maneuver_profile
+        ? maneuver_profile->start_delay + maneuver_profile->lateral_length
+        : start_delay + lateral_length;
+    total_lateral_length = std::max(profile_total_length - profile_elapsed, 0.0);
+  }
 
   auto evaluate_profile = [&](const std::vector<double>& local_q) {
     if (!maneuver_profile) {
@@ -563,91 +584,118 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
         maneuver_profile->n3,
         maneuver_profile->target);
   };
-  double base_extent = std::max(preview_length * 1.35 + cfg.lateral.preview_extra,
-                                total_lateral_length + 1.0);
-  if (remaining_real <= preview_length) {
-    base_extent = std::max(base_extent, remaining_real + cfg.simulation.virtual_extension_min);
-    base_extent = std::min(base_extent, remaining_real + cfg.simulation.virtual_extension_max);
+  double base_extent, q_extent;
+  std::vector<double> q;
+  {
+    ScopedBlockTimer boundary_setup_timer(g_planning_block_timings.candidate_boundary_setup_ms);
+    base_extent = std::max(preview_length * 1.35 + cfg.lateral.preview_extra,
+                           total_lateral_length + 1.0);
+    if (remaining_real <= preview_length) {
+      base_extent = std::max(base_extent, remaining_real + cfg.simulation.virtual_extension_min);
+      base_extent = std::min(base_extent, remaining_real + cfg.simulation.virtual_extension_max);
+    }
+    q_extent = std::max(base_extent, 0.2);
+    q = make_arange(q_extent + cfg.lateral.spatial_ds, cfg.lateral.spatial_ds);
+    q.push_back(remaining_real);
+    sort_unique(q);
+    if (q.size() < 3) q = {0.0, 0.5 * std::max(q_extent, 0.2), std::max(q_extent, 0.2)};
   }
-  const double q_extent = std::max(base_extent, 0.2);
-  auto q = make_arange(q_extent + cfg.lateral.spatial_ds, cfg.lateral.spatial_ds);
-  q.push_back(remaining_real);
-  sort_unique(q);
-  if (q.size() < 3) q = {0.0, 0.5 * std::max(q_extent, 0.2), std::max(q_extent, 0.2)};
 
   ProfileResult profile = evaluate_profile(q);
   std::vector<double> s_query(q.size());
-  for (std::size_t i = 0; i < q.size(); ++i) s_query[i] = fr.s + q[i];
-  auto ref = evaluate_reference_with_virtual_extension(reference, s_query, real_end_s,
-                                                        cfg.simulation.virtual_extension_blend_length);
+  ReferenceEvaluation ref;
+  {
+    ScopedBlockTimer projection_timer(g_planning_block_timings.candidate_projection_ms);
+    for (std::size_t i = 0; i < q.size(); ++i) s_query[i] = fr.s + q[i];
+    ref = evaluate_reference_with_virtual_extension(reference, s_query, real_end_s,
+                                                     cfg.simulation.virtual_extension_blend_length);
+  }
   std::vector<double> x(q.size()), y(q.size());
-  for (std::size_t i = 0; i < q.size(); ++i) {
-    x[i] = ref.x[i] - profile.p[i] * std::sin(ref.psi[i]);
-    y[i] = ref.y[i] + profile.p[i] * std::cos(ref.psi[i]);
+  {
+    ScopedBlockTimer curvature_cartesian_timer(g_planning_block_timings.candidate_curvature_cartesian_ms);
+    for (std::size_t i = 0; i < q.size(); ++i) {
+      x[i] = ref.x[i] - profile.p[i] * std::sin(ref.psi[i]);
+      y[i] = ref.y[i] + profile.p[i] * std::cos(ref.psi[i]);
+    }
   }
-  double target_spatial_length = hard_preview_limit
-      ? std::max(preview_length, 0.20)
-      : std::max(preview_length, std::min(total_lateral_length + 1.0, q_extent));
-  if (remaining_real <= preview_length) {
-    target_spatial_length = std::max(target_spatial_length, remaining_real + cfg.simulation.virtual_extension_min);
+  {
+    ScopedBlockTimer boundary_setup_timer(g_planning_block_timings.candidate_boundary_setup_ms);
+    double target_spatial_length = hard_preview_limit
+        ? std::max(preview_length, 0.20)
+        : std::max(preview_length, std::min(total_lateral_length + 1.0, q_extent));
+    if (remaining_real <= preview_length) {
+      target_spatial_length = std::max(target_spatial_length, remaining_real + cfg.simulation.virtual_extension_min);
+    }
+    q = truncate_q_at_path_length(q, x, y, target_spatial_length);
+    q.push_back(std::min(remaining_real, q.back()));
+    sort_unique(q);
   }
-  q = truncate_q_at_path_length(q, x, y, target_spatial_length);
-  q.push_back(std::min(remaining_real, q.back()));
-  sort_unique(q);
 
   profile = evaluate_profile(q);
-  s_query.resize(q.size());
-  for (std::size_t i = 0; i < q.size(); ++i) s_query[i] = fr.s + q[i];
-  ref = evaluate_reference_with_virtual_extension(reference, s_query, real_end_s,
-                                                   cfg.simulation.virtual_extension_blend_length);
-  x.resize(q.size()); y.resize(q.size());
-  for (std::size_t i = 0; i < q.size(); ++i) {
-    x[i] = ref.x[i] - profile.p[i] * std::sin(ref.psi[i]);
-    y[i] = ref.y[i] + profile.p[i] * std::cos(ref.psi[i]);
+  {
+    ScopedBlockTimer projection_timer(g_planning_block_timings.candidate_projection_ms);
+    s_query.resize(q.size());
+    for (std::size_t i = 0; i < q.size(); ++i) s_query[i] = fr.s + q[i];
+    ref = evaluate_reference_with_virtual_extension(reference, s_query, real_end_s,
+                                                     cfg.simulation.virtual_extension_blend_length);
   }
-  auto arc = cumulative_arc_length(x, y);
-  std::vector<std::size_t> keep;
-  keep.reserve(q.size());
-  keep.push_back(0);
-  for (std::size_t i = 1; i < q.size(); ++i) {
-    if (arc[i] - arc[keep.back()] > 1.0e-8) keep.push_back(i);
-  }
-  if (keep.size() != q.size()) {
-    auto select_double = [&keep](const std::vector<double>& values) {
-      std::vector<double> selected; selected.reserve(keep.size());
-      for (auto idx : keep) selected.push_back(values[idx]);
-      return selected;
-    };
-    auto select_byte = [&keep](const std::vector<std::uint8_t>& values) {
-      std::vector<std::uint8_t> selected; selected.reserve(keep.size());
-      for (auto idx : keep) selected.push_back(values[idx]);
-      return selected;
-    };
-    q = select_double(q); x = select_double(x); y = select_double(y);
-    profile.p = select_double(profile.p); profile.dp = select_double(profile.dp); profile.ddp = select_double(profile.ddp);
-    ref.psi = select_double(ref.psi); ref.kappa = select_double(ref.kappa); ref.kappa_s = select_double(ref.kappa_s);
-    ref.is_virtual = select_byte(ref.is_virtual);
+  std::vector<double> arc;
+  {
+    ScopedBlockTimer curvature_cartesian_timer(g_planning_block_timings.candidate_curvature_cartesian_ms);
+    x.resize(q.size()); y.resize(q.size());
+    for (std::size_t i = 0; i < q.size(); ++i) {
+      x[i] = ref.x[i] - profile.p[i] * std::sin(ref.psi[i]);
+      y[i] = ref.y[i] + profile.p[i] * std::cos(ref.psi[i]);
+    }
     arc = cumulative_arc_length(x, y);
+    std::vector<std::size_t> keep;
+    keep.reserve(q.size());
+    keep.push_back(0);
+    for (std::size_t i = 1; i < q.size(); ++i) {
+      if (arc[i] - arc[keep.back()] > 1.0e-8) keep.push_back(i);
+    }
+    if (keep.size() != q.size()) {
+      auto select_double = [&keep](const std::vector<double>& values) {
+        std::vector<double> selected; selected.reserve(keep.size());
+        for (auto idx : keep) selected.push_back(values[idx]);
+        return selected;
+      };
+      auto select_byte = [&keep](const std::vector<std::uint8_t>& values) {
+        std::vector<std::uint8_t> selected; selected.reserve(keep.size());
+        for (auto idx : keep) selected.push_back(values[idx]);
+        return selected;
+      };
+      q = select_double(q); x = select_double(x); y = select_double(y);
+      profile.p = select_double(profile.p); profile.dp = select_double(profile.dp); profile.ddp = select_double(profile.ddp);
+      ref.psi = select_double(ref.psi); ref.kappa = select_double(ref.kappa); ref.kappa_s = select_double(ref.kappa_s);
+      ref.is_virtual = select_byte(ref.is_virtual);
+      arc = cumulative_arc_length(x, y);
+    }
   }
   if (arc.size() < 3 || arc.back() < 0.1) return std::nullopt;
 
   std::vector<double> psi(arc.size()), kappa(arc.size());
-  for (std::size_t i = 0; i < arc.size(); ++i) {
-    const double A = 1.0 - ref.kappa[i] * profile.p[i];
-    psi[i] = ref.psi[i] + std::atan2(profile.dp[i], A);
+  std::vector<double> kappa_l;
+  {
+    ScopedBlockTimer curvature_cartesian_timer(g_planning_block_timings.candidate_curvature_cartesian_ms);
+    for (std::size_t i = 0; i < arc.size(); ++i) {
+      const double A = 1.0 - ref.kappa[i] * profile.p[i];
+      psi[i] = ref.psi[i] + std::atan2(profile.dp[i], A);
+    }
+    psi = unwrap_angles(psi);
+    const double branch_shift = 2.0 * kPi * std::round((state.chi - psi.front()) / (2.0 * kPi));
+    for (double& value : psi) value += branch_shift;
+    for (std::size_t i = 0; i < arc.size(); ++i) {
+      const double A = 1.0 - ref.kappa[i] * profile.p[i];
+      const double D = std::max(A * A + profile.dp[i] * profile.dp[i], 1.0e-10);
+      const double A_prime = -ref.kappa_s[i] * profile.p[i] - ref.kappa[i] * profile.dp[i];
+      kappa[i] = (ref.kappa[i] * D + A * profile.ddp[i] - profile.dp[i] * A_prime) /
+                 (D * std::sqrt(D));
+    }
+    kappa_l = gradient(kappa, arc, false);
   }
-  psi = unwrap_angles(psi);
-  const double branch_shift = 2.0 * kPi * std::round((state.chi - psi.front()) / (2.0 * kPi));
-  for (double& value : psi) value += branch_shift;
-  for (std::size_t i = 0; i < arc.size(); ++i) {
-    const double A = 1.0 - ref.kappa[i] * profile.p[i];
-    const double D = std::max(A * A + profile.dp[i] * profile.dp[i], 1.0e-10);
-    const double A_prime = -ref.kappa_s[i] * profile.p[i] - ref.kappa[i] * profile.dp[i];
-    kappa[i] = (ref.kappa[i] * D + A * profile.ddp[i] - profile.dp[i] * A_prime) /
-               (D * std::sqrt(D));
-  }
-  auto kappa_l = gradient(kappa, arc, false);
   if (maneuver_profile == nullptr) {
+    ScopedBlockTimer curvature_cartesian_timer(g_planning_block_timings.candidate_curvature_cartesian_ms);
     // A newly generated profile must begin exactly at the measured motion
     // state.  For a latched profile, however, overriding its front tangent and
     // curvature on every 10 Hz replan would repeatedly flatten the first
@@ -668,7 +716,10 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
   const double real_end_n = interp_scalar(q, profile.p, real_end_q);
   const double real_end_psi = interp_scalar(q, psi, real_end_q);
   double end_x, end_y, ref_end_psi, end_kappa, end_kappa_s;
-  reference.evaluate(real_end_s, end_x, end_y, ref_end_psi, end_kappa, end_kappa_s);
+  {
+    ScopedBlockTimer projection_timer(g_planning_block_timings.candidate_projection_ms);
+    reference.evaluate(real_end_s, end_x, end_y, ref_end_psi, end_kappa, end_kappa_s);
+  }
   (void)end_kappa_s;
   const double real_end_heading_error = wrap_angle(real_end_psi - ref_end_psi);
   const double virtual_extension_length = std::max(0.0, q.back() - remaining_real);

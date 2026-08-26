@@ -62,6 +62,26 @@ struct PlanningBlockTimings {
   double feasibility_check_ms{0.0};
   double collision_check_ms{0.0};
   double ranking_ms{0.0};
+  // Further breakdown of candidate_generation_ms into the internal phases of
+  // generate_spatial_path_candidate() (all nested inside it, so each of
+  // these is also counted in candidate_generation_ms and they need not sum
+  // to it exactly). candidate_projection_ms is every reference-path
+  // evaluate() call used to map a query arc-length back onto the global
+  // path -- cost scales with how many query points get evaluated, i.e. with
+  // the global path's input/sampling. candidate_boundary_setup_ms is the
+  // initial Frenet boundary conditions plus the spatial (S) extent/sample-
+  // array setup -- a fixed amount of work per attempt.
+  // candidate_polynomial_fit_ms is solving for the septic/quartic lateral-
+  // offset polynomial coefficients, redone on every curvature-violation
+  // retry. candidate_sample_points_ms is evaluating that polynomial
+  // (Horner) at each sample point. candidate_curvature_cartesian_ms is
+  // turning the resulting Frenet samples into Cartesian (x, y) points plus
+  // the arc-length/curvature/curvature-rate derived from them.
+  double candidate_projection_ms{0.0};
+  double candidate_boundary_setup_ms{0.0};
+  double candidate_polynomial_fit_ms{0.0};
+  double candidate_sample_points_ms{0.0};
+  double candidate_curvature_cartesian_ms{0.0};
 };
 
 void reset_planning_call_counts();

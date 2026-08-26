@@ -114,6 +114,11 @@ struct ExecutablePlan {
   double feasibility_check_ms{0.0};
   double collision_check_ms{0.0};
   double ranking_ms{0.0};
+  double candidate_projection_ms{0.0};
+  double candidate_boundary_setup_ms{0.0};
+  double candidate_polynomial_fit_ms{0.0};
+  double candidate_sample_points_ms{0.0};
+  double candidate_curvature_cartesian_ms{0.0};
 };
 
 struct InputSnapshot {
@@ -819,6 +824,11 @@ class PlannerNodeCpp final : public rclcpp::Node {
       executable->feasibility_check_ms = block_timings.feasibility_check_ms;
       executable->collision_check_ms = block_timings.collision_check_ms;
       executable->ranking_ms = block_timings.ranking_ms;
+      executable->candidate_projection_ms = block_timings.candidate_projection_ms;
+      executable->candidate_boundary_setup_ms = block_timings.candidate_boundary_setup_ms;
+      executable->candidate_polynomial_fit_ms = block_timings.candidate_polynomial_fit_ms;
+      executable->candidate_sample_points_ms = block_timings.candidate_sample_points_ms;
+      executable->candidate_curvature_cartesian_ms = block_timings.candidate_curvature_cartesian_ms;
       bool registration_stale = false;
       {
         // Register the plan atomically with respect to input revision updates
@@ -1255,6 +1265,11 @@ class PlannerNodeCpp final : public rclcpp::Node {
            << ",\"feasibility_check_ms\":" << plan.feasibility_check_ms
            << ",\"collision_check_ms\":" << plan.collision_check_ms
            << ",\"ranking_ms\":" << plan.ranking_ms
+           << ",\"candidate_projection_ms\":" << plan.candidate_projection_ms
+           << ",\"candidate_boundary_setup_ms\":" << plan.candidate_boundary_setup_ms
+           << ",\"candidate_polynomial_fit_ms\":" << plan.candidate_polynomial_fit_ms
+           << ",\"candidate_sample_points_ms\":" << plan.candidate_sample_points_ms
+           << ",\"candidate_curvature_cartesian_ms\":" << plan.candidate_curvature_cartesian_ms
            << ",\"costmap_build_ms\":" << costmap_build.last_costmap_build_ms
            << ",\"costmap_rebuild_count\":" << costmap_build.costmap_rebuild_count << "}"
            << ",\"timing\":{"

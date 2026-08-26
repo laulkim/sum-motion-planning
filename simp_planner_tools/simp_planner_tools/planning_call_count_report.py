@@ -87,16 +87,33 @@ COSTMAP_REBUILD_COUNT_KEY = "costmap_rebuild_count"
 
 # Per-activated-plan time (ms), broken down by computation kind rather than by
 # pipeline stage. This is orthogonal to BLOCK_TIMING_PANELS above (each stage
-# there is a mix of these kinds); a candidate/feasibility/collision/ranking
-# operation that runs inside e.g. spatial screening is counted here too, so
-# these do not sum to total_compute_time_ms and are not meant to.
+# there is a mix of these kinds); a candidate/collision operation that runs
+# inside e.g. spatial screening is counted here too, so these do not sum to
+# total_compute_time_ms and are not meant to.
 # candidate_generation_ms sums every generate_spatial_path_candidate() call in
-# the cycle (curvature retries and the short-path fallback pass included).
+# the cycle (curvature retries and the short-path fallback pass included). The
+# five candidate_* entries right after it are a further breakdown of that
+# same total into the internal phases of generate_spatial_path_candidate()
+# (they are nested inside it, so they need not sum to it exactly):
+# projection (reference-path evaluate() calls -- cost scales with the global
+# path's sampling), boundary+S setup (initial Frenet boundary conditions plus
+# the spatial-extent/sample-array setup -- fixed cost per attempt),
+# polynomial fit (solving for the lateral-offset polynomial coefficients --
+# redone on every curvature-violation retry), sample points (evaluating that
+# polynomial at each sample), and curvature/Cartesian (turning the Frenet
+# samples into (x, y) points plus arc-length/curvature/curvature-rate).
+# feasibility_check_ms and ranking_ms are still recorded in the planner's
+# status JSON (see PlanningBlockTimings in core.hpp) but are intentionally
+# left out of this panel grid -- both are consistently near-zero and not
+# useful next to the other buckets here.
 STAGE_BREAKDOWN_SERIES = (
-    ("candidate_generation_ms", "Candidate path generation", "tab:blue"),
-    ("feasibility_check_ms", "Feasibility check", "tab:orange"),
+    ("candidate_generation_ms", "Candidate path generation (total)", "tab:blue"),
+    ("candidate_projection_ms", "Candidate gen: projection", "tab:cyan"),
+    ("candidate_boundary_setup_ms", "Candidate gen: boundary + S length", "tab:purple"),
+    ("candidate_polynomial_fit_ms", "Candidate gen: polynomial fit", "tab:brown"),
+    ("candidate_sample_points_ms", "Candidate gen: sample points", "tab:pink"),
+    ("candidate_curvature_cartesian_ms", "Candidate gen: curvature + Cartesian", "tab:olive"),
     ("collision_check_ms", "Collision check", "tab:red"),
-    ("ranking_ms", "Ranking / selection", "tab:green"),
 )
 
 REQUIRED_KEYS = (
@@ -259,14 +276,30 @@ def create_call_count_figure(samples: list[dict[str, float | int]]) -> Figure:
     return fig
 
 
+_STAGE_GRID_COLUMNS = 3
+_STAGE_GRID_ROWS = -(-len(STAGE_BREAKDOWN_SERIES) // _STAGE_GRID_COLUMNS)
+
+
 def create_stage_breakdown_figure(samples: list[dict[str, float | int]]) -> Figure:
     """Build a separate window with one subplot per requested computation
-    kind (candidate generation, feasibility check, collision check, ranking)
-    instead of overlaying all four on a single plot."""
+    kind: the candidate-generation total, its five internal-phase
+    sub-stages, and collision check -- instead of overlaying all of them on
+    a single plot."""
     time_sec = [float(sample["time_s"]) for sample in samples]
 
-    fig, axes = plt.subplots(2, 2, figsize=(13.0, 9.0), sharex=True)
-    for ax, (key, label, color) in zip(axes.flat, STAGE_BREAKDOWN_SERIES):
+    fig = plt.figure(
+        figsize=(6.5 * _STAGE_GRID_COLUMNS, 4.0 * _STAGE_GRID_ROWS)
+    )
+    gs = fig.add_gridspec(_STAGE_GRID_ROWS, _STAGE_GRID_COLUMNS)
+    axes: list = []
+    for slot in range(len(STAGE_BREAKDOWN_SERIES)):
+        ax = fig.add_subplot(
+            gs[slot // _STAGE_GRID_COLUMNS, slot % _STAGE_GRID_COLUMNS],
+            sharex=axes[0] if axes else None,
+        )
+        axes.append(ax)
+
+    for ax, (key, label, color) in zip(axes, STAGE_BREAKDOWN_SERIES):
         values = [float(sample[key]) for sample in samples]
         ax.plot(
             time_sec, values, color=color, marker="o", markersize=2, linewidth=1,
@@ -278,11 +311,17 @@ def create_stage_breakdown_figure(samples: list[dict[str, float | int]]) -> Figu
         ax.grid(True, alpha=0.3)
         ax.legend(loc="best", fontsize=8)
 
-    for ax in axes[-1, :]:
-        ax.set_xlabel("time [s]")
+    # Label the bottom-most axis in each column, since a series count that
+    # isn't a multiple of _STAGE_GRID_COLUMNS leaves the last row partial.
+    labeled_columns: set[int] = set()
+    for slot in reversed(range(len(axes))):
+        column = slot % _STAGE_GRID_COLUMNS
+        if column not in labeled_columns:
+            axes[slot].set_xlabel("time [s]")
+            labeled_columns.add(column)
 
     fig.suptitle(f"Planning computation by stage ({len(samples)} activated plans)")
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
     return fig
 
 
