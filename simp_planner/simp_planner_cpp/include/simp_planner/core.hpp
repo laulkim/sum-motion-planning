@@ -47,6 +47,21 @@ struct PlanningBlockTimings {
   double trajectory_normal_ms{0.0};
   double trajectory_terminal_ms{0.0};
   double allocation_ms{0.0};
+  // Cross-cutting breakdown by computation kind, orthogonal to the five
+  // stage buckets above (a stage's time is also counted here under whichever
+  // kind of work it was doing). candidate_generation_ms sums every
+  // generate_spatial_path_candidate() call in the cycle, including
+  // curvature-violation retries and the short-path fallback pass.
+  // feasibility_check_ms is the open-loop trajectory simulation plus its
+  // dynamic/kinematic constraint checks. collision_check_ms covers every
+  // obstacle-clearance query (spatial screening, trajectory-level clearance,
+  // and the final oriented multi-circle allocation check). ranking_ms is the
+  // candidate sorting/selection work that picks the best entry at each
+  // stage.
+  double candidate_generation_ms{0.0};
+  double feasibility_check_ms{0.0};
+  double collision_check_ms{0.0};
+  double ranking_ms{0.0};
 };
 
 void reset_planning_call_counts();

@@ -110,6 +110,10 @@ struct ExecutablePlan {
   double trajectory_terminal_ms{0.0};
   double allocation_block_ms{0.0};
   double handover_prediction_ms{0.0};
+  double candidate_generation_ms{0.0};
+  double feasibility_check_ms{0.0};
+  double collision_check_ms{0.0};
+  double ranking_ms{0.0};
 };
 
 struct InputSnapshot {
@@ -811,6 +815,10 @@ class PlannerNodeCpp final : public rclcpp::Node {
       executable->trajectory_terminal_ms = block_timings.trajectory_terminal_ms;
       executable->allocation_block_ms = block_timings.allocation_ms;
       executable->handover_prediction_ms = handover_prediction_ms;
+      executable->candidate_generation_ms = block_timings.candidate_generation_ms;
+      executable->feasibility_check_ms = block_timings.feasibility_check_ms;
+      executable->collision_check_ms = block_timings.collision_check_ms;
+      executable->ranking_ms = block_timings.ranking_ms;
       bool registration_stale = false;
       {
         // Register the plan atomically with respect to input revision updates
@@ -1188,7 +1196,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
            << ",\"decision_horizon_length\":"
            << diagnostics.decision_horizon_length
            << ",\"compute_time_ms\":" << compute_ms
-           << ",\"total_compute_time_ms\":" << compute_ms
+           << ",\"total_compute_time_ms\":"
+           << (compute_ms + costmap_build.last_costmap_build_ms)
            << ",\"num_safe_paths\":" << diagnostics.number_of_safe_paths
            << ",\"num_spatial_candidates\":"
            << diagnostics.number_of_lateral_paths
@@ -1242,6 +1251,10 @@ class PlannerNodeCpp final : public rclcpp::Node {
            << ",\"trajectory_terminal_ms\":" << plan.trajectory_terminal_ms
            << ",\"allocation_block_ms\":" << plan.allocation_block_ms
            << ",\"handover_prediction_ms\":" << plan.handover_prediction_ms
+           << ",\"candidate_generation_ms\":" << plan.candidate_generation_ms
+           << ",\"feasibility_check_ms\":" << plan.feasibility_check_ms
+           << ",\"collision_check_ms\":" << plan.collision_check_ms
+           << ",\"ranking_ms\":" << plan.ranking_ms
            << ",\"costmap_build_ms\":" << costmap_build.last_costmap_build_ms
            << ",\"costmap_rebuild_count\":" << costmap_build.costmap_rebuild_count << "}"
            << ",\"timing\":{"

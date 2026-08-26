@@ -85,10 +85,25 @@ SPATIAL_ATTEMPTS_KEY = "spatial_candidate_generation_attempts"
 COSTMAP_BUILD_MS_KEY = "costmap_build_ms"
 COSTMAP_REBUILD_COUNT_KEY = "costmap_rebuild_count"
 
+# Per-activated-plan time (ms), broken down by computation kind rather than by
+# pipeline stage. This is orthogonal to BLOCK_TIMING_PANELS above (each stage
+# there is a mix of these kinds); a candidate/feasibility/collision/ranking
+# operation that runs inside e.g. spatial screening is counted here too, so
+# these do not sum to total_compute_time_ms and are not meant to.
+# candidate_generation_ms sums every generate_spatial_path_candidate() call in
+# the cycle (curvature retries and the short-path fallback pass included).
+STAGE_BREAKDOWN_SERIES = (
+    ("candidate_generation_ms", "Candidate path generation", "tab:blue"),
+    ("feasibility_check_ms", "Feasibility check", "tab:orange"),
+    ("collision_check_ms", "Collision check", "tab:red"),
+    ("ranking_ms", "Ranking / selection", "tab:green"),
+)
+
 REQUIRED_KEYS = (
     tuple(key for key, _ in CATEGORIES)
     + tuple(key for _, series in BLOCK_TIMING_PANELS for key, _, _ in series)
     + (SPATIAL_ATTEMPTS_KEY, COSTMAP_BUILD_MS_KEY, COSTMAP_REBUILD_COUNT_KEY)
+    + tuple(key for key, _, _ in STAGE_BREAKDOWN_SERIES)
 )
 
 # Detail panels are laid out in a grid below the summary panel instead of a
@@ -244,10 +259,45 @@ def create_call_count_figure(samples: list[dict[str, float | int]]) -> Figure:
     return fig
 
 
+def create_stage_breakdown_figure(samples: list[dict[str, float | int]]) -> Figure:
+    """Build a separate window with one subplot per requested computation
+    kind (candidate generation, feasibility check, collision check, ranking)
+    instead of overlaying all four on a single plot."""
+    time_sec = [float(sample["time_s"]) for sample in samples]
+
+    fig, axes = plt.subplots(2, 2, figsize=(13.0, 9.0), sharex=True)
+    for ax, (key, label, color) in zip(axes.flat, STAGE_BREAKDOWN_SERIES):
+        values = [float(sample[key]) for sample in samples]
+        ax.plot(
+            time_sec, values, color=color, marker="o", markersize=2, linewidth=1,
+            label=f"mean {mean(values):.2f} ms",
+        )
+        ax.set_ylim(bottom=0)
+        ax.set_ylabel("time [ms]")
+        ax.set_title(label)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best", fontsize=8)
+
+    for ax in axes[-1, :]:
+        ax.set_xlabel("time [s]")
+
+    fig.suptitle(f"Planning computation by stage ({len(samples)} activated plans)")
+    fig.tight_layout()
+    return fig
+
+
 def render_call_count_report(
     samples: list[dict[str, float | int]], output_path: Path
 ) -> None:
     fig = create_call_count_figure(samples)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def render_stage_breakdown_report(
+    samples: list[dict[str, float | int]], output_path: Path
+) -> None:
+    fig = create_stage_breakdown_figure(samples)
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
 
@@ -309,6 +359,9 @@ class PlanningCallCountReportNode(Node):
         sample[SPATIAL_ATTEMPTS_KEY] = int(plan[SPATIAL_ATTEMPTS_KEY])
         sample[COSTMAP_BUILD_MS_KEY] = float(plan[COSTMAP_BUILD_MS_KEY])
         sample[COSTMAP_REBUILD_COUNT_KEY] = int(plan[COSTMAP_REBUILD_COUNT_KEY])
+        sample.update(
+            {key: float(plan[key]) for key, _, _ in STAGE_BREAKDOWN_SERIES}
+        )
         self.samples.append(sample)
 
     def save_report(self) -> None:
@@ -322,6 +375,13 @@ class PlanningCallCountReportNode(Node):
         self.get_logger().info(
             f"Saved {len(self.samples)}-plan time-aligned call-count report to "
             f"{png_path}"
+        )
+
+        stage_png_path = self.session_dir / "planning_stage_breakdown.png"
+        render_stage_breakdown_report(self.samples, stage_png_path)
+        self.get_logger().info(
+            f"Saved {len(self.samples)}-plan stage-breakdown report to "
+            f"{stage_png_path}"
         )
 
 

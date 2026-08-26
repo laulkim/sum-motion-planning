@@ -679,7 +679,10 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
     for (std::size_t i = 0; i < std::min<std::size_t>(3, q.size()); ++i) actual.push_back(i);
   }
   double max_curvature = 0.0;
-  for (auto idx : actual) max_curvature = std::max(max_curvature, std::abs(kappa[idx]));
+  {
+    ScopedBlockTimer feasibility_check_timer(g_planning_block_timings.feasibility_check_ms);
+    for (auto idx : actual) max_curvature = std::max(max_curvature, std::abs(kappa[idx]));
+  }
   if (max_curvature > cfg.constraints.curvature_max + 1.0e-9
       && lateral_length < cfg.lateral.max_length - 1.0e-9
       && curvature_retry_depth < 8) {
@@ -1384,8 +1387,13 @@ SpatialScreen screen_spatial_candidate(const SpatialPathCandidate& path,
       cfg.vehicle.length, cfg.vehicle.width, cfg.vehicle.footprint_margin);
   const double coarse_radius = 0.5 * cfg.vehicle.width
                              + cfg.vehicle.footprint_margin;
-  const auto ranking_clearance = path_clearance(x, y, costmap, ranking_radius);
-  const auto coarse_clearance = path_clearance(x, y, costmap, coarse_radius);
+  std::vector<double> ranking_clearance;
+  std::vector<double> coarse_clearance;
+  {
+    ScopedBlockTimer collision_check_timer(g_planning_block_timings.collision_check_ms);
+    ranking_clearance = path_clearance(x, y, costmap, ranking_radius);
+    coarse_clearance = path_clearance(x, y, costmap, coarse_radius);
+  }
   const double ranking_min = *std::min_element(ranking_clearance.begin(), ranking_clearance.end());
   const double coarse_min = *std::min_element(coarse_clearance.begin(), coarse_clearance.end());
   const bool ranking_free = std::all_of(ranking_clearance.begin(), ranking_clearance.end(),
@@ -1414,8 +1422,11 @@ SpatialScreen screen_spatial_candidate(const SpatialPathCandidate& path,
   }
   const double mean_deficit_squared = ranking_clearance.empty()
       ? 0.0 : sum_deficit_squared / static_cast<double>(ranking_clearance.size());
-  const auto terminal_goal = evaluate_terminal_goal_region(
-      path, cfg, costmap, screening_speed);
+  TerminalGoalRegionEvaluation terminal_goal;
+  {
+    ScopedBlockTimer collision_check_timer(g_planning_block_timings.collision_check_ms);
+    terminal_goal = evaluate_terminal_goal_region(path, cfg, costmap, screening_speed);
+  }
   const double terminal_soft_deficit = terminal_constraint_active
       ? std::max(0.0, soft_margin - terminal_goal.minimum_clearance)
       : 0.0;
@@ -1783,6 +1794,7 @@ TimeTrajectory generate_open_loop_trajectory(
       [](const PlannerState& lhs, const PlannerState& rhs) { return lhs.speed < rhs.speed; })->speed;
   const double hard_margin = effective_hard_clearance_margin(maximum_speed, cc);
   if (enforce_obstacle_collision) {
+    ScopedBlockTimer collision_check_timer(g_planning_block_timings.collision_check_ms);
     std::vector<double> state_x(state_count), state_y(state_count);
     for (std::size_t i = 0; i < state_count; ++i) {
       state_x[i] = trajectory.states[i].x;
@@ -2354,9 +2366,14 @@ PlanResult PathVelocityPlanner::plan_at_speed(
       const double lateral_length = std::get<1>(option);
       const double start_delay = std::get<2>(option);
       const bool terminal_position_only = std::get<3>(option);
-      auto candidate = generate_spatial_path_candidate(state, previous_action, fr,
-          n_target, lateral_length, preview_length, config_, path_, candidate_id,
-          start_delay, terminal_position_only, profile_override);
+      std::optional<SpatialPathCandidate> candidate;
+      {
+        ScopedBlockTimer candidate_generation_timer(
+            g_planning_block_timings.candidate_generation_ms);
+        candidate = generate_spatial_path_candidate(state, previous_action, fr,
+            n_target, lateral_length, preview_length, config_, path_, candidate_id,
+            start_delay, terminal_position_only, profile_override);
+      }
       const int generated_candidate_id = candidate_id;
       ++candidate_id;
       if (!candidate) continue;
@@ -2421,11 +2438,16 @@ PlanResult PathVelocityPlanner::plan_at_speed(
       const double usable = std::min(
           available, config_.lateral.short_path_max_length);
       if (usable + 1.0e-9 < minimum_stop_length) continue;
-      auto candidate = generate_spatial_path_candidate(
-          state, previous_action, fr, source.path.n_target,
-          source.path.lateral_length, usable, config_, path_, candidate_id,
-          source.path.start_delay, source.path.terminal_position_only,
-          nullptr, 0, true);
+      std::optional<SpatialPathCandidate> candidate;
+      {
+        ScopedBlockTimer candidate_generation_timer(
+            g_planning_block_timings.candidate_generation_ms);
+        candidate = generate_spatial_path_candidate(
+            state, previous_action, fr, source.path.n_target,
+            source.path.lateral_length, usable, config_, path_, candidate_id,
+            source.path.start_delay, source.path.terminal_position_only,
+            nullptr, 0, true);
+      }
       ++candidate_id;
       if (!candidate) continue;
       auto screen = screen_spatial_candidate(
@@ -2503,19 +2525,22 @@ PlanResult PathVelocityPlanner::plan_at_speed(
         cost,
         candidate_id};
   };
-  std::sort(entries.begin(), entries.end(),
-      [&](const Entry& a, const Entry& b) {
-    if (terminal_safe_region_active) {
-      return terminal_candidate_key(
-                 a.path.n_target, a.screen.terminal_goal_offset,
-                 a.screen.screening_cost, a.path.candidate_id)
-           < terminal_candidate_key(
-                 b.path.n_target, b.screen.terminal_goal_offset,
-                 b.screen.screening_cost, b.path.candidate_id);
-    }
-    return std::tuple<double, int>{a.screen.screening_cost, a.path.candidate_id}
-         < std::tuple<double, int>{b.screen.screening_cost, b.path.candidate_id};
-  });
+  {
+    ScopedBlockTimer ranking_timer(g_planning_block_timings.ranking_ms);
+    std::sort(entries.begin(), entries.end(),
+        [&](const Entry& a, const Entry& b) {
+      if (terminal_safe_region_active) {
+        return terminal_candidate_key(
+                   a.path.n_target, a.screen.terminal_goal_offset,
+                   a.screen.screening_cost, a.path.candidate_id)
+             < terminal_candidate_key(
+                   b.path.n_target, b.screen.terminal_goal_offset,
+                   b.screen.screening_cost, b.path.candidate_id);
+      }
+      return std::tuple<double, int>{a.screen.screening_cost, a.path.candidate_id}
+           < std::tuple<double, int>{b.screen.screening_cost, b.path.candidate_id};
+    });
+  }
 
   std::vector<FullCandidate> full;
   std::size_t cursor = 0;
@@ -2554,31 +2579,34 @@ PlanResult PathVelocityPlanner::plan_at_speed(
   }  // end trajectory_block_timer scope
 
   int selected = -1;
-  for (std::size_t i = 0; i < full.size(); ++i) {
-    if (!full[i].trajectory.safe()) continue;
-    if (selected < 0) {
-      selected = static_cast<int>(i);
-      continue;
-    }
-    const auto& current = full[static_cast<std::size_t>(selected)];
-    if (terminal_safe_region_active) {
-      const auto key = terminal_candidate_key(
-          full[i].path.n_target, full[i].screen.terminal_goal_offset,
-          full[i].total_cost, full[i].path.candidate_id);
-      const auto best_key = terminal_candidate_key(
-          current.path.n_target, current.screen.terminal_goal_offset,
-          current.total_cost, current.path.candidate_id);
-      if (key < best_key) selected = static_cast<int>(i);
-    } else {
-      const auto key = std::tuple<double, double, int>{
-          full[i].lateral_selection_cost,
-          std::abs(full[i].path.n_target),
-          full[i].path.candidate_id};
-      const auto best_key = std::tuple<double, double, int>{
-          current.lateral_selection_cost,
-          std::abs(current.path.n_target),
-          current.path.candidate_id};
-      if (key < best_key) selected = static_cast<int>(i);
+  {
+    ScopedBlockTimer ranking_timer(g_planning_block_timings.ranking_ms);
+    for (std::size_t i = 0; i < full.size(); ++i) {
+      if (!full[i].trajectory.safe()) continue;
+      if (selected < 0) {
+        selected = static_cast<int>(i);
+        continue;
+      }
+      const auto& current = full[static_cast<std::size_t>(selected)];
+      if (terminal_safe_region_active) {
+        const auto key = terminal_candidate_key(
+            full[i].path.n_target, full[i].screen.terminal_goal_offset,
+            full[i].total_cost, full[i].path.candidate_id);
+        const auto best_key = terminal_candidate_key(
+            current.path.n_target, current.screen.terminal_goal_offset,
+            current.total_cost, current.path.candidate_id);
+        if (key < best_key) selected = static_cast<int>(i);
+      } else {
+        const auto key = std::tuple<double, double, int>{
+            full[i].lateral_selection_cost,
+            std::abs(full[i].path.n_target),
+            full[i].path.candidate_id};
+        const auto best_key = std::tuple<double, double, int>{
+            current.lateral_selection_cost,
+            std::abs(current.path.n_target),
+            current.path.candidate_id};
+        if (key < best_key) selected = static_cast<int>(i);
+      }
     }
   }
 
@@ -2634,23 +2662,26 @@ PlanResult PathVelocityPlanner::plan_at_speed(
   } else {
     auto best = full.end();
     if (!full.empty()) {
-      best = std::min_element(full.begin(), full.end(),
-          [&](const FullCandidate& a, const FullCandidate& b) {
-        if (terminal_safe_region_active) {
-          return terminal_candidate_key(
-                     a.path.n_target, a.screen.terminal_goal_offset,
-                     a.total_cost, a.path.candidate_id)
-               < terminal_candidate_key(
-                     b.path.n_target, b.screen.terminal_goal_offset,
-                     b.total_cost, b.path.candidate_id);
-        }
-        return std::tuple<double, double, int>{
-                   a.lateral_selection_cost, std::abs(a.path.n_target),
-                   a.path.candidate_id}
-             < std::tuple<double, double, int>{
-                   b.lateral_selection_cost, std::abs(b.path.n_target),
-                   b.path.candidate_id};
-      });
+      {
+        ScopedBlockTimer ranking_timer(g_planning_block_timings.ranking_ms);
+        best = std::min_element(full.begin(), full.end(),
+            [&](const FullCandidate& a, const FullCandidate& b) {
+          if (terminal_safe_region_active) {
+            return terminal_candidate_key(
+                       a.path.n_target, a.screen.terminal_goal_offset,
+                       a.total_cost, a.path.candidate_id)
+                 < terminal_candidate_key(
+                       b.path.n_target, b.screen.terminal_goal_offset,
+                       b.total_cost, b.path.candidate_id);
+          }
+          return std::tuple<double, double, int>{
+                     a.lateral_selection_cost, std::abs(a.path.n_target),
+                     a.path.candidate_id}
+               < std::tuple<double, double, int>{
+                     b.lateral_selection_cost, std::abs(b.path.n_target),
+                     b.path.candidate_id};
+        });
+      }
       result.selected_path = best->path;
       result.diagnostics.selected_candidate_id = best->path.candidate_id;
       result.diagnostics.selected_path_mode = best->path_mode;
@@ -3130,8 +3161,12 @@ AllocationSelectionResult allocate_with_oriented_collision_search(
       continue;
     }
     ++evaluated;
-    auto collision = check_oriented_allocation_collision(
-        allocation, costmap, vehicle, cost, footprint);
+    OrientedCollisionResult collision;
+    {
+      ScopedBlockTimer collision_check_timer(g_planning_block_timings.collision_check_ms);
+      collision = check_oriented_allocation_collision(
+          allocation, costmap, vehicle, cost, footprint);
+    }
     AllocationSelectionResult candidate{std::move(allocation), collision, profile, evaluated};
     if (collision.collision_free) {
       return candidate;

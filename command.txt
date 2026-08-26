@@ -1,0 +1,3 @@
+ros2 run simp_planner_tools  planning_call_count_report_node --ros-args -p scenario:=winding_obstacle_course
+
+ros2 launch simp_planner_tools simulation.launch.py scenario:=winding_obstacle_course target_speed:=7.0 costmap_resolution:=0.1
