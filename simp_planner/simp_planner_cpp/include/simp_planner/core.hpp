@@ -637,9 +637,15 @@ class PathVelocityPlanner {
   PathVelocityPlanner(EnvConfig config, ReferencePath path,
                       std::optional<Costmap2D> costmap = std::nullopt);
 
+  // `known_projection`, when provided, must be path().project(state.x,
+  // state.y, state.chi) already computed by the caller (e.g. planner_node.cpp
+  // frequently needs that same projection for its own terminal-finishing
+  // check right before calling plan()) -- passing it in skips recomputing
+  // that same O(reference point count) nearest-point search here.
   PlanResult plan(const PlannerState& state,
                   const PlannerAction& previous_action,
-                  const PlanningCommand& command);
+                  const PlanningCommand& command,
+                  std::optional<FrenetProjection> known_projection = std::nullopt);
 
   void set_lateral_target_hint(std::optional<double> hint);
   std::optional<double> lateral_target_hint() const { return lateral_target_hint_; }
@@ -665,16 +671,22 @@ class PathVelocityPlanner {
   const std::optional<Costmap2D>& costmap() const { return costmap_; }
 
  private:
+  // `fr` must already be path_.project(state.x, state.y, state.chi) -- both
+  // callers (the plan() speed-trial loop, and emergency_stop() called with
+  // its caller's own state) already have it computed, so it's threaded
+  // through instead of each re-deriving it from scratch.
   PlanResult plan_at_speed(const PlannerState& state,
                            const PlannerAction& previous_action,
                            double target_speed,
                            DriveMode drive_mode,
                            const std::vector<int>& excluded_candidate_ids,
-                           const std::vector<double>& excluded_lateral_targets);
+                           const std::vector<double>& excluded_lateral_targets,
+                           const FrenetProjection& fr);
   TimeTrajectory emergency_stop(const PlannerState& state,
                                 const PlannerAction& previous_action,
                                 double target_speed,
-                                bool terminal_stop_required);
+                                bool terminal_stop_required,
+                                const FrenetProjection& fr);
   std::vector<double> speed_trials(double requested_speed) const;
 
   EnvConfig config_;

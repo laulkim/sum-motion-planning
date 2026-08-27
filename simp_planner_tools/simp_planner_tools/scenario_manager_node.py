@@ -67,14 +67,14 @@ class ScenarioManagerNode(Node):
         self.declare_parameter("target_speed", -1.0)
         self.declare_parameter("frame_id", "odom")
         self.declare_parameter("path_back_length", 5.0)
-        self.declare_parameter("path_ahead_length", 50.0)
+        self.declare_parameter("path_ahead_length", 35.0)
         self.declare_parameter("path_update_distance", 1.0)
         self.declare_parameter("costmap_resolution", -1.0)
         # Retained for compatibility with existing launch/config files. Local
         # costmaps now have their own fixed sensor extent and do not use it.
         self.declare_parameter("costmap_margin", 10.0)
         self.declare_parameter("costmap_size_m", 60.0)
-        self.declare_parameter("costmap_publish_hz", 5.0)
+        self.declare_parameter("costmap_publish_hz", 10.0)
         self.declare_parameter("stop_speed_threshold", 0.03)
         self.declare_parameter("terminal_capture_distance", 0.20)
         self.declare_parameter("projection_search_back", 20)

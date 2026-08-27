@@ -480,8 +480,20 @@ InitialSpatialBoundary initial_spatial_boundaries(
   {
     ScopedBlockTimer projection_timer(g_planning_block_timings.candidate_projection_ms);
     const double s1 = std::min(fr.s + eps, path.s_max());
-    k1 = interp_scalar(path.s(), path.kappa(), s1);
-    ks1 = interp_scalar(path.s(), path.kappa_s(), s1);
+    // fr.segment_index already brackets fr.s (project() guarantees
+    // path.s()[segment_index] <= fr.s <= path.s()[segment_index + 1]). s1 is
+    // only eps=1mm further, so it falls in that same bracket unless fr.s was
+    // already within eps of the segment's far endpoint -- reuse the known
+    // index directly (O(1)) instead of re-searching the array for it.
+    const auto& s_values = path.s();
+    std::size_t index = std::min(fr.segment_index, s_values.size() - 2);
+    if (s1 > s_values[index + 1]) index = std::min(index + 1, s_values.size() - 2);
+    const double dx = std::max(s_values[index + 1] - s_values[index], 1.0e-15);
+    const double alpha = clamp_value((s1 - s_values[index]) / dx, 0.0, 1.0);
+    const auto& kappa_values = path.kappa();
+    const auto& kappa_s_values = path.kappa_s();
+    k1 = (1.0 - alpha) * kappa_values[index] + alpha * kappa_values[index + 1];
+    ks1 = (1.0 - alpha) * kappa_s_values[index] + alpha * kappa_s_values[index + 1];
   }
   auto rate_for = [&](double n3) {
     const auto [kap0, speed0] = offset_path_curvature(result.n0, result.n1, result.n2, fr.kappa, fr.kappa_s);
@@ -2266,8 +2278,7 @@ std::vector<double> PathVelocityPlanner::speed_trials(double requested_speed) co
 
 TimeTrajectory PathVelocityPlanner::emergency_stop(
     const PlannerState& state, const PlannerAction& previous_action,
-    double target_speed, bool terminal_stop_required) {
-  const auto fr = path_.project(state.x, state.y, state.chi);
+    double target_speed, bool terminal_stop_required, const FrenetProjection& fr) {
   const double remaining = std::max(path_.s_max() - config_.simulation.path_end_margin - fr.s, 0.2);
   const double preview = std::min(config_.constraints.v_max * config_.longitudinal.horizon,
                                   remaining);
@@ -2304,13 +2315,9 @@ PlanResult PathVelocityPlanner::plan_at_speed(
     const PlannerState& state, const PlannerAction& previous_action,
     double target_speed, DriveMode drive_mode,
     const std::vector<int>& excluded_candidate_ids,
-    const std::vector<double>& excluded_lateral_targets) {
+    const std::vector<double>& excluded_lateral_targets,
+    const FrenetProjection& fr) {
   const auto start_time = std::chrono::steady_clock::now();
-  FrenetProjection fr;
-  {
-    ScopedBlockTimer projection_timer(g_planning_block_timings.candidate_projection_ms);
-    fr = path_.project(state.x, state.y, state.chi);
-  }
   const double real_end_s = path_.s_max() - config_.simulation.path_end_margin;
   const double terminal_goal_s = std::max(real_end_s - config_.longitudinal.stop_target_offset, 0.0);
   const double remaining_to_goal = std::max(terminal_goal_s - fr.s, 0.0);
@@ -2848,7 +2855,7 @@ PlanResult PathVelocityPlanner::plan_at_speed(
     }
     if (!braking_fallback_safe) {
       ++g_planning_call_counts.trajectory_planning;
-      auto braking = emergency_stop(state, previous_action, target_speed, terminal_mode_active);
+      auto braking = emergency_stop(state, previous_action, target_speed, terminal_mode_active, fr);
       if (braking.safe()) {
         result.selected_path.reset();
         result.trajectory = std::move(braking);
@@ -2897,7 +2904,8 @@ PlanResult PathVelocityPlanner::plan_at_speed(
 
 PlanResult PathVelocityPlanner::plan(const PlannerState& state,
                                      const PlannerAction& previous_action,
-                                     const PlanningCommand& command) {
+                                     const PlanningCommand& command,
+                                     std::optional<FrenetProjection> known_projection) {
   const auto excluded_candidate_ids = one_shot_excluded_candidate_ids_;
   const auto excluded_lateral_targets = one_shot_excluded_lateral_targets_;
   one_shot_excluded_candidate_ids_.clear();
@@ -2917,6 +2925,14 @@ PlanResult PathVelocityPlanner::plan(const PlannerState& state,
     return result;
   }
 
+  FrenetProjection fr;
+  if (known_projection) {
+    fr = *known_projection;
+  } else {
+    ScopedBlockTimer projection_timer(g_planning_block_timings.candidate_projection_ms);
+    fr = path_.project(state.x, state.y, state.chi);
+  }
+
   // Short phases and high requested speeds may be position-feasible only at a
   // lower cruise cap.  Keep the deterministic speed backoff active in the
   // terminal region instead of falling directly to an emergency stop.
@@ -2930,7 +2946,7 @@ PlanResult PathVelocityPlanner::plan(const PlannerState& state,
     ++attempts;
     auto result = plan_at_speed(
         state, previous_action, trial, command.drive_mode,
-        excluded_candidate_ids, excluded_lateral_targets);
+        excluded_candidate_ids, excluded_lateral_targets, fr);
     feasible = result.diagnostics.number_of_safe_paths > 0
         && result.diagnostics.status.find("INFEASIBLE") == std::string::npos
         && result.diagnostics.status.find("EMERGENCY") == std::string::npos;

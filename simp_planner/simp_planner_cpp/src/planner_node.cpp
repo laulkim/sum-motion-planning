@@ -694,14 +694,15 @@ class PlannerNodeCpp final : public rclcpp::Node {
       const double handover_prediction_ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - handover_start).count();
 
+      std::optional<FrenetProjection> handover_projection;
       if (active) {
-        const auto handover_projection = planner_->path().project(
+        handover_projection = planner_->path().project(
             handover.state.x, handover.state.y, handover.state.chi);
         const double terminal_goal_s = std::max(
             planner_->path().s_max() - config_.simulation.path_end_margin
                 - config_.longitudinal.stop_target_offset,
             0.0);
-        const double remaining = terminal_goal_s - handover_projection.s;
+        const double remaining = terminal_goal_s - handover_projection->s;
         if (std::abs(remaining) <= 0.20 && handover.state.speed <= 0.25) {
           publish_status("TERMINAL_ACTIVE_PLAN_FINISHING", 0.0,
                          static_cast<std::int64_t>(active->plan_id));
@@ -719,7 +720,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
 
       auto attempt_result = planner_->plan(
           handover.state, handover.last_action,
-          PlanningCommand{input->target_speed, input->drive_mode});
+          PlanningCommand{input->target_speed, input->drive_mode}, handover_projection);
       const bool infeasible =
           attempt_result.diagnostics.status.find("EMERGENCY") != std::string::npos ||
           attempt_result.diagnostics.status.find("INFEASIBLE") != std::string::npos;
@@ -743,7 +744,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
           ++path_replans;
           auto replanned_result = planner_->plan(
               handover.state, handover.last_action,
-              PlanningCommand{input->target_speed, input->drive_mode});
+              PlanningCommand{input->target_speed, input->drive_mode}, handover_projection);
           const bool replanned_infeasible =
               replanned_result.diagnostics.status.find("EMERGENCY") != std::string::npos ||
               replanned_result.diagnostics.status.find("INFEASIBLE") != std::string::npos;
