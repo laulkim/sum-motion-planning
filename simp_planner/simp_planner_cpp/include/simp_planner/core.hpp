@@ -65,18 +65,25 @@ struct PlanningBlockTimings {
   // Further breakdown of candidate_generation_ms into the internal phases of
   // generate_spatial_path_candidate() (all nested inside it, so each of
   // these is also counted in candidate_generation_ms and they need not sum
-  // to it exactly). candidate_projection_ms is every reference-path
-  // evaluate() call used to map a query arc-length back onto the global
-  // path -- cost scales with how many query points get evaluated, i.e. with
-  // the global path's input/sampling. candidate_boundary_setup_ms is the
-  // initial Frenet boundary conditions plus the spatial (S) extent/sample-
-  // array setup -- a fixed amount of work per attempt.
-  // candidate_polynomial_fit_ms is solving for the septic/quartic lateral-
-  // offset polynomial coefficients, redone on every curvature-violation
-  // retry. candidate_sample_points_ms is evaluating that polynomial
-  // (Horner) at each sample point. candidate_curvature_cartesian_ms is
-  // turning the resulting Frenet samples into Cartesian (x, y) points plus
-  // the arc-length/curvature/curvature-rate derived from them.
+  // to it exactly; candidate_projection_ms also includes one call site
+  // outside candidate generation, see below). candidate_projection_ms is
+  // matching the vehicle/query state onto the reference path itself: the
+  // once-per-cycle initial Frenet projection (path_.project() at the top of
+  // plan_at_speed()), plus the single-point reference-path evaluate() calls
+  // used to seed a new candidate's boundary conditions and to locate its
+  // real endpoint. It excludes the per-sample-point path evaluation used to
+  // build a candidate's full curve, which is folded into
+  // candidate_curvature_cartesian_ms instead (see below).
+  // candidate_boundary_setup_ms is the initial Frenet boundary conditions
+  // plus the spatial (S) extent/sample-array setup -- a fixed amount of
+  // work per attempt. candidate_polynomial_fit_ms is solving for the
+  // septic/quartic lateral-offset polynomial coefficients, redone on every
+  // curvature-violation retry. candidate_sample_points_ms is evaluating
+  // that polynomial (Horner) at each sample point. candidate_curvature_
+  // cartesian_ms is evaluating the reference path (with virtual extension)
+  // at every sample point of a candidate's full curve, turning the result
+  // into Cartesian (x, y) points, plus the arc-length/curvature/curvature-
+  // rate derived from them.
   double candidate_projection_ms{0.0};
   double candidate_boundary_setup_ms{0.0};
   double candidate_polynomial_fit_ms{0.0};

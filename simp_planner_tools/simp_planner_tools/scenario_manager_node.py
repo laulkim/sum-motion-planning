@@ -67,7 +67,7 @@ class ScenarioManagerNode(Node):
         self.declare_parameter("target_speed", -1.0)
         self.declare_parameter("frame_id", "odom")
         self.declare_parameter("path_back_length", 5.0)
-        self.declare_parameter("path_ahead_length", 29.0)
+        self.declare_parameter("path_ahead_length", 50.0)
         self.declare_parameter("path_update_distance", 1.0)
         self.declare_parameter("costmap_resolution", -1.0)
         # Retained for compatibility with existing launch/config files. Local

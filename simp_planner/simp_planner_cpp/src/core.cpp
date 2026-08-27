@@ -475,9 +475,14 @@ InitialSpatialBoundary initial_spatial_boundaries(
       + motion_weight * measured_kappa_l;
   result.desired_kappa_l = clamp_value(result.desired_kappa_l, -0.10, 0.10);
   const double eps = 1.0e-3;
-  const double s1 = std::min(fr.s + eps, path.s_max());
-  const double k1 = interp_scalar(path.s(), path.kappa(), s1);
-  const double ks1 = interp_scalar(path.s(), path.kappa_s(), s1);
+  double k1 = 0.0;
+  double ks1 = 0.0;
+  {
+    ScopedBlockTimer projection_timer(g_planning_block_timings.candidate_projection_ms);
+    const double s1 = std::min(fr.s + eps, path.s_max());
+    k1 = interp_scalar(path.s(), path.kappa(), s1);
+    ks1 = interp_scalar(path.s(), path.kappa_s(), s1);
+  }
   auto rate_for = [&](double n3) {
     const auto [kap0, speed0] = offset_path_curvature(result.n0, result.n1, result.n2, fr.kappa, fr.kappa_s);
     const double ne = result.n0 + result.n1 * eps + 0.5 * result.n2 * eps * eps + (1.0 / 6.0) * n3 * eps * eps * eps;
@@ -604,15 +609,12 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
   ProfileResult profile = evaluate_profile(q);
   std::vector<double> s_query(q.size());
   ReferenceEvaluation ref;
-  {
-    ScopedBlockTimer projection_timer(g_planning_block_timings.candidate_projection_ms);
-    for (std::size_t i = 0; i < q.size(); ++i) s_query[i] = fr.s + q[i];
-    ref = evaluate_reference_with_virtual_extension(reference, s_query, real_end_s,
-                                                     cfg.simulation.virtual_extension_blend_length);
-  }
   std::vector<double> x(q.size()), y(q.size());
   {
     ScopedBlockTimer curvature_cartesian_timer(g_planning_block_timings.candidate_curvature_cartesian_ms);
+    for (std::size_t i = 0; i < q.size(); ++i) s_query[i] = fr.s + q[i];
+    ref = evaluate_reference_with_virtual_extension(reference, s_query, real_end_s,
+                                                     cfg.simulation.virtual_extension_blend_length);
     for (std::size_t i = 0; i < q.size(); ++i) {
       x[i] = ref.x[i] - profile.p[i] * std::sin(ref.psi[i]);
       y[i] = ref.y[i] + profile.p[i] * std::cos(ref.psi[i]);
@@ -632,16 +634,13 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
   }
 
   profile = evaluate_profile(q);
+  std::vector<double> arc;
   {
-    ScopedBlockTimer projection_timer(g_planning_block_timings.candidate_projection_ms);
+    ScopedBlockTimer curvature_cartesian_timer(g_planning_block_timings.candidate_curvature_cartesian_ms);
     s_query.resize(q.size());
     for (std::size_t i = 0; i < q.size(); ++i) s_query[i] = fr.s + q[i];
     ref = evaluate_reference_with_virtual_extension(reference, s_query, real_end_s,
                                                      cfg.simulation.virtual_extension_blend_length);
-  }
-  std::vector<double> arc;
-  {
-    ScopedBlockTimer curvature_cartesian_timer(g_planning_block_timings.candidate_curvature_cartesian_ms);
     x.resize(q.size()); y.resize(q.size());
     for (std::size_t i = 0; i < q.size(); ++i) {
       x[i] = ref.x[i] - profile.p[i] * std::sin(ref.psi[i]);
@@ -2307,7 +2306,11 @@ PlanResult PathVelocityPlanner::plan_at_speed(
     const std::vector<int>& excluded_candidate_ids,
     const std::vector<double>& excluded_lateral_targets) {
   const auto start_time = std::chrono::steady_clock::now();
-  const auto fr = path_.project(state.x, state.y, state.chi);
+  FrenetProjection fr;
+  {
+    ScopedBlockTimer projection_timer(g_planning_block_timings.candidate_projection_ms);
+    fr = path_.project(state.x, state.y, state.chi);
+  }
   const double real_end_s = path_.s_max() - config_.simulation.path_end_margin;
   const double terminal_goal_s = std::max(real_end_s - config_.longitudinal.stop_target_offset, 0.0);
   const double remaining_to_goal = std::max(terminal_goal_s - fr.s, 0.0);

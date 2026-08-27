@@ -94,26 +94,47 @@ COSTMAP_REBUILD_COUNT_KEY = "costmap_rebuild_count"
 # the cycle (curvature retries and the short-path fallback pass included). The
 # five candidate_* entries right after it are a further breakdown of that
 # same total into the internal phases of generate_spatial_path_candidate()
-# (they are nested inside it, so they need not sum to it exactly):
-# projection (reference-path evaluate() calls -- cost scales with the global
-# path's sampling), boundary+S setup (initial Frenet boundary conditions plus
-# the spatial-extent/sample-array setup -- fixed cost per attempt),
-# polynomial fit (solving for the lateral-offset polynomial coefficients --
-# redone on every curvature-violation retry), sample points (evaluating that
-# polynomial at each sample), and curvature/Cartesian (turning the Frenet
-# samples into (x, y) points plus arc-length/curvature/curvature-rate).
+# (they are nested inside it, so they need not sum to it exactly; projection
+# also includes one once-per-cycle call site outside candidate generation):
+# projection (matching the vehicle/query state onto the reference path --
+# the once-per-cycle initial Frenet projection plus single-point
+# reference-path evaluate() calls, but NOT the per-sample-point evaluation
+# used to build a candidate's full curve), boundary+S setup (initial Frenet
+# boundary conditions plus the spatial-extent/sample-array setup -- fixed
+# cost per attempt), polynomial fit (solving for the lateral-offset
+# polynomial coefficients -- redone on every curvature-violation retry),
+# sample points (evaluating that polynomial at each sample), and
+# curvature/Cartesian (the per-sample-point reference-path evaluation used
+# to build a candidate's full curve, turned into (x, y) points plus
+# arc-length/curvature/curvature-rate).
 # feasibility_check_ms and ranking_ms are still recorded in the planner's
 # status JSON (see PlanningBlockTimings in core.hpp) but are intentionally
 # left out of this panel grid -- both are consistently near-zero and not
 # useful next to the other buckets here.
 PATH_BREAKDOWN_SERIES = (
-    ("candidate_generation_ms", "Candidate path generation (total)", "tab:blue"),
-    ("candidate_projection_ms", "Candidate gen: projection", "tab:cyan"),
-    ("candidate_boundary_setup_ms", "Candidate gen: boundary + S length", "tab:purple"),
-    ("candidate_polynomial_fit_ms", "Candidate gen: polynomial fit", "tab:brown"),
-    ("candidate_sample_points_ms", "Candidate gen: sample points", "tab:pink"),
-    ("candidate_curvature_cartesian_ms", "Candidate gen: curvature + Cartesian", "tab:olive"),
-    ("collision_check_ms", "Collision check", "tab:red"),
+    ("Candidate path generation (total)", (
+        ("candidate_generation_ms", "total", "tab:blue"),
+    )),
+    ("Candidate gen: projection", (
+        ("candidate_projection_ms", "projection", "tab:cyan"),
+    )),
+    ("Candidate gen: boundary + S length", (
+        ("candidate_boundary_setup_ms", "boundary + S length", "tab:purple"),
+    )),
+    # Solving the polynomial (fixed cost per attempt) and evaluating it at
+    # every sample point (cost scales with sample count) are two phases of
+    # the same step, so they are summed into one combined series here
+    # rather than plotted as two separate lines.
+    ("Candidate gen: polynomial fit + sample points", (
+        (("candidate_polynomial_fit_ms", "candidate_sample_points_ms"),
+         "polynomial fit + sample points", "tab:brown"),
+    )),
+    ("Candidate gen: curvature + Cartesian", (
+        ("candidate_curvature_cartesian_ms", "curvature + Cartesian", "tab:olive"),
+    )),
+    ("Collision check", (
+        ("collision_check_ms", "collision check", "tab:red"),
+    )),
 )
 
 # trajectory_generation_ms and its five trajectory_* entries are the same
@@ -130,20 +151,42 @@ PATH_BREAKDOWN_SERIES = (
 # dynamic/kinematic constraint validation loop that produces valid_dynamic --
 # distinct from the spatial feasibility_check_ms above).
 TRAJECTORY_BREAKDOWN_SERIES = (
-    ("trajectory_generation_ms", "Trajectory generation (total)", "tab:green"),
-    ("trajectory_initial_state_target_ms", "Trajectory: initial state + target", "tab:orange"),
-    ("trajectory_longitudinal_profile_ms", "Trajectory: longitudinal profile", "tab:gray"),
-    ("trajectory_time_parameterization_ms", "Trajectory: time parameterization", "tab:cyan"),
-    ("trajectory_state_calculation_ms", "Trajectory: state calculation", "tab:purple"),
-    ("trajectory_feasibility_check_ms", "Trajectory: feasibility check", "tab:red"),
+    ("Trajectory generation (total)", (
+        ("trajectory_generation_ms", "total", "tab:green"),
+    )),
+    ("Trajectory: initial state + target", (
+        ("trajectory_initial_state_target_ms", "initial state + target", "tab:orange"),
+    )),
+    ("Trajectory: longitudinal profile", (
+        ("trajectory_longitudinal_profile_ms", "longitudinal profile", "tab:gray"),
+    )),
+    ("Trajectory: time parameterization", (
+        ("trajectory_time_parameterization_ms", "time parameterization", "tab:cyan"),
+    )),
+    ("Trajectory: state calculation", (
+        ("trajectory_state_calculation_ms", "state calculation", "tab:purple"),
+    )),
+    ("Trajectory: feasibility check", (
+        ("trajectory_feasibility_check_ms", "feasibility check", "tab:red"),
+    )),
 )
+
+# A breakdown series' key is either a single JSON field name, or a tuple of
+# field names to be summed into one combined series (see the polynomial
+# fit + sample points entry above) -- this expands either form to the
+# individual field name(s) it draws from.
+def _series_keys(key: str | tuple[str, ...]) -> tuple[str, ...]:
+    return key if isinstance(key, tuple) else (key,)
+
 
 REQUIRED_KEYS = (
     tuple(key for key, _ in CATEGORIES)
     + tuple(key for _, series in BLOCK_TIMING_PANELS for key, _, _ in series)
     + (SPATIAL_ATTEMPTS_KEY, COSTMAP_BUILD_MS_KEY, COSTMAP_REBUILD_COUNT_KEY)
-    + tuple(key for key, _, _ in PATH_BREAKDOWN_SERIES)
-    + tuple(key for key, _, _ in TRAJECTORY_BREAKDOWN_SERIES)
+    + tuple(k for _, subseries in PATH_BREAKDOWN_SERIES
+            for key, _, _ in subseries for k in _series_keys(key))
+    + tuple(k for _, subseries in TRAJECTORY_BREAKDOWN_SERIES
+            for key, _, _ in subseries for k in _series_keys(key))
 )
 
 # Detail panels are laid out in a grid below the summary panel instead of a
@@ -304,14 +347,17 @@ _STAGE_GRID_COLUMNS = 3
 
 def create_breakdown_figure(
     samples: list[dict[str, float | int]],
-    series: tuple[tuple[str, str, str], ...],
+    series: tuple[tuple[str, tuple[tuple[str, str, str], ...]], ...],
     title: str,
     count_series: tuple[str, str, str] | None = None,
 ) -> Figure:
-    """Build a separate window with one subplot per requested computation
-    kind in `series`, instead of overlaying all of them on a single plot.
+    """Build a separate window with one subplot per (panel_title, series)
+    entry in `series` -- each panel overlays every (key, label, color) in
+    its own series tuple, so closely-related quantities can share one
+    panel instead of always getting one subplot apiece.
     If `count_series` (key, label, color) is given, it gets its own extra
-    panel appended after the others, plotting that per-plan call count."""
+    panel placed first (before `series`), plotting that per-plan call
+    count."""
     panel_count = len(series) + (1 if count_series is not None else 0)
     stage_grid_rows = -(-panel_count // _STAGE_GRID_COLUMNS)
     time_sec = [float(sample["time_s"]) for sample in samples]
@@ -327,31 +373,34 @@ def create_breakdown_figure(
             sharex=axes[0] if axes else None,
         )
         axes.append(ax)
+    series_axes = axes[1:] if count_series is not None else axes
 
-    for ax, (key, label, color) in zip(axes, series):
-        values = [float(sample[key]) for sample in samples]
-        ax.plot(
-            time_sec, values, color=color, marker="o", markersize=2, linewidth=1,
-            label=f"mean {mean(values):.2f} ms", zorder=3,
-        )
-        max_v = max(values)
-        min_v = min(values)
-        ax.axhspan(max_v * 0.985, max_v * 1.015, color="tab:orange", alpha=0.20, zorder=0)
-        ax.axhline(max_v, color="tab:orange", linestyle=":", linewidth=1.3,
-                   label=f"max {max_v:.2f} ms", zorder=1)
-        ax.axhspan(min_v * 0.985, min_v * 1.015, color="tab:blue", alpha=0.20, zorder=0)
-        ax.axhline(min_v, color="tab:blue", linestyle=":", linewidth=1.3,
-                   label=f"min {min_v:.2f} ms", zorder=1)
+    for ax, (panel_title, subseries) in zip(series_axes, series):
+        for key, label, color in subseries:
+            keys = _series_keys(key)
+            values = [sum(float(sample[k]) for k in keys) for sample in samples]
+            ax.plot(
+                time_sec, values, color=color, marker="o", markersize=2, linewidth=1,
+                label=f"{label} (mean {mean(values):.2f} ms)", zorder=3,
+            )
+            max_v = max(values)
+            min_v = min(values)
+            ax.axhspan(max_v * 0.985, max_v * 1.015, color="tab:orange", alpha=0.20, zorder=0)
+            ax.axhline(max_v, color="tab:orange", linestyle=":", linewidth=1.3,
+                       label=f"{label} max {max_v:.2f} ms", zorder=1)
+            ax.axhspan(min_v * 0.985, min_v * 1.015, color="tab:blue", alpha=0.20, zorder=0)
+            ax.axhline(min_v, color="tab:blue", linestyle=":", linewidth=1.3,
+                       label=f"{label} min {min_v:.2f} ms", zorder=1)
         ax.set_ylim(bottom=0)
         ax.set_ylabel("time [ms]")
-        ax.set_title(label)
+        ax.set_title(panel_title)
         ax.grid(True, alpha=0.3)
         ax.legend(loc="best", fontsize=8)
 
     if count_series is not None:
         count_key, count_label, count_color = count_series
         counts = [int(sample[count_key]) for sample in samples]
-        count_ax = axes[len(series)]
+        count_ax = axes[0]
         count_ax.plot(
             time_sec, counts, color=count_color,
             marker="o", markersize=2, linewidth=1,
@@ -466,10 +515,12 @@ class PlanningCallCountReportNode(Node):
         sample[COSTMAP_BUILD_MS_KEY] = float(plan[COSTMAP_BUILD_MS_KEY])
         sample[COSTMAP_REBUILD_COUNT_KEY] = int(plan[COSTMAP_REBUILD_COUNT_KEY])
         sample.update(
-            {key: float(plan[key]) for key, _, _ in PATH_BREAKDOWN_SERIES}
+            {k: float(plan[k]) for _, subseries in PATH_BREAKDOWN_SERIES
+             for key, _, _ in subseries for k in _series_keys(key)}
         )
         sample.update(
-            {key: float(plan[key]) for key, _, _ in TRAJECTORY_BREAKDOWN_SERIES}
+            {k: float(plan[k]) for _, subseries in TRAJECTORY_BREAKDOWN_SERIES
+             for key, _, _ in subseries for k in _series_keys(key)}
         )
         self.samples.append(sample)
 
