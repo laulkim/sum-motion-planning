@@ -82,6 +82,31 @@ struct PlanningBlockTimings {
   double candidate_polynomial_fit_ms{0.0};
   double candidate_sample_points_ms{0.0};
   double candidate_curvature_cartesian_ms{0.0};
+  // Breakdown of generate_open_loop_trajectory() into its conceptual stages.
+  // trajectory_generation_ms is the total wall-clock time of the whole
+  // function (wraps the entire body; the five entries below are nested
+  // inside it and need not sum to it exactly). trajectory_initial_state_target_ms
+  // is the pre-loop setup: binding the initial handover state and deciding
+  // this call's objective (cruise-to-target-speed vs. terminal-stop).
+  // trajectory_longitudinal_profile_ms is, per simulated step, turning that
+  // objective into v(t)/a(t)/j(t) (terminal feedback control, emergency
+  // braking, or cruise-speed tracking, then jerk/accel clamping).
+  // trajectory_time_parameterization_ms is integrating that profile into
+  // arc-length progress (s_{k+1} = s_k + distance) and the endpoint-overshoot
+  // check. trajectory_state_calculation_ms is turning arc-length progress
+  // back into path geometry (x, y, heading, curvature) via interpolate_path
+  // and assembling each trajectory point -- both inside the main loop and in
+  // the post-loop pass that derives lateral acceleration/jerk for every
+  // state. trajectory_feasibility_check_ms is the fine-substep dynamic/
+  // kinematic constraint validation loop that produces valid_dynamic (not to
+  // be confused with feasibility_check_ms above, which is the spatial
+  // candidate's curvature check).
+  double trajectory_generation_ms{0.0};
+  double trajectory_initial_state_target_ms{0.0};
+  double trajectory_longitudinal_profile_ms{0.0};
+  double trajectory_time_parameterization_ms{0.0};
+  double trajectory_state_calculation_ms{0.0};
+  double trajectory_feasibility_check_ms{0.0};
 };
 
 void reset_planning_call_counts();
@@ -141,7 +166,7 @@ struct LateralPathConfig {
       6.0, 6.25, 6.5, 6.75, 7.0, 7.25, 7.5, 7.75,
       8.0};
   double min_length{3.0};
-  double max_length{50.0};
+  double max_length{29.0};
   double spatial_ds{0.5};
   double dynamic_margin{1.08};
   double preview_extra{2.0};
@@ -213,7 +238,7 @@ struct CostConfig {
 };
 
 struct TerminalConstraintConfig {
-  double activation_margin{3.0};
+  double activation_margin{2.0};
   double minimum_activation_distance{1.0};
   double safe_region_planning_buffer{12.0};
   double safe_region_settle_distance{4.0};

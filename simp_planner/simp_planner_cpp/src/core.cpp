@@ -1611,6 +1611,8 @@ TimeTrajectory generate_open_loop_trajectory(
     bool terminal_mode_active,
     double target_speed,
     bool enforce_obstacle_collision = true) {
+  ScopedBlockTimer trajectory_generation_timer(g_planning_block_timings.trajectory_generation_ms);
+  const auto initial_state_target_start = std::chrono::steady_clock::now();
   const auto& c = cfg.constraints;
   const auto& lc = cfg.longitudinal;
   const auto& cc = cfg.cost;
@@ -1628,6 +1630,9 @@ TimeTrajectory generate_open_loop_trajectory(
                                     std::numeric_limits<double>::quiet_NaN());
   trajectory.states.front() = initial_state;
   TerminalFeedbackController terminal_controller(cfg);
+  g_planning_block_timings.trajectory_initial_state_target_ms +=
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - initial_state_target_start).count();
 
   for (int k = 0; k < N; ++k) {
     const std::size_t index = static_cast<std::size_t>(k);
@@ -1651,13 +1656,19 @@ TimeTrajectory generate_open_loop_trajectory(
       trajectory.predicted_stop_error = std::abs(terminal_goal_q - q_progress);
       break;
     }
+    double jerk = 0.0;
+    double a_next = 0.0;
+    double v_next = 0.0;
+    double distance = 0.0;
+    {
+    ScopedBlockTimer longitudinal_profile_timer(
+        g_planning_block_timings.trajectory_longitudinal_profile_ms);
     const double accel_limit = emergency ? c.a_max : std::min(c.a_max, lc.cruise_acceleration);
     const double decel_limit = emergency ? std::abs(c.a_min)
         : std::min(std::abs(c.a_min), lc.service_deceleration);
     const double jerk_limit = emergency ? c.jerk_max
         : std::min(c.jerk_max, lc.comfort_jerk);
     double jerk_raw = 0.0;
-    double jerk = 0.0;
     bool braking_active_this_step = false;
     if (terminal_mode_active) {
       const double dq_dl = reference_progress_rate(path, l_progress);
@@ -1693,13 +1704,11 @@ TimeTrajectory generate_open_loop_trajectory(
         (terminal_mode_active && braking_active_this_step)
         ? std::max(a, 0.0)
         : accel_limit;
-    double a_next = clamp_value(
+    a_next = clamp_value(
         a + jerk * dt, -decel_limit, acceleration_upper);
     jerk = (a_next - a) / dt;
     const double v_trial = v + a * dt + 0.5 * jerk * dt * dt;
     const auto stop_time = positive_velocity_root(v, a, jerk, dt);
-    double distance = 0.0;
-    double v_next = 0.0;
     if (stop_time || v_trial <= 0.0) {
       const double use = stop_time ? *stop_time : dt;
       distance = std::max(jerk_integrated_distance(v, a, jerk, use), 0.0);
@@ -1709,8 +1718,14 @@ TimeTrajectory generate_open_loop_trajectory(
       v_next = clamp_value(v_trial, c.v_min, c.v_max);
       distance = std::max(jerk_integrated_distance(v, a, jerk, dt), 0.0);
     }
-    const double l_next = l_progress + distance;
-    const double q_next = interpolate_reference_progress(path, l_next);
+    }  // end longitudinal_profile_timer scope
+    double l_next = 0.0;
+    double q_next = 0.0;
+    {
+    ScopedBlockTimer time_parameterization_timer(
+        g_planning_block_timings.trajectory_time_parameterization_ms);
+    l_next = l_progress + distance;
+    q_next = interpolate_reference_progress(path, l_next);
     const bool terminal_tolerance_extension = terminal_mode_active
         && q_next <= terminal_goal_q + tc.longitudinal_tolerance + 1.0e-9;
     // Near the terminal point, the current state can already lie a few
@@ -1733,6 +1748,10 @@ TimeTrajectory generate_open_loop_trajectory(
       }
       break;
     }
+    }  // end time_parameterization_timer scope
+    {
+    ScopedBlockTimer state_calculation_timer(
+        g_planning_block_timings.trajectory_state_calculation_ms);
     const auto sample = interpolate_path(path, l_next);
     PlannerState next;
     next.x = sample.x;
@@ -1746,6 +1765,7 @@ TimeTrajectory generate_open_loop_trajectory(
         + v_next * v_next * sample.kappa_l};
     trajectory.progress[index + 1] = l_next;
     trajectory.speed_reference[index + 1] = trajectory.speed_reference[index];
+    }  // end state_calculation_timer scope
     if (terminal_mode_active
         && v_next <= std::max(lc.stop_speed_threshold, lc.terminal_capture_speed)
         && std::abs(terminal_goal_q - q_next) <= tc.longitudinal_tolerance
@@ -1769,6 +1789,9 @@ TimeTrajectory generate_open_loop_trajectory(
   std::vector<double> reference_progress(state_count, 0.0);
   std::vector<double> trajectory_kappa(state_count, 0.0);
   std::vector<double> trajectory_kappa_l(state_count, 0.0);
+  {
+  ScopedBlockTimer state_calculation_post_loop_timer(
+      g_planning_block_timings.trajectory_state_calculation_ms);
   for (std::size_t i = 0; i < state_count; ++i) {
     reference_progress[i] = interpolate_reference_progress(path, trajectory.progress[i]);
     const auto sample = interpolate_path(path, trajectory.progress[i]);
@@ -1780,10 +1803,14 @@ TimeTrajectory generate_open_loop_trajectory(
     trajectory.lateral_jerk[i] = 2.0 * v * a * sample.kappa
         + v * v * v * sample.kappa_l;
   }
+  }  // end state_calculation_post_loop_timer scope
 
   bool speed_min_ok = true, speed_max_ok = true, acceleration_ok = true;
   bool heading_rate_ok = true, heading_accel_ok = true;
   bool lateral_accel_ok = true, lateral_jerk_ok = true, curvature_ok = true;
+  {
+  ScopedBlockTimer trajectory_feasibility_check_timer(
+      g_planning_block_timings.trajectory_feasibility_check_ms);
   const double execution_dt = std::min(std::max(lc.execution_dt, 1.0e-4), dt);
   const int substep_count = std::max(1, static_cast<int>(std::ceil(dt / execution_dt)));
   for (int k = 0; k < N; ++k) {
@@ -1840,6 +1867,7 @@ TimeTrajectory generate_open_loop_trajectory(
   trajectory.valid_dynamic = speed_min_ok && speed_max_ok && acceleration_ok && jerk_ok
       && heading_rate_ok && heading_accel_ok && lateral_accel_ok && lateral_jerk_ok
       && curvature_ok && !trajectory.endpoint_overshoot_attempt && progress_ok;
+  }  // end trajectory_feasibility_check_timer scope
 
   const double maximum_speed = std::max_element(trajectory.states.begin(), trajectory.states.end(),
       [](const PlannerState& lhs, const PlannerState& rhs) { return lhs.speed < rhs.speed; })->speed;

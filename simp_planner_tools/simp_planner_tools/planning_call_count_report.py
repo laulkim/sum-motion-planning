@@ -106,7 +106,7 @@ COSTMAP_REBUILD_COUNT_KEY = "costmap_rebuild_count"
 # status JSON (see PlanningBlockTimings in core.hpp) but are intentionally
 # left out of this panel grid -- both are consistently near-zero and not
 # useful next to the other buckets here.
-STAGE_BREAKDOWN_SERIES = (
+PATH_BREAKDOWN_SERIES = (
     ("candidate_generation_ms", "Candidate path generation (total)", "tab:blue"),
     ("candidate_projection_ms", "Candidate gen: projection", "tab:cyan"),
     ("candidate_boundary_setup_ms", "Candidate gen: boundary + S length", "tab:purple"),
@@ -116,11 +116,34 @@ STAGE_BREAKDOWN_SERIES = (
     ("collision_check_ms", "Collision check", "tab:red"),
 )
 
+# trajectory_generation_ms and its five trajectory_* entries are the same
+# kind of breakdown for generate_open_loop_trajectory() (nested inside the
+# total, so they need not sum to it exactly): initial state + target (the
+# pre-loop setup -- binding the handover state and picking cruise-to-speed
+# vs. terminal-stop as this call's objective), longitudinal profile
+# (v(t)/a(t)/j(t) from the terminal/emergency/cruise control branches),
+# time parameterization (integrating that profile into arc-length progress,
+# s_{k+1} = s_k + distance, plus the endpoint-overshoot check), state
+# calculation (turning arc-length progress back into path geometry via
+# interpolate_path, both per simulated step and in the post-loop lateral
+# accel/jerk derivation pass), and feasibility check (the fine-substep
+# dynamic/kinematic constraint validation loop that produces valid_dynamic --
+# distinct from the spatial feasibility_check_ms above).
+TRAJECTORY_BREAKDOWN_SERIES = (
+    ("trajectory_generation_ms", "Trajectory generation (total)", "tab:green"),
+    ("trajectory_initial_state_target_ms", "Trajectory: initial state + target", "tab:orange"),
+    ("trajectory_longitudinal_profile_ms", "Trajectory: longitudinal profile", "tab:gray"),
+    ("trajectory_time_parameterization_ms", "Trajectory: time parameterization", "tab:cyan"),
+    ("trajectory_state_calculation_ms", "Trajectory: state calculation", "tab:purple"),
+    ("trajectory_feasibility_check_ms", "Trajectory: feasibility check", "tab:red"),
+)
+
 REQUIRED_KEYS = (
     tuple(key for key, _ in CATEGORIES)
     + tuple(key for _, series in BLOCK_TIMING_PANELS for key, _, _ in series)
     + (SPATIAL_ATTEMPTS_KEY, COSTMAP_BUILD_MS_KEY, COSTMAP_REBUILD_COUNT_KEY)
-    + tuple(key for key, _, _ in STAGE_BREAKDOWN_SERIES)
+    + tuple(key for key, _, _ in PATH_BREAKDOWN_SERIES)
+    + tuple(key for key, _, _ in TRAJECTORY_BREAKDOWN_SERIES)
 )
 
 # Detail panels are laid out in a grid below the summary panel instead of a
@@ -277,29 +300,35 @@ def create_call_count_figure(samples: list[dict[str, float | int]]) -> Figure:
 
 
 _STAGE_GRID_COLUMNS = 3
-_STAGE_GRID_ROWS = -(-len(STAGE_BREAKDOWN_SERIES) // _STAGE_GRID_COLUMNS)
 
 
-def create_stage_breakdown_figure(samples: list[dict[str, float | int]]) -> Figure:
+def create_breakdown_figure(
+    samples: list[dict[str, float | int]],
+    series: tuple[tuple[str, str, str], ...],
+    title: str,
+    count_series: tuple[str, str, str] | None = None,
+) -> Figure:
     """Build a separate window with one subplot per requested computation
-    kind: the candidate-generation total, its five internal-phase
-    sub-stages, and collision check -- instead of overlaying all of them on
-    a single plot."""
+    kind in `series`, instead of overlaying all of them on a single plot.
+    If `count_series` (key, label, color) is given, it gets its own extra
+    panel appended after the others, plotting that per-plan call count."""
+    panel_count = len(series) + (1 if count_series is not None else 0)
+    stage_grid_rows = -(-panel_count // _STAGE_GRID_COLUMNS)
     time_sec = [float(sample["time_s"]) for sample in samples]
 
     fig = plt.figure(
-        figsize=(6.5 * _STAGE_GRID_COLUMNS, 4.0 * _STAGE_GRID_ROWS)
+        figsize=(6.5 * _STAGE_GRID_COLUMNS, 4.0 * stage_grid_rows)
     )
-    gs = fig.add_gridspec(_STAGE_GRID_ROWS, _STAGE_GRID_COLUMNS)
+    gs = fig.add_gridspec(stage_grid_rows, _STAGE_GRID_COLUMNS)
     axes: list = []
-    for slot in range(len(STAGE_BREAKDOWN_SERIES)):
+    for slot in range(panel_count):
         ax = fig.add_subplot(
             gs[slot // _STAGE_GRID_COLUMNS, slot % _STAGE_GRID_COLUMNS],
             sharex=axes[0] if axes else None,
         )
         axes.append(ax)
 
-    for ax, (key, label, color) in zip(axes, STAGE_BREAKDOWN_SERIES):
+    for ax, (key, label, color) in zip(axes, series):
         values = [float(sample[key]) for sample in samples]
         ax.plot(
             time_sec, values, color=color, marker="o", markersize=2, linewidth=1,
@@ -319,6 +348,21 @@ def create_stage_breakdown_figure(samples: list[dict[str, float | int]]) -> Figu
         ax.grid(True, alpha=0.3)
         ax.legend(loc="best", fontsize=8)
 
+    if count_series is not None:
+        count_key, count_label, count_color = count_series
+        counts = [int(sample[count_key]) for sample in samples]
+        count_ax = axes[len(series)]
+        count_ax.plot(
+            time_sec, counts, color=count_color,
+            marker="o", markersize=2, linewidth=1,
+            label=f"mean {mean(counts):.1f}", zorder=3,
+        )
+        count_ax.set_ylim(bottom=0)
+        count_ax.set_ylabel("count")
+        count_ax.set_title(count_label)
+        count_ax.grid(True, alpha=0.3)
+        count_ax.legend(loc="best", fontsize=8)
+
     # Label the bottom-most axis in each column, since a series count that
     # isn't a multiple of _STAGE_GRID_COLUMNS leaves the last row partial.
     labeled_columns: set[int] = set()
@@ -328,7 +372,7 @@ def create_stage_breakdown_figure(samples: list[dict[str, float | int]]) -> Figu
             axes[slot].set_xlabel("time [s]")
             labeled_columns.add(column)
 
-    fig.suptitle(f"Planning computation by stage ({len(samples)} activated plans)")
+    fig.suptitle(f"{title} ({len(samples)} activated plans)")
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
     return fig
 
@@ -341,10 +385,25 @@ def render_call_count_report(
     plt.close(fig)
 
 
-def render_stage_breakdown_report(
+def render_path_breakdown_report(
     samples: list[dict[str, float | int]], output_path: Path
 ) -> None:
-    fig = create_stage_breakdown_figure(samples)
+    fig = create_breakdown_figure(
+        samples, PATH_BREAKDOWN_SERIES, "Planning computation by path-generation stage",
+        count_series=(
+            SPATIAL_ATTEMPTS_KEY, "candidate-generation attempts", "tab:gray",
+        ),
+    )
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def render_trajectory_breakdown_report(
+    samples: list[dict[str, float | int]], output_path: Path
+) -> None:
+    fig = create_breakdown_figure(
+        samples, TRAJECTORY_BREAKDOWN_SERIES, "Planning computation by trajectory stage"
+    )
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
 
@@ -407,7 +466,10 @@ class PlanningCallCountReportNode(Node):
         sample[COSTMAP_BUILD_MS_KEY] = float(plan[COSTMAP_BUILD_MS_KEY])
         sample[COSTMAP_REBUILD_COUNT_KEY] = int(plan[COSTMAP_REBUILD_COUNT_KEY])
         sample.update(
-            {key: float(plan[key]) for key, _, _ in STAGE_BREAKDOWN_SERIES}
+            {key: float(plan[key]) for key, _, _ in PATH_BREAKDOWN_SERIES}
+        )
+        sample.update(
+            {key: float(plan[key]) for key, _, _ in TRAJECTORY_BREAKDOWN_SERIES}
         )
         self.samples.append(sample)
 
@@ -424,11 +486,18 @@ class PlanningCallCountReportNode(Node):
             f"{png_path}"
         )
 
-        stage_png_path = self.session_dir / "planning_stage_breakdown.png"
-        render_stage_breakdown_report(self.samples, stage_png_path)
+        path_png_path = self.session_dir / "planning_path_breakdown.png"
+        render_path_breakdown_report(self.samples, path_png_path)
         self.get_logger().info(
-            f"Saved {len(self.samples)}-plan stage-breakdown report to "
-            f"{stage_png_path}"
+            f"Saved {len(self.samples)}-plan path-breakdown report to "
+            f"{path_png_path}"
+        )
+
+        trajectory_png_path = self.session_dir / "planning_trajectory_breakdown.png"
+        render_trajectory_breakdown_report(self.samples, trajectory_png_path)
+        self.get_logger().info(
+            f"Saved {len(self.samples)}-plan trajectory-breakdown report to "
+            f"{trajectory_png_path}"
         )
 
 

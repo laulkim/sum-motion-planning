@@ -222,7 +222,7 @@ def load_scenario_definition(
         return ScenarioDefinition(name=name, phases=(phase,))
 
     if name == "straight_long":
-        # A pure 300 m straight reference path with no obstacles or gates,
+        # A pure 1 km straight reference path with no obstacles or gates,
         # for sustained high-speed cruise/tracking checks without any
         # avoidance maneuver in the way.
         phase = ScenarioPhase(
