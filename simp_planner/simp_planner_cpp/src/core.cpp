@@ -796,13 +796,49 @@ struct PathSample {
   double x{0.0}; double y{0.0}; double psi{0.0}; double kappa{0.0}; double kappa_l{0.0};
 };
 
+// A path sample is always looked up by the same query arc-length across
+// several parallel arrays (x, y, psi, kappa, kappa_l, ...). Resolving the
+// bracketing index/blend weight once and reusing it avoids repeating the
+// same std::upper_bound() search once per array.
+struct InterpIndex {
+  std::size_t index{0};
+  double alpha{0.0};
+};
+
+InterpIndex resolve_interp_index(const std::vector<double>& x, double query) {
+  if (x.size() < 2) return InterpIndex{0, 0.0};
+  if (query <= x.front()) return InterpIndex{0, 0.0};
+  if (query >= x.back()) return InterpIndex{x.size() - 2, 1.0};
+  const std::size_t i = lower_interval(x, query);
+  const double dx = std::max(x[i + 1] - x[i], 1.0e-15);
+  return InterpIndex{i, (query - x[i]) / dx};
+}
+
+double apply_interp_index(const std::vector<double>& y, const InterpIndex& idx) {
+  if (idx.index + 1 >= y.size()) return y[idx.index];
+  return (1.0 - idx.alpha) * y[idx.index] + idx.alpha * y[idx.index + 1];
+}
+
 PathSample interpolate_path(const SpatialPathCandidate& path, double progress) {
   const double query = clamp_value(progress, 0.0, path.arc_length.back());
-  return {interp_scalar(path.arc_length, path.x, query),
-          interp_scalar(path.arc_length, path.y, query),
-          interp_scalar(path.arc_length, path.psi, query),
-          interp_scalar(path.arc_length, path.kappa, query),
-          interp_scalar(path.arc_length, path.kappa_l, query)};
+  const InterpIndex idx = resolve_interp_index(path.arc_length, query);
+  return {apply_interp_index(path.x, idx), apply_interp_index(path.y, idx),
+          apply_interp_index(path.psi, idx), apply_interp_index(path.kappa, idx),
+          apply_interp_index(path.kappa_l, idx)};
+}
+
+// Lighter-weight variant for callers (curve_speed_limit) that only need
+// curvature and its arc-length derivative, not full pose (x, y, heading) --
+// skips computing/interpolating the three unused arrays entirely.
+struct CurvatureSample {
+  double kappa{0.0};
+  double kappa_l{0.0};
+};
+
+CurvatureSample interpolate_curvature(const SpatialPathCandidate& path, double progress) {
+  const double query = clamp_value(progress, 0.0, path.arc_length.back());
+  const InterpIndex idx = resolve_interp_index(path.arc_length, query);
+  return {apply_interp_index(path.kappa, idx), apply_interp_index(path.kappa_l, idx)};
 }
 
 double interpolate_reference_progress(const SpatialPathCandidate& path, double progress) {
@@ -1588,7 +1624,7 @@ double curve_speed_limit(const SpatialPathCandidate& path, double progress,
   for (int i = 0; i < 61; ++i) {
     const double alpha = static_cast<double>(i) / 60.0;
     const double sample_s = progress + alpha * (std::max(progress, s1) - progress);
-    const auto sample = interpolate_path(path, sample_s);
+    const auto sample = interpolate_curvature(path, sample_s);
     const double v_kappa = std::sqrt(cfg.constraints.a_lat_max /
                                      (std::abs(sample.kappa) + 1.0e-5));
     const double v_kappa_rate = std::cbrt(
