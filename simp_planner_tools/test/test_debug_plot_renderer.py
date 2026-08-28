@@ -68,6 +68,10 @@ def test_all_scenario_obstacles_and_vehicle_relative_costmap_size_are_drawn() ->
         "costmap_resolution": 1.0,
         "costmap_width": 60,
         "costmap_height": 60,
+        # Sits at this box's geometric centre, so the (symmetric, raw
+        # as-received) costmap reports equal ahead/behind/left/right numbers
+        # here -- a planner crop window is generally NOT symmetric like this.
+        "current_state": {"x": -20.0, "y": 50.0, "body_yaw": 0.5 * math.pi},
     }
 
     obstacles = _draw_scenario_obstacles(axis, snapshot)
@@ -77,6 +81,7 @@ def test_all_scenario_obstacles_and_vehicle_relative_costmap_size_are_drawn() ->
     assert obstacles[0].get_label() == "Scenario obstacles (2 total)"
     assert boundary is not None
     assert "60.0×60.0 m" in boundary.get_label()
+    assert "as received" in boundary.get_label()
     np.testing.assert_allclose(
         np.asarray(boundary.get_xy())[:4],
         np.asarray([[10.0, 20.0], [10.0, 80.0], [-50.0, 80.0], [-50.0, 20.0]]),
@@ -85,7 +90,49 @@ def test_all_scenario_obstacles_and_vehicle_relative_costmap_size_are_drawn() ->
     np.testing.assert_allclose(
         axis.collections[-1].get_offsets(), np.asarray([[-20.0, 50.0]])
     )
-    assert any("body x ±30.0" in annotation.get_text() for annotation in axis.texts)
+    assert any(
+        "ahead 30.0 m, behind 30.0 m, left 30.0 m, right 30.0 m" in annotation.get_text()
+        for annotation in axis.texts
+    )
+    plt.close(figure)
+
+
+def test_costmap_boundary_prefers_planner_crop_window_over_raw_grid() -> None:
+    # The planner crops the raw received grid down to a reference-path-slice
+    # window before running its distance transform (see
+    # LOCAL_COSTMAP_REDESIGN_KR.md) -- the debug plot should show that
+    # smaller/asymmetric window, not the full grid the sensor/scenario side
+    # published.
+    figure, axis = plt.subplots()
+    snapshot = {
+        "costmap_origin": {"x": -100.0, "y": -100.0, "yaw": 0.0},
+        "costmap_resolution": 1.0,
+        "costmap_width": 60,
+        "costmap_height": 60,
+        "costmap_crop_origin": {"x": 0.0, "y": 0.0, "yaw": 0.0},
+        "costmap_crop_resolution": 1.0,
+        "costmap_crop_width": 10,
+        "costmap_crop_height": 6,
+        "current_state": {"x": 2.0, "y": 3.0, "body_yaw": 0.0},
+    }
+
+    boundary = _draw_costmap_boundary(axis, snapshot)
+
+    assert boundary is not None
+    assert "10.0×6.0 m" in boundary.get_label()
+    assert "planner window" in boundary.get_label()
+    np.testing.assert_allclose(
+        np.asarray(boundary.get_xy())[:4],
+        np.asarray([[0.0, 0.0], [10.0, 0.0], [10.0, 6.0], [0.0, 6.0]]),
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        axis.collections[-1].get_offsets(), np.asarray([[2.0, 3.0]])
+    )
+    assert any(
+        "ahead 8.0 m, behind 2.0 m, left 3.0 m, right 3.0 m" in annotation.get_text()
+        for annotation in axis.texts
+    )
     plt.close(figure)
 
 

@@ -268,6 +268,16 @@ class DebugPlotNode(Node):
         self.costmap_resolution: Optional[float] = None
         self.costmap_width: Optional[int] = None
         self.costmap_height: Optional[int] = None
+        # Sticky: the region the planner actually ran its distance transform
+        # over (see LOCAL_COSTMAP_REDESIGN_KR.md). Only present on the richer
+        # "RUNNING" planner-status messages, not every "PENDING_PLAN_READY"
+        # tick -- kept sticky here (like costmap_origin above) so the debug
+        # plot still shows the last-known planner window instead of losing it
+        # whenever a leaner status message happens to be the latest.
+        self.costmap_crop_origin: Optional[dict[str, float]] = None
+        self.costmap_crop_resolution: Optional[float] = None
+        self.costmap_crop_width: Optional[int] = None
+        self.costmap_crop_height: Optional[int] = None
         self.target_speed: Optional[float] = None
         self.mode: Optional[int] = None
         self.requested_mode: Optional[int] = None
@@ -568,6 +578,15 @@ class DebugPlotNode(Node):
 
         execution = self.planner_section("execution")
         plan = self.planner_section("plan")
+        if "costmap_crop_width" in plan:
+            self.costmap_crop_origin = {
+                "x": plan.get("costmap_crop_origin_x"),
+                "y": plan.get("costmap_crop_origin_y"),
+                "yaw": plan.get("costmap_crop_origin_yaw"),
+            }
+            self.costmap_crop_resolution = plan.get("costmap_crop_resolution")
+            self.costmap_crop_width = plan.get("costmap_crop_width")
+            self.costmap_crop_height = plan.get("costmap_crop_height")
         timing = self.planner_section("timing")
         plan_id = int(execution.get("current_plan_id", 0) or 0)
         if plan_id <= 0 or plan_id == self.last_logged_plan_id:
@@ -1011,6 +1030,15 @@ class DebugPlotNode(Node):
             "costmap_resolution": self.costmap_resolution,
             "costmap_width": self.costmap_width,
             "costmap_height": self.costmap_height,
+            # The region the planner actually ran its distance transform
+            # over (a reference-path-slice crop of the grid above, usually
+            # smaller and off-centre) -- see LOCAL_COSTMAP_REDESIGN_KR.md.
+            # Sticky (see planner_status_callback): None until the first
+            # "RUNNING"-state status message carries crop metadata.
+            "costmap_crop_origin": copy.deepcopy(self.costmap_crop_origin),
+            "costmap_crop_resolution": self.costmap_crop_resolution,
+            "costmap_crop_width": self.costmap_crop_width,
+            "costmap_crop_height": self.costmap_crop_height,
             "current_state": copy.deepcopy(self.current_state),
             "current_projection": self.projection_payload(self.current_projection),
             "selected_projection": self.projection_payload(self.selected_projection),

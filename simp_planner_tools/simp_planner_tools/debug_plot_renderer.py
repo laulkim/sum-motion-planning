@@ -49,17 +49,27 @@ def _vehicle_polygon(x: float, y: float, yaw: float, length: float, width: float
 def _costmap_geometry(
     snapshot: dict[str, Any],
     expected_shape: tuple[int, int] | None = None,
+    prefix: str = "costmap",
 ) -> dict[str, Any] | None:
-    """Return validated grid geometry expressed in odom coordinates."""
-    origin = snapshot.get("costmap_origin")
+    """Return validated grid geometry expressed in odom coordinates.
+
+    ``prefix`` selects which set of snapshot keys to read: "costmap" is the
+    full grid as received from the sensor/scenario side; "costmap_crop" is
+    the (usually smaller, reference-path-slice-sized) window the planner
+    actually ran its distance transform over -- see
+    LOCAL_COSTMAP_REDESIGN_KR.md. Both share this same key shape:
+    ``{prefix}_origin`` (dict with x/y/yaw), ``{prefix}_resolution``,
+    ``{prefix}_width``, ``{prefix}_height``.
+    """
+    origin = snapshot.get(f"{prefix}_origin")
     try:
         origin_x = float(origin["x"])
         origin_y = float(origin["y"])
         origin_yaw = float(origin["yaw"])
-        resolution = float(snapshot.get("costmap_resolution"))
+        resolution = float(snapshot.get(f"{prefix}_resolution"))
         default_height, default_width = expected_shape or (0, 0)
-        width = int(snapshot.get("costmap_width", default_width))
-        height = int(snapshot.get("costmap_height", default_height))
+        width = int(snapshot.get(f"{prefix}_width", default_width))
+        height = int(snapshot.get(f"{prefix}_height", default_height))
     except (KeyError, TypeError, ValueError, OverflowError):
         return None
     if not (
@@ -183,8 +193,21 @@ def _costmap_is_vehicle_centered(snapshot: dict[str, Any]) -> bool:
 
 
 def _draw_costmap_boundary(map_ax: Any, snapshot: dict[str, Any]) -> Polygon | None:
-    """Outline the captured local map and identify its vehicle-centred size."""
-    geometry = _costmap_geometry(snapshot)
+    """Outline the region the planner actually ran its distance transform over.
+
+    Prefers ``costmap_crop_*`` (the planner's reference-path-slice crop of
+    the received grid, see LOCAL_COSTMAP_REDESIGN_KR.md) and falls back to
+    the raw received ``costmap_*`` grid when a snapshot has no crop metadata
+    (older snapshots, or before the planner has both a path and odom to crop
+    with). The crop is generally NOT centred on the vehicle -- it can reach
+    much further ahead than behind, or further to one side than the other --
+    so the marker/annotation report the vehicle's actual local position
+    rather than assuming it sits at the box's geometric centre.
+    """
+    geometry = _costmap_geometry(snapshot, prefix="costmap_crop")
+    is_planner_window = geometry is not None
+    if geometry is None:
+        geometry = _costmap_geometry(snapshot)
     if geometry is None:
         return None
     width_m = float(geometry["width_m"])
@@ -192,10 +215,8 @@ def _draw_costmap_boundary(map_ax: Any, snapshot: dict[str, Any]) -> Polygon | N
     vehicle_centered = _costmap_is_vehicle_centered(snapshot)
     label = f"Costmap {width_m:.1f}×{height_m:.1f} m"
     if vehicle_centered:
-        label = (
-            f"Local costmap {width_m:.1f}×{height_m:.1f} m "
-            f"(body ±{0.5 * width_m:.1f}/±{0.5 * height_m:.1f} m)"
-        )
+        qualifier = "planner window" if is_planner_window else "as received"
+        label = f"Local costmap {width_m:.1f}×{height_m:.1f} m ({qualifier})"
     boundary = Polygon(
         geometry["corners"],
         closed=True,
@@ -210,16 +231,38 @@ def _draw_costmap_boundary(map_ax: Any, snapshot: dict[str, Any]) -> Polygon | N
     first_corner = geometry["corners"][0]
     annotation = f"{width_m:.1f} × {height_m:.1f} m"
     if vehicle_centered:
-        center = geometry["center"]
-        map_ax.scatter(
-            [center[0]], [center[1]], marker="+", s=80,
-            color="tab:cyan", linewidths=1.6, zorder=6,
-            label="Costmap capture vehicle centre",
-        )
-        annotation += (
-            f"\nbody x ±{0.5 * width_m:.1f}, "
-            f"y ±{0.5 * height_m:.1f} m"
-        )
+        state = snapshot.get("current_state") or {}
+        try:
+            vehicle_x = float(state["x"])
+            vehicle_y = float(state["y"])
+        except (KeyError, TypeError, ValueError):
+            vehicle_x = vehicle_y = None
+        if vehicle_x is not None:
+            c = math.cos(geometry["yaw"])
+            s = math.sin(geometry["yaw"])
+            dx = vehicle_x - geometry["origin_x"]
+            dy = vehicle_y - geometry["origin_y"]
+            local_x = c * dx + s * dy
+            local_y = -s * dx + c * dy
+            map_ax.scatter(
+                [vehicle_x], [vehicle_y], marker="+", s=80,
+                color="tab:cyan", linewidths=1.6, zorder=6,
+                label="Costmap capture vehicle pose",
+            )
+            annotation += (
+                f"\nvehicle: ahead {width_m - local_x:.1f} m, "
+                f"behind {local_x:.1f} m, "
+                f"left {height_m - local_y:.1f} m, right {local_y:.1f} m"
+            )
+        else:
+            # Snapshot predates per-state vehicle pose, or state is missing
+            # this tick -- fall back to the box's own geometric centre.
+            center = geometry["center"]
+            map_ax.scatter(
+                [center[0]], [center[1]], marker="+", s=80,
+                color="tab:cyan", linewidths=1.6, zorder=6,
+                label="Costmap centre",
+            )
     map_ax.annotate(
         annotation,
         xy=(first_corner[0], first_corner[1]),

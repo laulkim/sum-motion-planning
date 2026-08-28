@@ -148,6 +148,16 @@ struct InputSnapshot {
 struct CostmapBuildSnapshot {
   double last_costmap_build_ms{0.0};
   std::uint64_t costmap_rebuild_count{0};
+  // Geometry of the region Costmap2D actually ran its distance transform
+  // over -- the reference-path-slice crop of the received grid, not
+  // necessarily the full received grid. See crop_costmap_to_reference_path_
+  // window() and LOCAL_COSTMAP_REDESIGN_KR.md.
+  double costmap_crop_origin_x{0.0};
+  double costmap_crop_origin_y{0.0};
+  double costmap_crop_origin_yaw{0.0};
+  int costmap_crop_width{0};
+  int costmap_crop_height{0};
+  double costmap_crop_resolution{0.0};
 };
 
 struct ModeStatusSnapshot {
@@ -427,6 +437,120 @@ class PlannerNodeCpp final : public rclcpp::Node {
     return hash;
   }
 
+  struct CostmapCropResult {
+    std::vector<std::int8_t> data;
+    int width{0};
+    int height{0};
+    double origin_x{0.0};
+    double origin_y{0.0};
+  };
+
+  // Crops the received grid (width x height, row-major, expressed in its own
+  // local frame at capture time via origin_x/origin_y/origin_yaw) down to the
+  // axis-aligned sub-window -- in that SAME local frame, so this is a plain
+  // index crop with no extra rotation -- that covers the reference path's
+  // local slice around the vehicle plus a margin (vehicle footprint, widest
+  // lateral candidate, and the vehicle's expected displacement between
+  // costmap captures). The EDT in Costmap2D's constructor then only pays for
+  // this sub-region instead of the whole received grid. See
+  // LOCAL_COSTMAP_REDESIGN_KR.md ("범위(extent)"). Falls back to returning
+  // the input unchanged if the reference path doesn't overlap the grid at
+  // all or the computed window doesn't usefully shrink anything.
+  static CostmapCropResult crop_costmap_to_reference_path_window(
+      std::vector<std::int8_t> data, int width, int height, double resolution,
+      double origin_x, double origin_y, double origin_yaw,
+      const ReferencePath& path, const PlannerState& state,
+      const EnvConfig& config) {
+    CostmapCropResult full{std::move(data), width, height, origin_x, origin_y};
+
+    const double half_length = 0.5 * config.vehicle.length;
+    const double half_width = 0.5 * config.vehicle.width;
+    const double footprint_margin = config.vehicle.footprint_margin;
+    // Nominal vehicle displacement between costmap captures. The planner has
+    // no direct handle on the local costmap's own publish period, so this
+    // approximates it from its typical 5 Hz cadence (see
+    // LOCAL_COSTMAP_REDESIGN_KR.md's capture-to-query discussion).
+    const double capture_gap_buffer = config.constraints.v_max * 0.2;
+    const double longitudinal_margin =
+        half_length + footprint_margin + capture_gap_buffer;
+    double max_lateral_target = 0.0;
+    for (double n : config.lateral.n_targets) {
+      max_lateral_target = std::max(max_lateral_target, std::abs(n));
+    }
+    const double lateral_margin = max_lateral_target + half_width + footprint_margin;
+    const double ahead_length_s = std::max(
+        config.adaptive_replan.minimum_spatial_preview, config.lateral.max_length);
+    const double back_length_s = longitudinal_margin;
+
+    const auto vehicle_projection = path.project(state.x, state.y, state.chi);
+    const double s_start = std::max(path.s_min(), vehicle_projection.s - back_length_s);
+    const double s_end = std::min(path.s_max(), vehicle_projection.s + ahead_length_s);
+    if (!(s_end > s_start)) return full;
+
+    const double c = std::cos(origin_yaw);
+    const double s_yaw = std::sin(origin_yaw);
+    double local_x_min = std::numeric_limits<double>::infinity();
+    double local_x_max = -std::numeric_limits<double>::infinity();
+    double local_y_min = std::numeric_limits<double>::infinity();
+    double local_y_max = -std::numeric_limits<double>::infinity();
+    constexpr double kSampleStep = 1.0;
+    const int sample_count = std::max(
+        2, static_cast<int>(std::ceil((s_end - s_start) / kSampleStep)) + 1);
+    for (int i = 0; i < sample_count; ++i) {
+      const double alpha = static_cast<double>(i) / static_cast<double>(sample_count - 1);
+      const double s_query = s_start + alpha * (s_end - s_start);
+      double px = 0.0, py = 0.0, psi = 0.0, kappa = 0.0, kappa_s = 0.0;
+      path.evaluate(s_query, px, py, psi, kappa, kappa_s);
+      const double dx = px - origin_x;
+      const double dy = py - origin_y;
+      const double local_x = c * dx + s_yaw * dy;
+      const double local_y = -s_yaw * dx + c * dy;
+      local_x_min = std::min(local_x_min, local_x);
+      local_x_max = std::max(local_x_max, local_x);
+      local_y_min = std::min(local_y_min, local_y);
+      local_y_max = std::max(local_y_max, local_y);
+    }
+    local_x_min -= longitudinal_margin;
+    local_x_max += longitudinal_margin;
+    local_y_min -= lateral_margin;
+    local_y_max += lateral_margin;
+
+    const int col_start = std::clamp(
+        static_cast<int>(std::floor(local_x_min / resolution)), 0, width);
+    const int col_stop = std::clamp(
+        static_cast<int>(std::ceil(local_x_max / resolution)), col_start, width);
+    const int row_start = std::clamp(
+        static_cast<int>(std::floor(local_y_min / resolution)), 0, height);
+    const int row_stop = std::clamp(
+        static_cast<int>(std::ceil(local_y_max / resolution)), row_start, height);
+
+    const int crop_width = col_stop - col_start;
+    const int crop_height = row_stop - row_start;
+    if (crop_width < 2 || crop_height < 2 ||
+        (crop_width >= width && crop_height >= height)) {
+      return full;
+    }
+
+    std::vector<std::int8_t> cropped(
+        static_cast<std::size_t>(crop_width) * static_cast<std::size_t>(crop_height));
+    for (int row = 0; row < crop_height; ++row) {
+      const auto source_offset =
+          static_cast<std::size_t>(row_start + row) * static_cast<std::size_t>(width) +
+          static_cast<std::size_t>(col_start);
+      const auto dest_offset = static_cast<std::size_t>(row) * static_cast<std::size_t>(crop_width);
+      std::copy_n(full.data.begin() + static_cast<std::ptrdiff_t>(source_offset),
+                  crop_width, cropped.begin() + static_cast<std::ptrdiff_t>(dest_offset));
+    }
+
+    const double crop_origin_x =
+        origin_x + c * (col_start * resolution) - s_yaw * (row_start * resolution);
+    const double crop_origin_y =
+        origin_y + s_yaw * (col_start * resolution) + c * (row_start * resolution);
+
+    return CostmapCropResult{std::move(cropped), crop_width, crop_height,
+                              crop_origin_x, crop_origin_y};
+  }
+
   void path_callback(const ReferencePathMsg::SharedPtr msg) {
     try {
       if (msg->x.size() < 4 || msg->x.size() != msg->y.size() ||
@@ -480,6 +604,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
       if (msg->header.frame_id.empty())
         throw std::invalid_argument("OccupancyGrid frame_id must not be empty");
       const auto fingerprint = costmap_fingerprint(*msg, origin_yaw);
+      std::shared_ptr<const ReferencePath> path_for_crop;
+      PlannerState state_for_crop{};
+      bool have_path_and_state = false;
       {
         std::lock_guard<std::mutex> lock(input_mutex_);
         if (received_odom_ && !odom_frame_.empty() &&
@@ -493,13 +620,36 @@ class PlannerNodeCpp final : public rclcpp::Node {
               "OccupancyGrid frame does not match reference-path frame");
         }
         if (received_costmap_ && fingerprint == costmap_fingerprint_) return;
+        have_path_and_state = received_path_ && received_odom_;
+        if (have_path_and_state) {
+          path_for_crop = reference_path_;
+          state_for_crop = current_state_;
+        }
       }
       std::vector<std::int8_t> data(msg->data.begin(), msg->data.end());
+      double map_origin_x = msg->info.origin.position.x;
+      double map_origin_y = msg->info.origin.position.y;
+      int map_width = width;
+      int map_height = height;
       const auto build_start = std::chrono::steady_clock::now();
+      if (have_path_and_state) {
+        // Only the planner knows the reference path, candidate reach, and
+        // vehicle footprint needed to size this window -- the scenario/
+        // sensor side just publishes the full local square. See
+        // LOCAL_COSTMAP_REDESIGN_KR.md.
+        auto crop = crop_costmap_to_reference_path_window(
+            std::move(data), width, height, msg->info.resolution,
+            map_origin_x, map_origin_y, origin_yaw, *path_for_crop,
+            state_for_crop, config_);
+        data = std::move(crop.data);
+        map_width = crop.width;
+        map_height = crop.height;
+        map_origin_x = crop.origin_x;
+        map_origin_y = crop.origin_y;
+      }
       auto map = std::make_shared<Costmap2D>(
-          std::move(data), width, height, msg->info.resolution,
-          msg->info.origin.position.x, msg->info.origin.position.y,
-          origin_yaw);
+          std::move(data), map_width, map_height, msg->info.resolution,
+          map_origin_x, map_origin_y, origin_yaw);
       const double build_ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - build_start).count();
       {
@@ -511,6 +661,12 @@ class PlannerNodeCpp final : public rclcpp::Node {
         ++structural_revision_;
         last_costmap_build_ms_ = build_ms;
         ++costmap_rebuild_count_;
+        costmap_crop_origin_x_ = map_origin_x;
+        costmap_crop_origin_y_ = map_origin_y;
+        costmap_crop_origin_yaw_ = origin_yaw;
+        costmap_crop_width_ = map_width;
+        costmap_crop_height_ = map_height;
+        costmap_crop_resolution_ = msg->info.resolution;
       }
       invalidate_pending_plan();
       request_replan("COSTMAP_CHANGED", true);
@@ -1131,7 +1287,10 @@ class PlannerNodeCpp final : public rclcpp::Node {
 
   CostmapBuildSnapshot costmap_build_snapshot() const {
     std::lock_guard<std::mutex> lock(input_mutex_);
-    return {last_costmap_build_ms_, costmap_rebuild_count_};
+    return {last_costmap_build_ms_, costmap_rebuild_count_,
+            costmap_crop_origin_x_, costmap_crop_origin_y_,
+            costmap_crop_origin_yaw_, costmap_crop_width_,
+            costmap_crop_height_, costmap_crop_resolution_};
   }
 
   ModeStatusSnapshot mode_status_snapshot() const {
@@ -1287,7 +1446,13 @@ class PlannerNodeCpp final : public rclcpp::Node {
            << ",\"trajectory_state_calculation_ms\":" << plan.trajectory_state_calculation_ms
            << ",\"trajectory_feasibility_check_ms\":" << plan.trajectory_feasibility_check_ms
            << ",\"costmap_build_ms\":" << costmap_build.last_costmap_build_ms
-           << ",\"costmap_rebuild_count\":" << costmap_build.costmap_rebuild_count << "}"
+           << ",\"costmap_rebuild_count\":" << costmap_build.costmap_rebuild_count
+           << ",\"costmap_crop_origin_x\":" << costmap_build.costmap_crop_origin_x
+           << ",\"costmap_crop_origin_y\":" << costmap_build.costmap_crop_origin_y
+           << ",\"costmap_crop_origin_yaw\":" << costmap_build.costmap_crop_origin_yaw
+           << ",\"costmap_crop_width\":" << costmap_build.costmap_crop_width
+           << ",\"costmap_crop_height\":" << costmap_build.costmap_crop_height
+           << ",\"costmap_crop_resolution\":" << costmap_build.costmap_crop_resolution << "}"
            << ",\"timing\":{"
            << "\"deadline_ms\":100.0"
            << ",\"handover_lead_sec\":"
@@ -1377,6 +1542,12 @@ class PlannerNodeCpp final : public rclcpp::Node {
   std::uint64_t costmap_fingerprint_{0};
   double last_costmap_build_ms_{0.0};
   std::uint64_t costmap_rebuild_count_{0};
+  double costmap_crop_origin_x_{0.0};
+  double costmap_crop_origin_y_{0.0};
+  double costmap_crop_origin_yaw_{0.0};
+  int costmap_crop_width_{0};
+  int costmap_crop_height_{0};
+  double costmap_crop_resolution_{0.0};
 
   std::shared_ptr<const ExecutablePlan> active_plan_;
   std::shared_ptr<const ExecutablePlan> pending_plan_;
