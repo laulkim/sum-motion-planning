@@ -115,21 +115,21 @@ PATH_BREAKDOWN_SERIES = (
     ("Candidate path generation (total)", (
         ("candidate_generation_ms", "total", "tab:blue"),
     )),
-    ("Candidate gen: projection", (
+    ("Candidate gen: reference projection", (
         ("candidate_projection_ms", "projection", "tab:cyan"),
     )),
-    ("Candidate gen: boundary + S length", (
+    ("Candidate gen: initial condition + S-range setup", (
         ("candidate_boundary_setup_ms", "boundary + S length", "tab:purple"),
     )),
     # Solving the polynomial (fixed cost per attempt) and evaluating it at
     # every sample point (cost scales with sample count) are two phases of
     # the same step, so they are summed into one combined series here
     # rather than plotted as two separate lines.
-    ("Candidate gen: polynomial fit + sample points", (
+    ("Candidate gen: polynomial solve + sampling", (
         (("candidate_polynomial_fit_ms", "candidate_sample_points_ms"),
          "polynomial fit + sample points", "tab:brown"),
     )),
-    ("Candidate gen: curvature + Cartesian", (
+    ("Candidate gen: Cartesian + curvature profile", (
         ("candidate_curvature_cartesian_ms", "curvature + Cartesian", "tab:olive"),
     )),
     ("Collision check", (
