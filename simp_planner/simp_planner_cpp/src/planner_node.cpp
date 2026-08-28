@@ -122,7 +122,6 @@ struct ExecutablePlan {
   double trajectory_generation_ms{0.0};
   double trajectory_initial_state_target_ms{0.0};
   double trajectory_longitudinal_profile_ms{0.0};
-  double trajectory_time_parameterization_ms{0.0};
   double trajectory_state_calculation_ms{0.0};
   double trajectory_feasibility_check_ms{0.0};
 };
@@ -839,7 +838,6 @@ class PlannerNodeCpp final : public rclcpp::Node {
       executable->trajectory_generation_ms = block_timings.trajectory_generation_ms;
       executable->trajectory_initial_state_target_ms = block_timings.trajectory_initial_state_target_ms;
       executable->trajectory_longitudinal_profile_ms = block_timings.trajectory_longitudinal_profile_ms;
-      executable->trajectory_time_parameterization_ms = block_timings.trajectory_time_parameterization_ms;
       executable->trajectory_state_calculation_ms = block_timings.trajectory_state_calculation_ms;
       executable->trajectory_feasibility_check_ms = block_timings.trajectory_feasibility_check_ms;
       bool registration_stale = false;
@@ -1286,7 +1284,6 @@ class PlannerNodeCpp final : public rclcpp::Node {
            << ",\"trajectory_generation_ms\":" << plan.trajectory_generation_ms
            << ",\"trajectory_initial_state_target_ms\":" << plan.trajectory_initial_state_target_ms
            << ",\"trajectory_longitudinal_profile_ms\":" << plan.trajectory_longitudinal_profile_ms
-           << ",\"trajectory_time_parameterization_ms\":" << plan.trajectory_time_parameterization_ms
            << ",\"trajectory_state_calculation_ms\":" << plan.trajectory_state_calculation_ms
            << ",\"trajectory_feasibility_check_ms\":" << plan.trajectory_feasibility_check_ms
            << ",\"costmap_build_ms\":" << costmap_build.last_costmap_build_ms

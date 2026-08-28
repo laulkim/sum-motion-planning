@@ -137,19 +137,22 @@ PATH_BREAKDOWN_SERIES = (
     )),
 )
 
-# trajectory_generation_ms and its five trajectory_* entries are the same
+# trajectory_generation_ms and its four trajectory_* entries are the same
 # kind of breakdown for generate_open_loop_trajectory() (nested inside the
 # total, so they need not sum to it exactly): initial state + target (the
 # pre-loop setup -- binding the handover state and picking cruise-to-speed
 # vs. terminal-stop as this call's objective), longitudinal profile
 # (v(t)/a(t)/j(t) from the terminal/emergency/cruise control branches),
-# time parameterization (integrating that profile into arc-length progress,
-# s_{k+1} = s_k + distance, plus the endpoint-overshoot check), state
-# calculation (turning arc-length progress back into path geometry via
-# interpolate_path, both per simulated step and in the post-loop lateral
-# accel/jerk derivation pass), and feasibility check (the fine-substep
-# dynamic/kinematic constraint validation loop that produces valid_dynamic --
-# distinct from the spatial feasibility_check_ms above).
+# time parameterization + state calculation (integrating that profile into
+# arc-length progress, s_{k+1} = s_k + distance, plus the endpoint-overshoot
+# check, then turning that progress back into path geometry via
+# interpolate_path -- both per simulated step and in the post-loop lateral
+# accel/jerk derivation pass; these were two buckets until it became clear
+# they always run back-to-back with nothing else interleaved, so splitting
+# them never told us anything the combined number didn't), and feasibility
+# check (the fine-substep dynamic/kinematic constraint validation loop that
+# produces valid_dynamic -- distinct from the spatial feasibility_check_ms
+# above).
 TRAJECTORY_BREAKDOWN_SERIES = (
     ("Trajectory generation (total)", (
         ("trajectory_generation_ms", "total", "tab:green"),
@@ -160,11 +163,8 @@ TRAJECTORY_BREAKDOWN_SERIES = (
     ("Trajectory: longitudinal profile", (
         ("trajectory_longitudinal_profile_ms", "longitudinal profile", "tab:gray"),
     )),
-    ("Trajectory: time parameterization", (
-        ("trajectory_time_parameterization_ms", "time parameterization", "tab:cyan"),
-    )),
-    ("Trajectory: state calculation", (
-        ("trajectory_state_calculation_ms", "state calculation", "tab:purple"),
+    ("Trajectory: time parameterization + state calculation", (
+        ("trajectory_state_calculation_ms", "time parameterization + state calculation", "tab:purple"),
     )),
     ("Trajectory: feasibility check", (
         ("trajectory_feasibility_check_ms", "feasibility check", "tab:red"),

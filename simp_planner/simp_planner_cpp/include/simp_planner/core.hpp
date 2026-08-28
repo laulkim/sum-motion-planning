@@ -94,24 +94,31 @@ struct PlanningBlockTimings {
   // function (wraps the entire body; the five entries below are nested
   // inside it and need not sum to it exactly). trajectory_initial_state_target_ms
   // is the pre-loop setup: binding the initial handover state and deciding
-  // this call's objective (cruise-to-target-speed vs. terminal-stop).
+  // this call's objective (cruise-to-target-speed vs. terminal-stop). It also
+  // includes the terminal-mode activation decision in plan_at_speed(), run
+  // once per cycle before any candidate is generated: comparing remaining
+  // distance to the reference path's stop point against a jerk-limited
+  // required stopping distance (terminal_constraint_active/terminal_mode_active),
+  // plus the terminal safe-region obstacle check (terminal_safe_region_active).
   // trajectory_longitudinal_profile_ms is, per simulated step, turning that
   // objective into v(t)/a(t)/j(t) (terminal feedback control, emergency
   // braking, or cruise-speed tracking, then jerk/accel clamping).
-  // trajectory_time_parameterization_ms is integrating that profile into
-  // arc-length progress (s_{k+1} = s_k + distance) and the endpoint-overshoot
-  // check. trajectory_state_calculation_ms is turning arc-length progress
-  // back into path geometry (x, y, heading, curvature) via interpolate_path
-  // and assembling each trajectory point -- both inside the main loop and in
-  // the post-loop pass that derives lateral acceleration/jerk for every
-  // state. trajectory_feasibility_check_ms is the fine-substep dynamic/
+  // trajectory_state_calculation_ms is integrating that profile into
+  // arc-length progress (s_{k+1} = s_k + distance) plus the endpoint-overshoot
+  // check, then turning that progress back into path geometry (x, y, heading,
+  // curvature) via interpolate_path and assembling each trajectory point --
+  // both inside the main loop and in the post-loop pass that derives lateral
+  // acceleration/jerk for every state. These two used to be separate buckets
+  // (time parameterization vs. state calculation) but are folded into one:
+  // they run back-to-back on every step with no other work between them, so
+  // splitting them never told us anything the combined number didn't.
+  // trajectory_feasibility_check_ms is the fine-substep dynamic/
   // kinematic constraint validation loop that produces valid_dynamic (not to
   // be confused with feasibility_check_ms above, which is the spatial
   // candidate's curvature check).
   double trajectory_generation_ms{0.0};
   double trajectory_initial_state_target_ms{0.0};
   double trajectory_longitudinal_profile_ms{0.0};
-  double trajectory_time_parameterization_ms{0.0};
   double trajectory_state_calculation_ms{0.0};
   double trajectory_feasibility_check_ms{0.0};
 };

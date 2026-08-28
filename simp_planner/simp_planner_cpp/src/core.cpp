@@ -1769,8 +1769,8 @@ TimeTrajectory generate_open_loop_trajectory(
     double l_next = 0.0;
     double q_next = 0.0;
     {
-    ScopedBlockTimer time_parameterization_timer(
-        g_planning_block_timings.trajectory_time_parameterization_ms);
+    ScopedBlockTimer state_calculation_timer(
+        g_planning_block_timings.trajectory_state_calculation_ms);
     l_next = l_progress + distance;
     q_next = interpolate_reference_progress(path, l_next);
     const bool terminal_tolerance_extension = terminal_mode_active
@@ -1795,10 +1795,6 @@ TimeTrajectory generate_open_loop_trajectory(
       }
       break;
     }
-    }  // end time_parameterization_timer scope
-    {
-    ScopedBlockTimer state_calculation_timer(
-        g_planning_block_timings.trajectory_state_calculation_ms);
     const auto sample = interpolate_path(path, l_next);
     PlannerState next;
     next.x = sample.x;
@@ -2382,6 +2378,13 @@ PlanResult PathVelocityPlanner::plan_at_speed(
   terminal_safe_region_active_last_ = terminal_safe_region_active;
   const bool terminal_mode_active = terminal_constraint_active;
   const bool map_end_mode = terminal_constraint_active;
+  // Stopping-distance/terminal-safe-region activation decision above runs once
+  // per cycle, before any candidate is generated -- fold it into the same
+  // "initial state + objective" bucket that generate_open_loop_trajectory()
+  // uses for its own pre-loop setup below.
+  g_planning_block_timings.trajectory_initial_state_target_ms +=
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - start_time).count();
 
   if (maneuver_profile_ && maneuver_start_s_) {
     const double total_length = maneuver_profile_->start_delay
