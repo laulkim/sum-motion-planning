@@ -167,6 +167,13 @@ def main():
     print(f"saved: {tail_path}  ({len(tail_xy)}pt, s=[{s_from:.2f},{s_to:.2f}]m, "
           f"(마지막 phase, switch_s 없음), max|kappa|={np.max(np.abs(tail_kappa)):.4f} 1/m)")
 
+    # 이 시나리오가 쓰는 로컬 원점(UTM easting/northing) 기록 -- RViz에서 원본
+    # HD map(차선 등)을 같은 "odom" 프레임에 겹쳐 그리려는 노드가 읽어간다.
+    origin_path = os.path.join(DATA_DIR, "output", "hdmap_lap_switch_origin.txt")
+    with open(origin_path, "w", encoding="utf-8") as f:
+        f.write(f"{origin[0]:.3f} {origin[1]:.3f}\n")
+    print(f"saved: {origin_path}  (origin_easting={origin[0]:.3f}, origin_northing={origin[1]:.3f})")
+
 
 if __name__ == "__main__":
     main()

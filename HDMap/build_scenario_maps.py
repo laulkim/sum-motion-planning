@@ -138,6 +138,11 @@ def main():
     print(f"saved: {left_path}  ({len(crab_xy_local)}pt, max|kappa|={np.max(np.abs(crab_kappa)):.4f} 1/m)")
     print(f"saved: {right_path}  ({len(return_xy_local)}pt, max|kappa|={np.max(np.abs(return_kappa)):.4f} 1/m)")
 
+    origin_path = os.path.join(DATA_DIR, "output", "hdmap_crab1_switch_origin.txt")
+    with open(origin_path, "w", encoding="utf-8") as f:
+        f.write(f"{origin[0]:.3f} {origin[1]:.3f}\n")
+    print(f"saved: {origin_path}  (origin_easting={origin[0]:.3f}, origin_northing={origin[1]:.3f})")
+
 
 if __name__ == "__main__":
     main()

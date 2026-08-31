@@ -1,12 +1,16 @@
 import math
+import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 from simp_planner_tools.scenario_definition import load_scenario_definition
+
+_HDMAP_DIR = "/home/sum/Desktop/simp_planner/HDMap"
 
 
 def _resolved_nodes(context):
@@ -126,6 +130,55 @@ def _resolved_nodes(context):
                 }
             ],
         ),
+        Node(
+            package="simp_planner_tools",
+            executable="vehicle_visualizer_node",
+            name="vehicle_visualizer_node",
+            output="screen",
+            parameters=[
+                {
+                    "vehicle_length": float(
+                        LaunchConfiguration("vehicle_length").perform(context)
+                    ),
+                    "vehicle_width": float(
+                        LaunchConfiguration("vehicle_width").perform(context)
+                    ),
+                }
+            ],
+        ),
+        Node(
+            package="simp_planner_tools",
+            executable="hdmap_lane_visualizer_node",
+            name="hdmap_lane_visualizer_node",
+            output="screen",
+            parameters=[
+                {
+                    "shapefile_path": os.path.join(
+                        _HDMAP_DIR, "HDMAP", "B2_SURFACELINEMARK.shp"
+                    ),
+                    # HD map 기반이 아닌 시나리오는 이 파일이 없는 게 정상이다
+                    # -- 노드가 경고만 남기고 조용히 비활성화된다.
+                    "origin_file": os.path.join(
+                        _HDMAP_DIR, "output", f"{scenario_name}_origin.txt"
+                    ),
+                }
+            ],
+        ),
+        Node(
+            package="rviz2",
+            executable="rviz2",
+            name="rviz2",
+            output="screen",
+            arguments=[
+                "-d",
+                os.path.join(
+                    get_package_share_directory("simp_planner_tools"),
+                    "rviz",
+                    "simp_planner.rviz",
+                ),
+            ],
+            condition=IfCondition(LaunchConfiguration("use_rviz")),
+        ),
     ]
 
 
@@ -169,6 +222,18 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "debug_output_dir",
                 default_value="/home/sum/Desktop/simp_planner/simp_planner_debug",
+            ),
+            DeclareLaunchArgument(
+                "vehicle_length", default_value="3.0",
+                description="RViz vehicle footprint marker length (m).",
+            ),
+            DeclareLaunchArgument(
+                "vehicle_width", default_value="2.0",
+                description="RViz vehicle footprint marker width (m).",
+            ),
+            DeclareLaunchArgument(
+                "use_rviz", default_value="false",
+                description="Auto-launch rviz2 with the bundled simp_planner.rviz config.",
             ),
             OpaqueFunction(function=_resolved_nodes),
         ]

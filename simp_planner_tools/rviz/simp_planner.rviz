@@ -1,0 +1,170 @@
+Panels:
+  - Class: rviz_common/Displays
+    Help Height: 78
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /Vehicle footprint1
+        - /HD map lanes1
+        - /Traveled path1
+        - /Global path1
+        - /Selected trajectory1
+        - /Active reference1
+      Splitter Ratio: 0.5
+    Tree Height: 700
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Enabled: true
+      Name: Grid
+      Value: true
+    - Class: rviz_default_plugins/Odometry
+      Enabled: true
+      Name: Vehicle odometry
+      Topic:
+        Value: /odom
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Keep: 1
+      Shape:
+        Value: Arrow
+      Angle Tolerance: 0.1
+      Position Tolerance: 0.1
+      Value: true
+    - Class: rviz_default_plugins/Map
+      Enabled: true
+      Name: Costmap
+      Topic:
+        Value: /costmap
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Alpha: 0.85
+      Color Scheme: costmap
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Vehicle footprint
+      Topic:
+        Value: /viz/vehicle_footprint
+        Depth: 1
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: HD map lanes
+      Topic:
+        Value: /viz/hdmap_lanes
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: Traveled path
+      Topic:
+        Value: /viz/traveled_path
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Color: 255; 140; 0
+      Line Style: Billboards
+      Line Width: 0.15
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0.01
+      Pose Style: None
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: Global path
+      Topic:
+        Value: /scenario/global_path
+        Depth: 5
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Color: 40; 40; 255
+      Line Style: Billboards
+      Line Width: 0.15
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0.02
+      Pose Style: None
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: Active reference
+      Topic:
+        Value: /reference_path
+        Depth: 5
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Color: 0; 200; 0
+      Line Style: Billboards
+      Line Width: 0.20
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0.03
+      Pose Style: None
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: Selected trajectory
+      Topic:
+        Value: /planner/selected_trajectory
+        Depth: 5
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Color: 255; 0; 0
+      Line Style: Billboards
+      Line Width: 0.25
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0.04
+      Pose Style: None
+      Value: true
+  Enabled: true
+  Global Options:
+    Background Color: 255; 255; 255
+    Fixed Frame: odom
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+      Hide Inactive Objects: true
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Angle: 0
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.06
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.01
+      Scale: 8
+      Target Frame: <Fixed Frame>
+      X: 0
+      Y: 0
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 900
+  Width: 1400
+  X: 60
+  Y: 60
