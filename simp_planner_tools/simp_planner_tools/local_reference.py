@@ -116,6 +116,12 @@ def local_reference_indices(
 
     if len(indices) < 4:
         raise RuntimeError("Local path generation produced too few points")
+
+    # One extra waypoint beyond the nominal ahead-length window. The track is
+    # closed-loop, so a next point always exists; the consumer uses it to
+    # estimate curvature at the true last usable point via a forward
+    # difference, then drops it before building its own reference path.
+    indices.append((current + 1) % len(track.x))
     return np.asarray(indices, dtype=int)
 
 

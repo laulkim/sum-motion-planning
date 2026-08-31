@@ -359,7 +359,6 @@ class ScenarioManagerNode(Node):
         data_message.x = local.x.tolist()
         data_message.y = local.y.tolist()
         data_message.yaw = local.yaw.tolist()
-        data_message.curvature = local.kappa.tolist()
         data_message.mode = local.mode.tolist()
         data_message.closed_loop = False
         self.path_data_pub.publish(data_message)

@@ -85,6 +85,27 @@ std::vector<double> cumulative_arc_length(const std::vector<double>& x,
   return s;
 }
 
+// The reference path no longer carries an authored curvature array, so it is
+// estimated here from (unwrapped) yaw and arc length via a forward
+// difference. The publisher always appends one waypoint beyond the window it
+// actually wants planned -- a real next point when one exists, otherwise a
+// synthetic point extended straight along the last heading (whose forward
+// difference is exactly zero, matching the fact that motion, and therefore
+// curvature demand, stops at that point). That guarantee lets this function
+// stay unconditional: it returns one fewer sample than it was given, and the
+// caller drops the trailing (borrowed) x/y/yaw/s sample to match.
+std::vector<double> estimate_curvature_from_yaw(const std::vector<double>& psi,
+                                                const std::vector<double>& s) {
+  if (psi.size() != s.size() || psi.size() < 2) {
+    throw std::invalid_argument("curvature estimation requires equal arrays of length >= 2");
+  }
+  std::vector<double> kappa(psi.size() - 1, 0.0);
+  for (std::size_t i = 0; i + 1 < psi.size(); ++i) {
+    kappa[i] = (psi[i + 1] - psi[i]) / std::max(s[i + 1] - s[i], 1.0e-15);
+  }
+  return kappa;
+}
+
 struct ExecutablePlan {
   PlanResult result;
   AllocationResult allocation;
@@ -565,10 +586,13 @@ class PlannerNodeCpp final : public rclcpp::Node {
 
   void path_callback(const ReferencePathMsg::SharedPtr msg) {
     try {
-      if (msg->x.size() < 4 || msg->x.size() != msg->y.size() ||
-          msg->x.size() != msg->yaw.size() || msg->x.size() != msg->curvature.size() ||
-          msg->x.size() != msg->mode.size()) {
-        throw std::invalid_argument("reference path arrays must have equal length >= 4");
+      // Publishers append one waypoint beyond the window they want planned
+      // (see estimate_curvature_from_yaw), so at least 5 points are required
+      // for a usable 4-point reference path after that trailing point is
+      // dropped.
+      if (msg->x.size() < 5 || msg->x.size() != msg->y.size() ||
+          msg->x.size() != msg->yaw.size() || msg->x.size() != msg->mode.size()) {
+        throw std::invalid_argument("reference path arrays must have equal length >= 5");
       }
       if (msg->mode.front() > static_cast<std::uint8_t>(DriveMode::Right) ||
           !std::all_of(msg->mode.begin(), msg->mode.end(),
@@ -576,8 +600,15 @@ class PlannerNodeCpp final : public rclcpp::Node {
         throw std::invalid_argument("each local reference must contain one valid drive mode");
       }
       const auto reference_mode = static_cast<DriveMode>(msg->mode.front());
+      const auto arc_length = cumulative_arc_length(msg->x, msg->y);
+      const auto kappa = estimate_curvature_from_yaw(unwrap_angles(msg->yaw), arc_length);
+      const auto used = kappa.size();
       auto path = std::make_shared<ReferencePath>(
-          cumulative_arc_length(msg->x, msg->y), msg->x, msg->y, msg->yaw, msg->curvature);
+          std::vector<double>(arc_length.begin(), arc_length.begin() + used),
+          std::vector<double>(msg->x.begin(), msg->x.begin() + used),
+          std::vector<double>(msg->y.begin(), msg->y.begin() + used),
+          std::vector<double>(msg->yaw.begin(), msg->yaw.begin() + used),
+          kappa);
       bool identical = false;
       bool hard_change = false;
       {
@@ -1405,7 +1436,6 @@ class PlannerNodeCpp final : public rclcpp::Node {
     data_message.x.reserve(motion.x.size());
     data_message.y.reserve(motion.y.size());
     data_message.yaw.reserve(motion.chi.size());
-    data_message.curvature.reserve(motion.kappa.size());
     data_message.mode.reserve(motion.drive_mode.size());
     for (std::size_t i = 0; i < motion.x.size(); ++i) {
       geometry_msgs::msg::PoseStamped pose;
@@ -1417,7 +1447,6 @@ class PlannerNodeCpp final : public rclcpp::Node {
       data_message.x.push_back(motion.x[i]);
       data_message.y.push_back(motion.y[i]);
       data_message.yaw.push_back(motion.chi[i]);
-      data_message.curvature.push_back(motion.kappa[i]);
       data_message.mode.push_back(static_cast<std::uint8_t>(motion.drive_mode[i]));
     }
     trajectory_pub_->publish(path_message);

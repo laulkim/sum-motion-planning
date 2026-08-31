@@ -367,16 +367,29 @@ class DebugPlotNode(Node):
 
     def reference_callback(self, message: ReferencePathMessage) -> None:
         self.mark("reference")
-        self.reference_x = np.asarray(message.x, dtype=float)
-        self.reference_y = np.asarray(message.y, dtype=float)
-        self.reference_yaw = np.unwrap(np.asarray(message.yaw, dtype=float))
-        self.reference_kappa = np.asarray(message.curvature, dtype=float)
-        if len(self.reference_x) >= 2:
-            self.reference_segment_length = np.hypot(
-                np.diff(self.reference_x), np.diff(self.reference_y)
-            )
-            self.reference_s = np.r_[0.0, np.cumsum(self.reference_segment_length)]
+        x = np.asarray(message.x, dtype=float)
+        y = np.asarray(message.y, dtype=float)
+        yaw = np.unwrap(np.asarray(message.yaw, dtype=float))
+        if len(x) >= 2:
+            segment_length = np.hypot(np.diff(x), np.diff(y))
+            s = np.r_[0.0, np.cumsum(segment_length)]
+            # The publisher appends one waypoint beyond the window it wants
+            # plotted (see simp_planner_cpp's estimate_curvature_from_yaw) so
+            # curvature at the true last usable point can be estimated with a
+            # forward difference; drop that borrowed point to match what the
+            # planner actually uses.
+            kappa = np.diff(yaw) / np.maximum(np.diff(s), 1.0e-15)
+            self.reference_x = x[:-1]
+            self.reference_y = y[:-1]
+            self.reference_yaw = yaw[:-1]
+            self.reference_kappa = kappa
+            self.reference_segment_length = segment_length[:-1]
+            self.reference_s = s[:-1]
         else:
+            self.reference_x = x
+            self.reference_y = y
+            self.reference_yaw = yaw
+            self.reference_kappa = np.empty(0)
             self.reference_segment_length = np.empty(0)
             self.reference_s = np.empty(0)
         self.current_projection = None
@@ -384,9 +397,20 @@ class DebugPlotNode(Node):
     def selected_data_callback(self, message: ReferencePathMessage) -> None:
         self.mark("selected_trajectory")
         try:
-            self.selected_geometry = OpenPathGeometry.from_arrays(
-                message.x, message.y, message.yaw, message.curvature
-            )
+            x = np.asarray(message.x, dtype=float)
+            y = np.asarray(message.y, dtype=float)
+            yaw = np.unwrap(np.asarray(message.yaw, dtype=float))
+            if len(x) >= 2:
+                s = np.r_[0.0, np.cumsum(np.hypot(np.diff(x), np.diff(y)))]
+                # This topic is the planner's own dense trajectory dump, not
+                # a local reference slice, so it carries no trailing padding
+                # point; repeat the last forward difference for the final
+                # sample -- adequate for this debug-only plot.
+                forward = np.diff(yaw) / np.maximum(np.diff(s), 1.0e-15)
+                kappa = np.r_[forward, forward[-1]]
+            else:
+                kappa = np.zeros_like(x)
+            self.selected_geometry = OpenPathGeometry.from_arrays(x, y, yaw, kappa)
             self.selected_x = self.selected_geometry.x
             self.selected_y = self.selected_geometry.y
             self.selected_projection = None

@@ -245,32 +245,74 @@ class ScenarioPath:
                 indices.append(current)
                 if accumulated >= required and len(indices) >= 4:
                     break
+            # One extra waypoint beyond the nominal ahead-length window
+            # (always available on a closed loop) so the consumer can
+            # estimate curvature at the true last usable point via a forward
+            # difference, then drop it before planning.
+            indices.append((current + 1) % len(self.x))
             idx = np.asarray(indices, dtype=int)
-        else:
-            start_s = max(0.0, float(projection_s) - float(back_length))
-            end_s = min(
-                self.total_length, float(projection_s) + float(ahead_length)
+            return ScenarioPath.from_arrays(
+                self.x[idx],
+                self.y[idx],
+                self.yaw[idx],
+                self.kappa[idx],
+                self.mode[idx],
+                map_yaw=self.map_yaw[idx],
+                heading_semantics=self.heading_semantics,
+                closed_loop=False,
             )
-            start = max(
-                0, int(np.searchsorted(self.s, start_s, side="right") - 1)
-            )
-            stop = min(
-                len(self.x), int(np.searchsorted(self.s, end_s, side="left") + 1)
-            )
-            if stop - start < 4:
-                if start == 0:
-                    stop = min(len(self.x), 4)
-                else:
-                    start = max(0, stop - 4)
-            idx = np.arange(start, stop, dtype=int)
 
+        start_s = max(0.0, float(projection_s) - float(back_length))
+        end_s = min(
+            self.total_length, float(projection_s) + float(ahead_length)
+        )
+        start = max(
+            0, int(np.searchsorted(self.s, start_s, side="right") - 1)
+        )
+        stop = min(
+            len(self.x), int(np.searchsorted(self.s, end_s, side="left") + 1)
+        )
+        if stop - start < 4:
+            if start == 0:
+                stop = min(len(self.x), 4)
+            else:
+                start = max(0, stop - 4)
+        idx = np.arange(start, stop, dtype=int)
+
+        if stop < len(self.x):
+            # A real next waypoint exists just beyond the nominal window --
+            # include it so the consumer can estimate curvature at the true
+            # last usable point via a forward difference, then drop it
+            # before planning.
+            pad_idx = np.r_[idx, stop]
+            return ScenarioPath.from_arrays(
+                self.x[pad_idx],
+                self.y[pad_idx],
+                self.yaw[pad_idx],
+                self.kappa[pad_idx],
+                self.mode[pad_idx],
+                map_yaw=self.map_yaw[pad_idx],
+                heading_semantics=self.heading_semantics,
+                closed_loop=False,
+            )
+
+        # The window already reaches the real end of this path -- there is no
+        # next waypoint to borrow. Append a synthetic point that continues
+        # straight along the last heading; a forward difference against it
+        # naturally yields curvature 0 there, matching the fact that motion
+        # (and therefore curvature demand) stops at this point.
+        last = int(idx[-1])
+        step = float(self.segment_length[last - 1]) if last > 0 else 0.1
+        pad_yaw = float(self.yaw[last])
+        pad_x = float(self.x[last] + step * math.cos(pad_yaw))
+        pad_y = float(self.y[last] + step * math.sin(pad_yaw))
         return ScenarioPath.from_arrays(
-            self.x[idx],
-            self.y[idx],
-            self.yaw[idx],
-            self.kappa[idx],
-            self.mode[idx],
-            map_yaw=self.map_yaw[idx],
+            np.r_[self.x[idx], pad_x],
+            np.r_[self.y[idx], pad_y],
+            np.r_[self.yaw[idx], pad_yaw],
+            np.r_[self.kappa[idx], 0.0],
+            np.r_[self.mode[idx], self.mode[last]],
+            map_yaw=np.r_[self.map_yaw[idx], float(self.map_yaw[last])],
             heading_semantics=self.heading_semantics,
             closed_loop=False,
         )
