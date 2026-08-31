@@ -32,6 +32,7 @@ import os
 import sys
 
 import numpy as np
+from scipy.signal import savgol_filter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from plot_route_switch_points import (  # noqa: E402
@@ -79,6 +80,33 @@ def straight_connector(start_xy, end_xy, spacing=CONNECTOR_SPACING):
     return xy, yaw, length, heading
 
 
+def smooth_seam(xy, yaw, window=9, polyorder=2):
+    """직선 커넥터가 크랩 자체 경로(스플라인)로 넘어가는 이음매는 곡률이
+    불연속이라(직선=0 -> 크랩 자체 곡선), 그 지점만 중앙차분으로 곡률을
+    구하면 순간적으로 큰 값이 나올 수 있다 (REFERENCE_PATH_GUIDE.md 8.2절:
+    "곡률 노이즈가 크면 이웃점 원/다항식 적합을 사용"). heading에 가벼운
+    국소 평활(Savitzky-Golay)만 적용하고 x,y는 그 평활된 heading을 따라
+    다시 적분해 재구성한다 -- 직선 구간은 이미 직선이라 그대로 남고, 이음매
+    부근만 완만해진다. 트랙<->커넥터 경계(직각이어야 하는 정지+모드전환
+    지점)와는 다른 자리이므로 이전에 고친 "직각" 조건과는 무관하다.
+    """
+    yaw_unwrapped = np.unwrap(yaw)
+    window = min(window, len(yaw_unwrapped))
+    if window % 2 == 0:
+        window -= 1
+    window = max(3, window)
+    order = min(polyorder, window - 1)
+    yaw_smooth = savgol_filter(yaw_unwrapped, window_length=window, polyorder=order)
+
+    ds = np.hypot(np.diff(xy[:, 0]), np.diff(xy[:, 1]))
+    xy_smooth = np.empty_like(xy)
+    xy_smooth[0] = xy[0]
+    for i in range(len(ds)):
+        step = ds[i] * np.array([math.cos(yaw_smooth[i]), math.sin(yaw_smooth[i])])
+        xy_smooth[i + 1] = xy_smooth[i] + step
+    return xy_smooth, yaw_smooth
+
+
 def save_csv(path, xy, yaw):
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -107,6 +135,7 @@ def main():
 
         full_xy = np.vstack([conn_xy, crab_xy])
         full_yaw = np.concatenate([conn_yaw, crab_yaw])
+        full_xy, full_yaw = smooth_seam(full_xy, full_yaw)
 
         out_csv = os.path.join(OUTPUT_DIR, f"{crab_name}_connected_ref.csv")
         save_csv(out_csv, full_xy, full_yaw)

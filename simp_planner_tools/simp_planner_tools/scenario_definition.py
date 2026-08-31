@@ -210,6 +210,82 @@ def load_scenario_definition(
             terminal_margin=3.0,
         )
 
+    if name == "hdmap_crab1_switch":
+        # HDMap/build_scenario_maps.py 로 생성한, 실제 HD map(큰트랙 + 크랩1)
+        # 기반 3-phase 시나리오: 전진(Forward) -> 크랩 이탈(Left) -> 정지 후
+        # 같은 경로를 되짚어 복귀(Right). switch_s=50.0은
+        # HDMap/output/switch_stations.txt 의 크랩1 S_switch를
+        # hdmap_crab1_forward.csv 자신의 로컬 원점 기준으로 다시 잰 값이다.
+        forward = ScenarioPhase(
+            name="hdmap_forward",
+            path=ScenarioPath.load_csv(
+                _map_path(share_directory, "hdmap_crab1_forward.csv"),
+                closed_loop=False,
+            ),
+            cruise_speed=1.5,
+            switch_s=50.0,
+        )
+        left = ScenarioPhase(
+            name="hdmap_crab1_left",
+            path=ScenarioPath.load_csv(
+                _map_path(share_directory, "hdmap_crab1_left.csv"),
+                closed_loop=False,
+            ),
+            cruise_speed=1.0,
+        )
+        right_return = ScenarioPhase(
+            name="hdmap_crab1_right_return",
+            path=ScenarioPath.load_csv(
+                _map_path(share_directory, "hdmap_crab1_right_return.csv"),
+                closed_loop=False,
+            ),
+            cruise_speed=1.0,
+        )
+        return ScenarioDefinition(
+            name=name,
+            phases=(forward, left, right_return),
+            terminal_margin=3.0,
+        )
+
+    if name == "hdmap_lap_switch":
+        # HDMap/build_lap_scenario_maps.py 로 생성. 큰트랙을 따라가며 크랩
+        # 1/2/3 switch를 순서대로 만나는 10-phase 연속 랩:
+        # forward0 -> crab1_left -> crab1_right_return ->
+        # forward1 -> crab2_left -> crab2_right_return ->
+        # forward2 -> crab3_left -> crab3_right_return ->
+        # forward3 (크랩3 switch ~ 큰트랙 끝, 마지막 phase). switch_s 값은
+        # build_lap_scenario_maps.py 콘솔 출력 그대로다. 전 phase가 큰트랙
+        # 자신의 시작점을 공통 원점으로 평행이동되어 있어 authored 상태로
+        # 이미 서로 이어진다.
+        def _lap_phase(csv_name, phase_name, cruise_speed, switch_s=None):
+            return ScenarioPhase(
+                name=phase_name,
+                path=ScenarioPath.load_csv(
+                    _map_path(share_directory, f"{csv_name}.csv"),
+                    closed_loop=False,
+                ),
+                cruise_speed=cruise_speed,
+                switch_s=switch_s,
+            )
+
+        phases = (
+            _lap_phase("hdmap_lap_forward0", "hdmap_lap_forward0", 1.5, switch_s=279.19),
+            _lap_phase("hdmap_lap_crab1_left", "hdmap_lap_crab1_left", 1.0),
+            _lap_phase("hdmap_lap_crab1_right_return", "hdmap_lap_crab1_right_return", 1.0),
+            _lap_phase("hdmap_lap_forward1", "hdmap_lap_forward1", 1.5, switch_s=183.79),
+            _lap_phase("hdmap_lap_crab2_left", "hdmap_lap_crab2_left", 1.0),
+            _lap_phase("hdmap_lap_crab2_right_return", "hdmap_lap_crab2_right_return", 1.0),
+            _lap_phase("hdmap_lap_forward2", "hdmap_lap_forward2", 1.5, switch_s=226.77),
+            _lap_phase("hdmap_lap_crab3_left", "hdmap_lap_crab3_left", 1.0),
+            _lap_phase("hdmap_lap_crab3_right_return", "hdmap_lap_crab3_right_return", 1.0),
+            _lap_phase("hdmap_lap_forward3", "hdmap_lap_forward3", 1.5),
+        )
+        return ScenarioDefinition(
+            name=name,
+            phases=phases,
+            terminal_margin=3.0,
+        )
+
     if name == "s_curve":
         phase = ScenarioPhase(
             name="s_curve_forward",
@@ -554,9 +630,10 @@ def load_scenario_definition(
         )
 
     supported = (
-        "stadium, crab_switch, reverse_switch, s_curve, straight_long, obstacle_avoidance, "
-        "terminal_safe_region, s_curve_obstacles, alternating_gate_corridor, curved_gate_maze, "
-        "winding_obstacle_course, narrow_22m_stop_corridor, narrow_28m_corridor, narrow_offset_corridor"
+        "stadium, crab_switch, reverse_switch, hdmap_crab1_switch, hdmap_lap_switch, s_curve, "
+        "straight_long, obstacle_avoidance, terminal_safe_region, s_curve_obstacles, "
+        "alternating_gate_corridor, curved_gate_maze, winding_obstacle_course, "
+        "narrow_22m_stop_corridor, narrow_28m_corridor, narrow_offset_corridor"
     )
     raise ValueError(f"Unsupported scenario '{scenario_name}'. Supported: {supported}")
 

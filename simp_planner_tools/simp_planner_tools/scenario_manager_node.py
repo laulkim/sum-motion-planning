@@ -420,6 +420,22 @@ class ScenarioManagerNode(Node):
             self.phase_paths[next_index] = self.execution_path_for_phase(
                 next_index, translated
             )
+        elif self.scenario.name in ("hdmap_crab1_switch", "hdmap_lap_switch"):
+            # HD-map-authored crab/track geometry (real curvature, not a
+            # synthetic straight line): keep the authored shape and heading,
+            # only translate it so it starts exactly at the actual stop
+            # position -- same reasoning as reverse_switch above. All phases
+            # of these two scenarios are already mutually consistent in one
+            # shared local frame, so this is just a safety correction for
+            # real stopping-precision drift.
+            nominal = self.scenario.phases[next_index].path
+            translated = nominal.translated(
+                stop_x - float(nominal.x[0]),
+                stop_y - float(nominal.y[0]),
+            )
+            self.phase_paths[next_index] = self.execution_path_for_phase(
+                next_index, translated
+            )
         self.phase_index = next_index
         self.phase_switch_count += 1
         self.state = ScenarioState.WAITING_MODE_CONFIRMATION
