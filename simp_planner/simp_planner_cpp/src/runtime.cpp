@@ -9,8 +9,11 @@ namespace simp_planner {
 
 bool plan_registration_is_current(const PlanningRevisionState& planned,
                                   const PlanningRevisionState& current) {
-  return planned.structural_revision == current.structural_revision &&
-         planned.command_revision == current.command_revision &&
+  // Rolling costmaps are a latest-only planning input.  A newer map must
+  // rebuild the next planner cycle, but it must not make an already computed
+  // plan impossible to hand over when maps arrive faster than the handover
+  // lead.  Command and confirmed-mode changes still invalidate immediately.
+  return planned.command_revision == current.command_revision &&
          planned.mode_revision == current.mode_revision;
 }
 

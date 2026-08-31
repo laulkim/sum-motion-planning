@@ -170,7 +170,9 @@ oriented multi-circle footprint로 costmap을 검사한다. 이것이 최종 har
 
 - 안전 결과 없음: pending plan 제거, 강제 jerk-limited safety stop,
   `NO_SAFE_PLAN_RETRY` 요청
-- 계산 중 hard input 변경: `STALE_PLAN_DISCARDED`
+- 계산 중 command/mode 같은 hard input 변경: `STALE_PLAN_DISCARDED`
+- 계산 중 costmap 갱신: 최신 완성 costmap에서 allocation을 1회 재검사하고,
+  안전하면 pending handover를 유지하며 충돌하면 `LATEST_COSTMAP_COLLISION_REPLAN`
 - scheduled start보다 늦음: `LATE_PLAN_DISCARDED` 후 재요청
 - 안전·fresh·제시간: `ExecutablePlan`을 `pending_plan_`에 원자적으로 등록
 - 예외: `PLANNING_RETRY` 요청
@@ -223,6 +225,7 @@ PlannerNodeCpp::planning_callback
 | `TERMINAL_ACTIVE_PLAN_FINISHING` | terminal 부근의 기존 plan을 계속 사용 |
 | `NO_SAFE_PLAN_SAFETY_STOP` | 안전 결과 없음, 안전정지 및 재요청 |
 | `STALE_PLAN_DISCARDED` | 계산 중 hard input 변경 |
+| `LATEST_COSTMAP_COLLISION_REPLAN` | 계산 중 갱신된 최신 costmap 재검사에서 충돌, 최신 입력으로 재계획 |
 | `LATE_PLAN_DISCARDED` | scheduled start를 넘겨 결과 폐기 |
 | `PLANNING_FAILED` | 예외 발생, 재요청 |
 

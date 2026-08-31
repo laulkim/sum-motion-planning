@@ -347,8 +347,18 @@ void test_soft_input_revision_policy() {
 
   current = planned;
   current.structural_revision += 1;
-  require(!simp_planner::plan_registration_is_current(planned, current),
-          "costmap/safety revision failed to invalidate plan");
+  require(simp_planner::plan_registration_is_current(planned, current),
+          "rolling costmap update incorrectly invalidated plan handover");
+  require(simp_planner::planner_rebuild_required(planned, current),
+          "rolling costmap update did not request planner rebuild");
+
+  current = planned;
+  current.request_revision += 1000;
+  current.structural_revision += 1000;
+  require(simp_planner::plan_registration_is_current(planned, current),
+          "costmap burst incorrectly invalidated plan handover");
+  require(simp_planner::planner_rebuild_required(planned, current),
+          "costmap burst did not preserve latest-map planner rebuild");
 
   current = planned;
   current.command_revision += 1;
@@ -359,6 +369,37 @@ void test_soft_input_revision_policy() {
   current.mode_revision += 1;
   require(!simp_planner::plan_registration_is_current(planned, current),
           "confirmed vehicle-mode change failed to invalidate plan");
+}
+
+void test_costmap_refresh_collision_gate() {
+  constexpr int width = 20;
+  constexpr int height = 20;
+  constexpr double resolution = 0.5;
+  constexpr double origin = -5.0;
+  std::vector<std::int8_t> free_data(width * height, 0);
+  auto blocked_data = free_data;
+  const int center_x = static_cast<int>(std::floor(-origin / resolution));
+  const int center_y = static_cast<int>(std::floor(-origin / resolution));
+  blocked_data[static_cast<std::size_t>(center_y * width + center_x)] = 100;
+
+  const simp_planner::Costmap2D free_map(
+      std::move(free_data), width, height, resolution, origin, origin);
+  const simp_planner::Costmap2D blocked_map(
+      std::move(blocked_data), width, height, resolution, origin, origin);
+  simp_planner::AllocationResult pending;
+  pending.trajectory.x = {0.0};
+  pending.trajectory.y = {0.0};
+  pending.trajectory.speed = {0.0};
+  pending.psi = {0.0};
+  const simp_planner::OrientedFootprintConfig footprint{
+      3, 0.20, 2.0 * simp_planner::kPi / 180.0};
+
+  require(simp_planner::check_oriented_allocation_collision(
+              pending, free_map, {}, {}, footprint).collision_free,
+          "safe costmap refresh incorrectly invalidated pending handover");
+  require(!simp_planner::check_oriented_allocation_collision(
+               pending, blocked_map, {}, {}, footprint).collision_free,
+          "colliding costmap refresh failed to invalidate pending handover");
 }
 
 
@@ -758,11 +799,18 @@ void test_scheduler_and_safety_tail() {
   scheduler.request(0, 1, 1, "INITIAL", true);
   auto first = scheduler.begin_if_due(0, false, false);
   require(first.has_value(), "urgent initial request not consumed");
-  scheduler.request(1000000, 2, 1, "ODOM", false);
-  require(!scheduler.begin_if_due(5000000, true, false).has_value(),
+  for (std::uint64_t revision = 2; revision <= 10; ++revision) {
+    scheduler.request(
+        static_cast<std::int64_t>(revision) * 1000000,
+        revision, revision, "COSTMAP_CHANGED", true);
+  }
+  require(!scheduler.begin_if_due(50000000, true, false).has_value(),
           "frequency cap violated");
-  require(scheduler.begin_if_due(100000000, true, false).has_value(),
-          "coalesced request not consumed");
+  const auto coalesced = scheduler.begin_if_due(100000000, true, false);
+  require(coalesced.has_value(), "coalesced request not consumed");
+  require(coalesced->input_revision == 10 &&
+              coalesced->structural_revision == 10,
+          "costmap burst did not coalesce to the latest revision");
 
   simp_planner::JerkLimitedSafetyStop safety(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.8);
   for (int i = 0; i < 1000 && !safety.stopped(); ++i) safety.advance(0.01);
@@ -786,6 +834,7 @@ int main() {
     test_drive_mode_feedback_supervisor();
     test_terminal_monotonic_braking_with_positive_jerk();
     test_soft_input_revision_policy();
+    test_costmap_refresh_collision_gate();
     test_oriented_footprint_directionality_and_profiles();
     test_bottleneck_limiter_and_low_speed_maneuver_latch();
     test_minimum_vy_collision_retry();

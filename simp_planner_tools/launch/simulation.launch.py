@@ -35,6 +35,8 @@ def _resolved_nodes(context):
     costmap_publish_hz = float(
         LaunchConfiguration("costmap_publish_hz").perform(context)
     )
+    if not math.isfinite(costmap_publish_hz) or costmap_publish_hz <= 0.0:
+        raise ValueError("costmap_publish_hz must be finite and positive")
     footprint_translation_step = float(
         LaunchConfiguration("oriented_footprint_translation_step_m").perform(context)
     )
@@ -104,6 +106,7 @@ def _resolved_nodes(context):
             parameters=[
                 {
                     "command_frequency_hz": command_frequency_hz,
+                    "costmap_update_period_sec": 1.0 / costmap_publish_hz,
                     "oriented_footprint_circle_count": footprint_circle_count,
                     "oriented_footprint_translation_step_m": footprint_translation_step,
                     "oriented_footprint_yaw_step_deg": footprint_yaw_step,
@@ -151,7 +154,7 @@ def generate_launch_description() -> LaunchDescription:
                 description="Negative value uses the scenario-recommended costmap resolution.",
             ),
             DeclareLaunchArgument(
-                "costmap_size_m", default_value="60.0",
+                "costmap_size_m", default_value="90.0",
                 description="Vehicle-centred square costmap side length in metres.",
             ),
             DeclareLaunchArgument(

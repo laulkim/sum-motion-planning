@@ -43,7 +43,7 @@ winding 경로에서는 호길이(S)와 실제 x/y 퍼짐이 크게 어긋나므
 `reference_path_->evaluate(s, x, y, ...)`로 1m 간격 점을 뽑고, **받은 코스트맵 메시지 자신의 origin_x/origin_y/origin_yaw**(현재 차량 pose가 아니라 — 캡처 시점과 조회 시점 사이에 시차가 있으므로, `distance_at_world`와 동일한 회전 규칙)로 그리드의 로컬 프레임으로 옮긴 뒤 `local_x`/`local_y`의 min/max를 구한다.
 
 ### 3단계 — 마진 추가
-- 종방향(±): `0.5×vehicle.length + footprint_margin + v_max×0.2` ≈ 2.7m (마지막 항은 5Hz 캡처-조회 사이 이동거리 근사 — planner는 이 메시지의 실제 publish 주기를 모르므로 5Hz 가정)
+- 종방향(±): `0.5×vehicle.length + footprint_margin + v_max×costmap_update_period_sec` (마지막 항은 캡처 사이 이동거리 버퍼이며 simulation launch가 실제 publish 주기를 planner에 전달)
 - 횡방향(±): `max|lateral.n_targets| + 0.5×vehicle.width + footprint_margin` ≈ 9.0m
 
 ### 4단계 — 셀 인덱스로 변환, 크롭, `Costmap2D` 생성
@@ -88,7 +88,7 @@ winding 경로에서는 호길이(S)와 실제 x/y 퍼짐이 크게 어긋나므
 | `costmap_size_m` | 60.0 (정사각) | `scenario_manager_node.py` | 시나리오 쪽은 이대로 유지 (변경 없음) |
 | `costmap_publish_hz` | 노드 기본 10.0, launch에서 5.0으로 오버라이드 | `scenario_manager_node.py` / `simulation.launch.py` | |
 | 전방 S 스윕 범위 | `max(adaptive_replan.minimum_spatial_preview, lateral.max_length)` ≈ 28~30m | `planner_node.cpp: crop_costmap_to_reference_path_window()` | |
-| 종방향 마진(±) | `0.5×vehicle.length + footprint_margin + v_max×0.2` ≈ 2.7m | 〃 | |
+| 종방향 마진(±) | `0.5×vehicle.length + footprint_margin + v_max×costmap_update_period_sec` | 〃 | launch에서 `costmap_update_period_sec=1/costmap_publish_hz` 자동 전달 |
 | 횡방향 마진(±) | `max\|lateral.n_targets\| + 0.5×vehicle.width + footprint_margin` ≈ 9.0m | 〃 | |
 
 ### `path_ahead_length`와 `terminal_safe_region_active` (코스트맵 크롭과는 무관 — 참고용)

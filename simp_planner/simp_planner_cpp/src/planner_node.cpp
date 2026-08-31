@@ -189,10 +189,15 @@ class PlannerNodeCpp final : public rclcpp::Node {
     trajectory_knot_dt_ = declare_parameter<double>("trajectory_knot_dt_sec", 0.10);
     command_frequency_hz_ = declare_parameter<double>("command_frequency_hz", 100.0);
     scheduler_frequency_hz_ = declare_parameter<double>("planning_scheduler_frequency_hz", 100.0);
+    costmap_update_period_sec_ =
+        declare_parameter<double>("costmap_update_period_sec", 0.20);
+    maximum_handover_lead_sec_ =
+        get_parameter("planning_handover_max_lead_sec").as_double();
     mode_change_stop_speed_ = declare_parameter<double>("mode_change_stop_speed_mps", 0.03);
     mode_command_period_sec_ = declare_parameter<double>("mode_command_period_sec", 0.25);
     if (!(trajectory_knot_dt_ > 0.0) || !(command_frequency_hz_ > 0.0) ||
-        !(scheduler_frequency_hz_ > 0.0)) {
+        !(scheduler_frequency_hz_ > 0.0) || !(costmap_update_period_sec_ > 0.0) ||
+        !std::isfinite(costmap_update_period_sec_)) {
       throw std::invalid_argument("planner timing parameters must be positive");
     }
     command_dt_ = 1.0 / command_frequency_hz_;
@@ -207,6 +212,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
     }
 
     input_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    environment_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     planning_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     execution_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
@@ -227,15 +233,19 @@ class PlannerNodeCpp final : public rclcpp::Node {
 
     rclcpp::SubscriptionOptions input_options;
     input_options.callback_group = input_group_;
+    rclcpp::SubscriptionOptions environment_options;
+    environment_options.callback_group = environment_group_;
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
         "/odom", 20, std::bind(&PlannerNodeCpp::odom_callback, this, std::placeholders::_1),
         input_options);
     path_sub_ = create_subscription<ReferencePathMsg>(
         "/reference_path_data", static_qos,
-        std::bind(&PlannerNodeCpp::path_callback, this, std::placeholders::_1), input_options);
+        std::bind(&PlannerNodeCpp::path_callback, this, std::placeholders::_1),
+        environment_options);
     costmap_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
         "/costmap", static_qos,
-        std::bind(&PlannerNodeCpp::costmap_callback, this, std::placeholders::_1), input_options);
+        std::bind(&PlannerNodeCpp::costmap_callback, this, std::placeholders::_1),
+        environment_options);
     target_speed_sub_ = create_subscription<std_msgs::msg::Float64>(
         "/target_speed", static_qos,
         std::bind(&PlannerNodeCpp::target_speed_callback, this, std::placeholders::_1),
@@ -309,7 +319,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
 
   bool snapshot_is_current(const InputSnapshot& input) const {
     std::lock_guard<std::mutex> lock(input_mutex_);
-    // Odometry and rolling local-reference updates are soft inputs.
+    // Odometry, rolling local-reference, and rolling costmap updates are soft
+    // inputs.  The scheduler retains their latest revisions for the next
+    // cycle; command and confirmed-mode changes still invalidate this plan.
     return plan_registration_is_current(
         revision_state(input), current_revision_state_locked());
   }
@@ -460,17 +472,17 @@ class PlannerNodeCpp final : public rclcpp::Node {
       std::vector<std::int8_t> data, int width, int height, double resolution,
       double origin_x, double origin_y, double origin_yaw,
       const ReferencePath& path, const PlannerState& state,
-      const EnvConfig& config) {
+      double costmap_update_period_sec, const EnvConfig& config) {
     CostmapCropResult full{std::move(data), width, height, origin_x, origin_y};
 
     const double half_length = 0.5 * config.vehicle.length;
     const double half_width = 0.5 * config.vehicle.width;
     const double footprint_margin = config.vehicle.footprint_margin;
-    // Nominal vehicle displacement between costmap captures. The planner has
-    // no direct handle on the local costmap's own publish period, so this
-    // approximates it from its typical 5 Hz cadence (see
-    // LOCAL_COSTMAP_REDESIGN_KR.md's capture-to-query discussion).
-    const double capture_gap_buffer = config.constraints.v_max * 0.2;
+    // Nominal vehicle displacement between costmap captures.  The period is a
+    // runtime parameter so changing the publisher rate does not silently
+    // change the usable cropped extent.
+    const double capture_gap_buffer =
+        config.constraints.v_max * costmap_update_period_sec;
     const double longitudinal_margin =
         half_length + footprint_margin + capture_gap_buffer;
     double max_lateral_target = 0.0;
@@ -604,9 +616,11 @@ class PlannerNodeCpp final : public rclcpp::Node {
       if (msg->header.frame_id.empty())
         throw std::invalid_argument("OccupancyGrid frame_id must not be empty");
       const auto fingerprint = costmap_fingerprint(*msg, origin_yaw);
+      const auto capture_time_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
       std::shared_ptr<const ReferencePath> path_for_crop;
       PlannerState state_for_crop{};
       bool have_path_and_state = false;
+      std::int64_t last_capture_time_ns = 0;
       {
         std::lock_guard<std::mutex> lock(input_mutex_);
         if (received_odom_ && !odom_frame_.empty() &&
@@ -620,12 +634,35 @@ class PlannerNodeCpp final : public rclcpp::Node {
               "OccupancyGrid frame does not match reference-path frame");
         }
         if (received_costmap_ && fingerprint == costmap_fingerprint_) return;
+        last_capture_time_ns = last_costmap_capture_time_ns_;
+        if (capture_time_ns > 0 && last_capture_time_ns > 0 &&
+            capture_time_ns < last_capture_time_ns) {
+          return;
+        }
         have_path_and_state = received_path_ && received_odom_;
         if (have_path_and_state) {
           path_for_crop = reference_path_;
           state_for_crop = current_state_;
         }
       }
+      double motion_buffer_sec = std::max(
+          costmap_update_period_sec_, maximum_handover_lead_sec_);
+      if (capture_time_ns > 0) {
+        if (last_capture_time_ns > 0 && capture_time_ns > last_capture_time_ns) {
+          motion_buffer_sec = std::max(
+              motion_buffer_sec,
+              1.0e-9 * static_cast<double>(
+                  capture_time_ns - last_capture_time_ns));
+        }
+        const auto receipt_time_ns = now_ns();
+        if (receipt_time_ns > capture_time_ns) {
+          motion_buffer_sec = std::max(
+              motion_buffer_sec,
+              1.0e-9 * static_cast<double>(receipt_time_ns - capture_time_ns));
+        }
+      }
+      motion_buffer_sec = std::min(
+          motion_buffer_sec, config_.longitudinal.horizon);
       std::vector<std::int8_t> data(msg->data.begin(), msg->data.end());
       double map_origin_x = msg->info.origin.position.x;
       double map_origin_y = msg->info.origin.position.y;
@@ -640,7 +677,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
         auto crop = crop_costmap_to_reference_path_window(
             std::move(data), width, height, msg->info.resolution,
             map_origin_x, map_origin_y, origin_yaw, *path_for_crop,
-            state_for_crop, config_);
+            state_for_crop, motion_buffer_sec, config_);
         data = std::move(crop.data);
         map_width = crop.width;
         map_height = crop.height;
@@ -652,11 +689,53 @@ class PlannerNodeCpp final : public rclcpp::Node {
           map_origin_x, map_origin_y, origin_yaw);
       const double build_ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - build_start).count();
+
+      // Precompute the common pending-plan validation path outside both state
+      // mutexes.  The final pointer comparison below handles a plan that was
+      // registered or activated while this check was running.
+      std::shared_ptr<const ExecutablePlan> pending_to_validate;
       {
-        std::lock_guard<std::mutex> lock(input_mutex_);
+        std::lock_guard<std::mutex> lock(execution_mutex_);
+        pending_to_validate = pending_plan_;
+      }
+      std::optional<OrientedCollisionResult> pending_collision;
+      if (pending_to_validate) {
+        pending_collision = check_oriented_allocation_collision(
+            pending_to_validate->allocation, *map, config_.vehicle,
+            config_.cost, oriented_footprint_config());
+      }
+
+      std::shared_ptr<const ExecutablePlan> invalidated_pending;
+      {
+        // Commit the map and validate pending handover as one state change.
+        // command_callback cannot activate a plan between these operations.
+        std::scoped_lock lock(input_mutex_, execution_mutex_);
+        if (received_odom_ && !odom_frame_.empty() &&
+            msg->header.frame_id != odom_frame_) {
+          throw std::invalid_argument(
+              "OccupancyGrid frame changed relative to odometry during build");
+        }
+        if (received_path_ && !path_frame_.empty() &&
+            msg->header.frame_id != path_frame_) {
+          throw std::invalid_argument(
+              "OccupancyGrid frame changed relative to reference path during build");
+        }
+        if (pending_plan_) {
+          const auto collision = pending_plan_ == pending_to_validate
+              ? *pending_collision
+              : check_oriented_allocation_collision(
+                    pending_plan_->allocation, *map, config_.vehicle,
+                    config_.cost, oriented_footprint_config());
+          if (!collision.collision_free) {
+            invalidated_pending = std::move(pending_plan_);
+          }
+        }
         costmap_ = std::move(map);
         costmap_frame_ = msg->header.frame_id;
         costmap_fingerprint_ = fingerprint;
+        if (capture_time_ns > last_costmap_capture_time_ns_) {
+          last_costmap_capture_time_ns_ = capture_time_ns;
+        }
         received_costmap_ = true;
         ++structural_revision_;
         last_costmap_build_ms_ = build_ms;
@@ -668,8 +747,13 @@ class PlannerNodeCpp final : public rclcpp::Node {
         costmap_crop_height_ = map_height;
         costmap_crop_resolution_ = msg->info.resolution;
       }
-      invalidate_pending_plan();
-      request_replan("COSTMAP_CHANGED", true);
+      // A rolling costmap supersedes the environment for the next planning
+      // cycle.  A collision-free pending handover survives arbitrary update
+      // rates; a newly colliding one is discarded by the atomic gate above.
+      request_replan(
+          invalidated_pending ? "COSTMAP_INVALIDATED_PENDING"
+                              : "COSTMAP_CHANGED",
+          true);
     } catch (const std::exception& error) {
       RCLCPP_ERROR(get_logger(), "Costmap rejected: %s", error.what());
     }
@@ -795,6 +879,11 @@ class PlannerNodeCpp final : public rclcpp::Node {
     return minimum;
   }
 
+  OrientedFootprintConfig oriented_footprint_config() const {
+    return {footprint_circle_count_, footprint_translation_step_m_,
+            footprint_yaw_step_deg_ * kPi / 180.0};
+  }
+
   void planning_callback() {
     const auto input = snapshot();
     if (!input) {
@@ -869,9 +958,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       std::optional<AllocationSelectionResult> selected_allocation;
       int outer_speed_attempts = 1;
       int path_replans = 0;
-      const OrientedFootprintConfig footprint_config{
-          footprint_circle_count_, footprint_translation_step_m_,
-          footprint_yaw_step_deg_ * kPi / 180.0};
+      const auto footprint_config = oriented_footprint_config();
 
       auto attempt_result = planner_->plan(
           handover.state, handover.last_action,
@@ -935,17 +1022,46 @@ class PlannerNodeCpp final : public rclcpp::Node {
       auto result = std::move(*selected_result);
       auto allocation_selection = std::move(*selected_allocation);
       auto allocation = std::move(allocation_selection.allocation);
-      const double allocation_clearance =
+      double allocation_clearance =
           allocation_selection.collision.minimum_clearance;
+      if (!snapshot_is_current(*input)) {
+        const double elapsed_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start_wall).count();
+        publish_status("STALE_PLAN_DISCARDED", elapsed_ms, -1);
+        return;
+      }
+
+      // Costmap generations are soft for lifecycle progress so a fast map
+      // cannot starve handover.  If planning raced a newer map, validate the
+      // selected allocation once against the newest completed Costmap2D.  Do
+      // not chase generation equality indefinitely: later maps remain queued
+      // for the next latest-only planning cycle.
+      std::shared_ptr<const Costmap2D> latest_costmap;
+      std::uint64_t validated_costmap_revision = input->structural_revision;
+      {
+        std::lock_guard<std::mutex> lock(input_mutex_);
+        latest_costmap = costmap_;
+        validated_costmap_revision = structural_revision_;
+      }
+      if (latest_costmap &&
+          validated_costmap_revision != input->structural_revision) {
+        const auto latest_collision = check_oriented_allocation_collision(
+            allocation, *latest_costmap, config_.vehicle, config_.cost,
+            footprint_config);
+        if (!latest_collision.collision_free) {
+          request_replan("LATEST_COSTMAP_COLLISION", true);
+          const double elapsed_ms = std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - start_wall).count();
+          publish_status("LATEST_COSTMAP_COLLISION_REPLAN", elapsed_ms, -1);
+          return;
+        }
+        allocation_clearance = std::min(
+            allocation_clearance, latest_collision.minimum_clearance);
+      }
+
       const auto end_wall = std::chrono::steady_clock::now();
       const double elapsed_sec = std::chrono::duration<double>(end_wall - start_wall).count();
       const auto ready_ns = now_ns();
-      if (!snapshot_is_current(*input)) {
-        // Every input callback already queued the latest revision. Do not write
-        // the stale revision back into the latest-only scheduler.
-        publish_status("STALE_PLAN_DISCARDED", elapsed_sec * 1000.0, -1);
-        return;
-      }
       const bool late = ready_ns >= scheduled_start;
       handover_timing_.record(elapsed_sec, late);
       if (late) {
@@ -960,7 +1076,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       executable->start_ns = scheduled_start;
       executable->ready_ns = ready_ns;
       executable->plan_id = ++plan_id_counter_;
-      executable->structural_revision = input->structural_revision;
+      executable->structural_revision = validated_costmap_revision;
       executable->frame_id = input->frame_id;
       executable->allocation_min_clearance = allocation_clearance;
       executable->allocation_profile = allocation_profile_name(allocation_selection.profile);
@@ -997,16 +1113,39 @@ class PlannerNodeCpp final : public rclcpp::Node {
       executable->trajectory_state_calculation_ms = block_timings.trajectory_state_calculation_ms;
       executable->trajectory_feasibility_check_ms = block_timings.trajectory_feasibility_check_ms;
       bool registration_stale = false;
+      bool registration_collision = false;
       {
-        // Register the plan atomically with respect to input revision updates
-        // and pending-plan invalidation callbacks.
+        // Register atomically with respect to hard input revision updates and
+        // costmap commit/pending validation.  The second collision check is a
+        // rare TOCTOU guard if a map landed after the optimistic check above.
         std::scoped_lock lock(input_mutex_, execution_mutex_);
         registration_stale = !plan_registration_is_current(
             revision_state(*input), current_revision_state_locked());
-        if (!registration_stale) pending_plan_ = executable;
+        if (!registration_stale &&
+            executable->structural_revision != structural_revision_) {
+          const auto latest_collision = check_oriented_allocation_collision(
+              executable->allocation, *costmap_, config_.vehicle, config_.cost,
+              footprint_config);
+          registration_collision = !latest_collision.collision_free;
+          if (!registration_collision) {
+            executable->structural_revision = structural_revision_;
+            executable->allocation_min_clearance = std::min(
+                executable->allocation_min_clearance,
+                latest_collision.minimum_clearance);
+          }
+        }
+        if (!registration_stale && !registration_collision) {
+          pending_plan_ = executable;
+        }
       }
       if (registration_stale) {
         publish_status("STALE_PLAN_DISCARDED", elapsed_sec * 1000.0, -1);
+        return;
+      }
+      if (registration_collision) {
+        request_replan("LATEST_COSTMAP_COLLISION", true);
+        publish_status(
+            "LATEST_COSTMAP_COLLISION_REPLAN", elapsed_sec * 1000.0, -1);
         return;
       }
       publish_status("PENDING_PLAN_READY", elapsed_sec * 1000.0,
@@ -1504,6 +1643,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
   mutable std::mutex terminal_hold_mutex_;
   mutable std::mutex execution_state_mutex_;
   rclcpp::CallbackGroup::SharedPtr input_group_;
+  rclcpp::CallbackGroup::SharedPtr environment_group_;
   rclcpp::CallbackGroup::SharedPtr planning_group_;
   rclcpp::CallbackGroup::SharedPtr execution_group_;
 
@@ -1540,6 +1680,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
   std::uint64_t command_revision_{0};
   std::uint64_t mode_revision_{0};
   std::uint64_t costmap_fingerprint_{0};
+  std::int64_t last_costmap_capture_time_ns_{0};
   double last_costmap_build_ms_{0.0};
   std::uint64_t costmap_rebuild_count_{0};
   double costmap_crop_origin_x_{0.0};
@@ -1561,6 +1702,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
   double trajectory_knot_dt_{0.10};
   double command_frequency_hz_{100.0};
   double scheduler_frequency_hz_{100.0};
+  double costmap_update_period_sec_{0.20};
+  double maximum_handover_lead_sec_{0.60};
   double command_dt_{0.01};
   double mode_change_stop_speed_{0.03};
   double mode_command_period_sec_{0.25};
@@ -1592,7 +1735,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
   auto node = std::make_shared<simp_planner::PlannerNodeCpp>();
-  rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 3);
+  rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 4);
   executor.add_node(node);
   executor.spin();
   rclcpp::shutdown();

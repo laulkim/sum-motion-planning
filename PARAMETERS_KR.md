@@ -385,7 +385,7 @@ Left/Right 값은 모든 profile에서 기본값을 유지한다. Left/Right cra
 
 ## 6. Planner ROS runtime 파라미터
 
-`planner_node_cpp`가 ROS에 노출하는 파라미터는 아래 16개뿐이다.
+`planner_node_cpp`가 ROS에 노출하는 파라미터는 아래 17개뿐이다.
 
 | ROS parameter | 기본값 | 단위 | 적용 |
 |---|---:|---:|---|
@@ -400,6 +400,7 @@ Left/Right 값은 모든 profile에서 기본값을 유지한다. Left/Right cra
 | `trajectory_knot_dt_sec` | 0.10 | s | `longitudinal.dt` override |
 | `command_frequency_hz` | 100.0 | Hz | command timer; `command_dt=0.01 s` |
 | `planning_scheduler_frequency_hz` | 100.0 | Hz | scheduler polling; 0.01 s |
+| `costmap_update_period_sec` | 0.20 | s | costmap crop의 캡처 간 이동 버퍼; simulation launch는 `1/costmap_publish_hz`를 자동 전달 |
 | `mode_change_stop_speed_mps` | 0.03 | m/s | Planner mode 전환 정지 기준 |
 | `mode_command_period_sec` | 0.25 | s | mode command 재송신 간격; 4 Hz |
 | `oriented_footprint_circle_count` | 3 | count | final footprint circle 수 |
