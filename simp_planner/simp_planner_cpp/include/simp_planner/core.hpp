@@ -180,7 +180,7 @@ struct LateralPathConfig {
       6.0, 6.25, 6.5, 6.75, 7.0, 7.25, 7.5, 7.75,
       8.0};
   double min_length{3.0};
-  double max_length{29.0};
+  double max_length{32.0};
   double spatial_ds{0.5};
   double dynamic_margin{1.08};
   double preview_extra{2.0};
