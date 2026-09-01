@@ -970,6 +970,7 @@ class DebugPlotNode(Node):
                 "alternating_gate_corridor",
                 "curved_gate_maze",
                 "winding_obstacle_course",
+                "winding_obstacle_course_wide_gates",
                 "narrow_22m_stop_corridor",
                 "narrow_28m_corridor",
                 "narrow_offset_corridor",

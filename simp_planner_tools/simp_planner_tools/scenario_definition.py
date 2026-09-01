@@ -629,10 +629,71 @@ def load_scenario_definition(
             terminal_margin=3.0,
         )
 
+    if name == "winding_obstacle_course_wide_gates":
+        # Same reference path, gate positions, and standalone obstacles as
+        # "winding_obstacle_course". Only the gate barrier walls are made
+        # thicker along the path direction (obstacle_length x3.8) so each
+        # wall reaches further to the sides of the corridor as the
+        # vehicle passes through, while the lateral reach (barrier_extent)
+        # and gap openings stay unchanged. Kept as a separate scenario so
+        # the baseline "winding_obstacle_course" is untouched.
+        path = ScenarioPath.load_csv(
+            _map_path(share_directory, "winding_obstacle_course.csv"),
+            closed_loop=False,
+        )
+        phase = ScenarioPhase(
+            name="winding_mixed_obstacle_course_wide_gates",
+            path=path,
+            cruise_speed=1.8,
+        )
+
+        gate_specs = (
+            (32.0, 2.60, 4.90, 4.5),
+            (86.0, -2.60, 4.80, 5.5),
+            (148.0, 2.60, 4.80, 5.0),
+            (202.0, -2.60, 4.90, 5.5),
+            (252.0, 2.25, 4.90, 4.5),
+        )
+        gates: list[ScenarioGate] = []
+        obstacles: list[ScenarioObstacle] = []
+        for s_position, center, gap, obstacle_length in gate_specs:
+            gate, lower, upper = gate_on_path(
+                path, s_position, lateral_center=center, gap_width=gap,
+                barrier_extent=14.0, obstacle_length=obstacle_length * 3.8,
+            )
+            gates.append(gate)
+            obstacles.extend((lower, upper))
+
+        obstacles.extend(
+            (
+                obstacle_on_path(
+                    path, 58.0, lateral_offset=-1.50, length=4.5, width=2.0,
+                    yaw_offset=math.radians(25.0),
+                ),
+                obstacle_on_path(
+                    path, 112.0, lateral_offset=2.80, length=5.0, width=3.0,
+                    yaw_offset=math.radians(-18.0),
+                ),
+                obstacle_on_path(
+                    path, 130.0, lateral_offset=-2.80, length=4.5, width=3.0,
+                    yaw_offset=math.radians(22.0),
+                ),
+                obstacle_on_path(
+                    path, 174.0, lateral_offset=0.10, length=6.0, width=2.7,
+                    yaw_offset=math.radians(35.0),
+                ),
+            )
+        )
+        return ScenarioDefinition(
+            name=name, phases=(phase,), obstacles=tuple(obstacles), gates=tuple(gates),
+            terminal_margin=3.0,
+        )
+
     supported = (
         "stadium, crab_switch, reverse_switch, hdmap_crab1_switch, hdmap_lap_switch, s_curve, "
         "straight_long, obstacle_avoidance, terminal_safe_region, s_curve_obstacles, "
         "alternating_gate_corridor, curved_gate_maze, winding_obstacle_course, "
+        "winding_obstacle_course_wide_gates, "
         "narrow_22m_stop_corridor, narrow_28m_corridor, narrow_offset_corridor"
     )
     raise ValueError(f"Unsupported scenario '{scenario_name}'. Supported: {supported}")
