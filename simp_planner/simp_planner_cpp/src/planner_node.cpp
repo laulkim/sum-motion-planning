@@ -125,6 +125,7 @@ struct ExecutablePlan {
   int trajectory_planning_calls{0};
   int allocation_calls{0};
   int spatial_candidate_generation_attempts{0};
+  int curvature_rejected_candidates{0};
   double spatial_normal_ms{0.0};
   double spatial_terminal_ms{0.0};
   double trajectory_normal_ms{0.0};
@@ -1122,6 +1123,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
       executable->allocation_calls = call_counts.allocation;
       executable->spatial_candidate_generation_attempts =
           call_counts.spatial_candidate_generation_attempts;
+      executable->curvature_rejected_candidates =
+          call_counts.curvature_rejected_candidates;
       const auto block_timings = simp_planner::planning_block_timings();
       executable->spatial_normal_ms = block_timings.spatial_normal_ms;
       executable->spatial_terminal_ms = block_timings.spatial_terminal_ms;
@@ -1593,6 +1596,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
            << ",\"allocation_calls\":" << plan.allocation_calls
            << ",\"spatial_candidate_generation_attempts\":"
            << plan.spatial_candidate_generation_attempts
+           << ",\"curvature_rejected_candidates\":"
+           << plan.curvature_rejected_candidates
            << ",\"spatial_normal_ms\":" << plan.spatial_normal_ms
            << ",\"spatial_terminal_ms\":" << plan.spatial_terminal_ms
            << ",\"trajectory_normal_ms\":" << plan.trajectory_normal_ms

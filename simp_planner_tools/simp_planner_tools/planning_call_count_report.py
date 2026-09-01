@@ -69,12 +69,31 @@ BLOCK_TIMING_PANELS = (
     ),
 )
 
-# Raw generate_spatial_path_candidate() invocation count, including every
-# curvature-violation retry (up to 8x recursive re-attempts with an extended
-# length) and the short-path fallback pass. Plotted against the Spatial path
-# generation + collision check block time to check whether the two are
-# proportional.
+# Raw generate_spatial_path_candidate() invocation count, including the
+# short-path fallback pass. A candidate whose required curvature exceeds the
+# limit is dropped outright (see CURVATURE_REJECTED_KEY below), not retried,
+# so this no longer includes curvature-violation re-attempts. Plotted against
+# the Spatial path generation + collision check block time to check whether
+# the two are proportional.
 SPATIAL_ATTEMPTS_KEY = "spatial_candidate_generation_attempts"
+
+# How many of the attempts above were dropped because the candidate's
+# required curvature exceeded curvature_max (generate_spatial_path_
+# candidate()'s early return -- see core.cpp). A subset of
+# spatial_candidate_generation_attempts, not an additional count.
+CURVATURE_REJECTED_KEY = "curvature_rejected_candidates"
+
+# Two independent re-planning loops, both inside a single activated-plan
+# cycle. speed_search_attempts is plan()'s own target-speed backoff
+# (speed_trials(), up to obstacle_speed_max_attempts): it is the count for
+# whichever plan() call ultimately got selected, not summed across replans.
+# path_replans is planner_node.cpp's allocation-collision-triggered outer
+# loop (up to allocation_path_replan_max_attempts): each iteration excludes
+# the previously-selected candidate and calls plan() again from scratch, so
+# it multiplies the spatial-candidate-generation cost of every one of those
+# attempts, not just the winning call.
+SPEED_SEARCH_ATTEMPTS_KEY = "speed_search_attempts"
+PATH_REPLANS_KEY = "path_replans"
 
 # Costmap distance-field rebuild cost. Unlike the four panels above, this is
 # event-driven (only runs when a new /costmap message arrives, on a
@@ -91,7 +110,7 @@ COSTMAP_REBUILD_COUNT_KEY = "costmap_rebuild_count"
 # inside e.g. spatial screening is counted here too, so these do not sum to
 # total_compute_time_ms and are not meant to.
 # candidate_generation_ms sums every generate_spatial_path_candidate() call in
-# the cycle (curvature retries and the short-path fallback pass included). The
+# the cycle (the short-path fallback pass included). The
 # five candidate_* entries right after it are a further breakdown of that
 # same total into the internal phases of generate_spatial_path_candidate()
 # (they are nested inside it, so they need not sum to it exactly; projection
@@ -102,8 +121,8 @@ COSTMAP_REBUILD_COUNT_KEY = "costmap_rebuild_count"
 # used to build a candidate's full curve), boundary+S setup (initial Frenet
 # boundary conditions plus the spatial-extent/sample-array setup -- fixed
 # cost per attempt), polynomial fit (solving for the lateral-offset
-# polynomial coefficients -- redone on every curvature-violation retry),
-# sample points (evaluating that polynomial at each sample), and
+# polynomial coefficients), sample points (evaluating that polynomial at
+# each sample), and
 # curvature/Cartesian (the per-sample-point reference-path evaluation used
 # to build a candidate's full curve, turned into (x, y) points plus
 # arc-length/curvature/curvature-rate).
@@ -183,6 +202,7 @@ REQUIRED_KEYS = (
     tuple(key for key, _ in CATEGORIES)
     + tuple(key for _, series in BLOCK_TIMING_PANELS for key, _, _ in series)
     + (SPATIAL_ATTEMPTS_KEY, COSTMAP_BUILD_MS_KEY, COSTMAP_REBUILD_COUNT_KEY)
+    + (CURVATURE_REJECTED_KEY, SPEED_SEARCH_ATTEMPTS_KEY, PATH_REPLANS_KEY)
     + tuple(k for _, subseries in PATH_BREAKDOWN_SERIES
             for key, _, _ in subseries for k in _series_keys(key))
     + tuple(k for _, subseries in TRAJECTORY_BREAKDOWN_SERIES
@@ -265,9 +285,9 @@ def create_call_count_figure(samples: list[dict[str, float | int]]) -> Figure:
         panel_ax.legend(loc="best", fontsize=8)
 
     # Debug panel: raw candidate-generation attempt count (every
-    # generate_spatial_path_candidate() call, including curvature retries)
-    # against the Spatial path generation + collision check block time, to
-    # see at a glance whether the two track each other.
+    # generate_spatial_path_candidate() call) against the Spatial path
+    # generation + collision check block time, to see at a glance whether
+    # the two track each other.
     attempts_ax = detail_axes[len(BLOCK_TIMING_PANELS)]
     attempts = [int(sample[SPATIAL_ATTEMPTS_KEY]) for sample in samples]
     attempts_line = attempts_ax.plot(
@@ -457,6 +477,69 @@ def render_trajectory_breakdown_report(
     plt.close(fig)
 
 
+def create_replan_curvature_figure(samples: list[dict[str, float | int]]) -> Figure:
+    """Two panels, side by side: how much re-planning happened this cycle
+    (both the allocation-collision-triggered outer replan loop in
+    planner_node.cpp and plan()'s own target-speed backoff), and how many
+    spatial candidates were dropped for exceeding the curvature limit. Both
+    are per-activated-plan counts, so a spike here directly explains a spike
+    in spatial_candidate_generation_attempts / block time on the other
+    panels -- each outer replan re-runs the full n_target x length-option
+    generation pass from scratch."""
+    time_sec = [float(sample["time_s"]) for sample in samples]
+
+    fig = plt.figure(figsize=(13.0, 4.5))
+    gs = fig.add_gridspec(1, 2)
+
+    replan_ax = fig.add_subplot(gs[0, 0])
+    path_replans = [int(sample[PATH_REPLANS_KEY]) for sample in samples]
+    speed_search_attempts = [
+        int(sample[SPEED_SEARCH_ATTEMPTS_KEY]) for sample in samples
+    ]
+    replan_ax.plot(
+        time_sec, path_replans, color="tab:red", marker="o", markersize=2,
+        linewidth=1,
+        label=f"path_replans, allocation-triggered (mean {mean(path_replans):.2f})",
+    )
+    replan_ax.plot(
+        time_sec, speed_search_attempts, color="tab:blue", marker="o", markersize=2,
+        linewidth=1, alpha=0.8,
+        label=f"speed_search_attempts, speed backoff (mean {mean(speed_search_attempts):.2f})",
+    )
+    replan_ax.set_ylim(bottom=0)
+    replan_ax.set_ylabel("count")
+    replan_ax.set_xlabel("time [s]")
+    replan_ax.set_title("Re-planning attempts per cycle")
+    replan_ax.grid(True, alpha=0.3)
+    replan_ax.legend(loc="best", fontsize=8)
+
+    curvature_ax = fig.add_subplot(gs[0, 1], sharex=replan_ax)
+    rejected = [int(sample[CURVATURE_REJECTED_KEY]) for sample in samples]
+    curvature_ax.plot(
+        time_sec, rejected, color="tab:purple", marker="o", markersize=2,
+        linewidth=1,
+        label=f"curvature_rejected_candidates (mean {mean(rejected):.1f})",
+    )
+    curvature_ax.set_ylim(bottom=0)
+    curvature_ax.set_ylabel("count")
+    curvature_ax.set_xlabel("time [s]")
+    curvature_ax.set_title("Spatial candidates dropped for exceeding curvature_max")
+    curvature_ax.grid(True, alpha=0.3)
+    curvature_ax.legend(loc="best", fontsize=8)
+
+    fig.suptitle(f"Re-planning vs. curvature rejection ({len(samples)} activated plans)")
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.93))
+    return fig
+
+
+def render_replan_curvature_report(
+    samples: list[dict[str, float | int]], output_path: Path
+) -> None:
+    fig = create_replan_curvature_figure(samples)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
 class PlanningCallCountReportNode(Node):
     """Counts how often spatial-path-generation / trajectory-planning /
     allocation run per activated plan, and how much wall-clock time each
@@ -514,6 +597,9 @@ class PlanningCallCountReportNode(Node):
         sample[SPATIAL_ATTEMPTS_KEY] = int(plan[SPATIAL_ATTEMPTS_KEY])
         sample[COSTMAP_BUILD_MS_KEY] = float(plan[COSTMAP_BUILD_MS_KEY])
         sample[COSTMAP_REBUILD_COUNT_KEY] = int(plan[COSTMAP_REBUILD_COUNT_KEY])
+        sample[CURVATURE_REJECTED_KEY] = int(plan[CURVATURE_REJECTED_KEY])
+        sample[SPEED_SEARCH_ATTEMPTS_KEY] = int(plan[SPEED_SEARCH_ATTEMPTS_KEY])
+        sample[PATH_REPLANS_KEY] = int(plan[PATH_REPLANS_KEY])
         sample.update(
             {k: float(plan[k]) for _, subseries in PATH_BREAKDOWN_SERIES
              for key, _, _ in subseries for k in _series_keys(key)}
@@ -549,6 +635,13 @@ class PlanningCallCountReportNode(Node):
         self.get_logger().info(
             f"Saved {len(self.samples)}-plan trajectory-breakdown report to "
             f"{trajectory_png_path}"
+        )
+
+        replan_png_path = self.session_dir / "planning_replan_curvature.png"
+        render_replan_curvature_report(self.samples, replan_png_path)
+        self.get_logger().info(
+            f"Saved {len(self.samples)}-plan re-planning/curvature-rejection report to "
+            f"{replan_png_path}"
         )
 
 

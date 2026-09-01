@@ -554,7 +554,6 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
     double start_delay = 0.0,
     bool terminal_position_only = false,
     const ManeuverProfileState* maneuver_profile = nullptr,
-    int curvature_retry_depth = 0,
     bool hard_preview_limit = false) {
   ++g_planning_call_counts.spatial_candidate_generation_attempts;
   double real_end_s, remaining_real;
@@ -745,15 +744,13 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
     ScopedBlockTimer feasibility_check_timer(g_planning_block_timings.feasibility_check_ms);
     for (auto idx : actual) max_curvature = std::max(max_curvature, std::abs(kappa[idx]));
   }
-  if (max_curvature > cfg.constraints.curvature_max + 1.0e-9
-      && lateral_length < cfg.lateral.max_length - 1.0e-9
-      && curvature_retry_depth < 8) {
-    const double scale = std::max(1.15, 1.05 * std::sqrt(max_curvature /
-        std::max(cfg.constraints.curvature_max, 1.0e-6)));
-    return generate_spatial_path_candidate(state, previous_action, fr, n_target,
-        std::min(lateral_length * scale, cfg.lateral.max_length), preview_length,
-        cfg, reference, candidate_id, start_delay, terminal_position_only,
-        maneuver_profile, curvature_retry_depth + 1, hard_preview_limit);
+  // A candidate whose required curvature exceeds the vehicle limit anywhere
+  // along its real (non-preview) extent is dropped here -- this n_target is
+  // simply infeasible at this lateral_length, rather than being regenerated
+  // with a longer one.
+  if (max_curvature > cfg.constraints.curvature_max + 1.0e-9) {
+    ++g_planning_call_counts.curvature_rejected_candidates;
+    return std::nullopt;
   }
   const double bound = std::max(std::abs(boundary.n0), std::abs(n_target)) + 0.4;
   double max_abs_n = 0.0;
@@ -2451,11 +2448,20 @@ PlanResult PathVelocityPlanner::plan_at_speed(
       // Complete the lateral transition before the terminal vehicle footprint
       // enters the blocked goal zone.  Reaching the offset only at the stop
       // coordinate can leave the front half of the vehicle on a colliding
-      // approach even though the final center pose itself is safe.
+      // approach even though the final center pose itself is safe.  The
+      // length must also stay at or above the curvature-feasible minimum for
+      // this offset -- generate_spatial_path_candidate() no longer retries
+      // with a longer length on its own, so a too-short deadline-driven
+      // length here would simply drop this n_target instead of widening it.
+      const double v_scale = std::max(
+          std::abs(state.speed), config_.constraints.v_eff_min);
+      const double curvature_safe_length = minimum_lateral_length(
+          n_target - fr.n, v_scale, config_);
       const double terminal_transition_length = clamp_value(
-          std::max(remaining_to_goal
-                       - std::max(config_.terminal.safe_region_settle_distance, 0.0),
-                   config_.lateral.min_length),
+          std::max({remaining_to_goal
+                        - std::max(config_.terminal.safe_region_settle_distance, 0.0),
+                    config_.lateral.min_length,
+                    curvature_safe_length}),
           config_.lateral.min_length, config_.lateral.max_length);
       options.clear();
       const bool terminal_position_only = terminal_constraint_active
@@ -2574,7 +2580,7 @@ PlanResult PathVelocityPlanner::plan_at_speed(
             state, previous_action, fr, source.path.n_target,
             source.path.lateral_length, usable, config_, path_, candidate_id,
             source.path.start_delay, source.path.terminal_position_only,
-            nullptr, 0, true);
+            nullptr, true);
       }
       ++candidate_id;
       if (!candidate) continue;
