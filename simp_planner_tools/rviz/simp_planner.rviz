@@ -90,7 +90,7 @@ Visualization Manager:
         Depth: 5
         Durability Policy: Transient Local
         Reliability Policy: Reliable
-      Color: 40; 40; 255
+      Color: 160; 0; 200
       Line Style: Billboards
       Line Width: 0.15
       Offset:
@@ -107,9 +107,9 @@ Visualization Manager:
         Depth: 5
         Durability Policy: Transient Local
         Reliability Policy: Reliable
-      Color: 0; 200; 0
+      Color: 0; 140; 0
       Line Style: Billboards
-      Line Width: 0.20
+      Line Width: 0.30
       Offset:
         X: 0
         Y: 0
@@ -124,9 +124,9 @@ Visualization Manager:
         Depth: 5
         Durability Policy: Transient Local
         Reliability Policy: Reliable
-      Color: 255; 0; 0
+      Color: 220; 0; 0
       Line Style: Billboards
-      Line Width: 0.25
+      Line Width: 0.38
       Offset:
         X: 0
         Y: 0

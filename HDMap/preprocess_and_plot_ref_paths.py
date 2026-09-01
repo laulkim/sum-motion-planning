@@ -26,7 +26,7 @@ if os.path.exists(_CJK_FONT_PATH):
 matplotlib.rcParams["axes.unicode_minus"] = False
 
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
-TRACKS = ["큰트랙", "크랩1", "크랩2", "크랩3"]
+TRACKS = ["레귤러1", "레귤러3", "크랩2"]
 
 RESAMPLE_SPACING = 0.2   # m, 재샘플링 간격 - 필요에 맞게 조정
 SPLINE_DEGREE = 3        # 3차 스플라인

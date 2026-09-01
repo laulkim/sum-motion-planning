@@ -1,6 +1,6 @@
 """FMTC HD map의 차선(B2_SURFACELINEMARK) 원본을 RViz용 MarkerArray로 publish한다.
 
-hdmap_* 시나리오(hdmap_lap_switch, hdmap_crab1_switch)는 HDMap/build_*_scenario_maps.py
+hdmap_* 시나리오(hdmap_lap_switch, hdmap_crab1_switch, fmtc_demo)는 HDMap/build_*_scenario_maps.py
 가 큰트랙 UTM 좌표에서 원점 하나를 빼서 로컬 "odom" 프레임을 만든다. 이 노드는
 그 원점(HDMap/output/{scenario}_origin.txt)을 그대로 다시 읽어, 원본 차선
 shapefile 좌표에서 같은 원점을 빼서 publish한다 -- 그래야 차선이 시나리오

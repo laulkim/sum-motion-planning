@@ -247,6 +247,45 @@ def load_scenario_definition(
             terminal_margin=3.0,
         )
 
+    if name == "fmtc_demo":
+        # HDMap/build_ref_ver1_path.py + HDMap/build_fmtc_demo_scenario.py 로
+        # 생성한, ref_ver1.txt 기반 3-phase 시나리오: 레귤러1(Forward) ->
+        # 크랩2(Left) -> 레귤러3(Forward). 레귤러1/크랩2는 각각 자신의 곡선에
+        # 다음 세그먼트 시작점을 수직 투영해 얻은 S_switch에서 정확히 잘려
+        # 있으므로, switch_s는 곧 그 phase csv 자신의 총 길이다
+        # (HDMap/build_fmtc_demo_scenario.py 콘솔 출력 그대로).
+        regular1 = ScenarioPhase(
+            name="fmtc_demo_regular1",
+            path=ScenarioPath.load_csv(
+                _map_path(share_directory, "fmtc_demo_regular1.csv"),
+                closed_loop=False,
+            ),
+            cruise_speed=1.5,
+            switch_s=94.81,
+        )
+        crab2 = ScenarioPhase(
+            name="fmtc_demo_crab2",
+            path=ScenarioPath.load_csv(
+                _map_path(share_directory, "fmtc_demo_crab2.csv"),
+                closed_loop=False,
+            ),
+            cruise_speed=1.0,
+            switch_s=152.53,
+        )
+        regular3 = ScenarioPhase(
+            name="fmtc_demo_regular3",
+            path=ScenarioPath.load_csv(
+                _map_path(share_directory, "fmtc_demo_regular3.csv"),
+                closed_loop=False,
+            ),
+            cruise_speed=1.5,
+        )
+        return ScenarioDefinition(
+            name=name,
+            phases=(regular1, crab2, regular3),
+            terminal_margin=3.0,
+        )
+
     if name == "hdmap_lap_switch":
         # HDMap/build_lap_scenario_maps.py 로 생성. 큰트랙을 따라가며 크랩
         # 1/2/3 switch를 순서대로 만나는 10-phase 연속 랩:
@@ -690,7 +729,7 @@ def load_scenario_definition(
         )
 
     supported = (
-        "stadium, crab_switch, reverse_switch, hdmap_crab1_switch, hdmap_lap_switch, s_curve, "
+        "stadium, crab_switch, reverse_switch, hdmap_crab1_switch, fmtc_demo, hdmap_lap_switch, s_curve, "
         "straight_long, obstacle_avoidance, terminal_safe_region, s_curve_obstacles, "
         "alternating_gate_corridor, curved_gate_maze, winding_obstacle_course, "
         "winding_obstacle_course_wide_gates, "
