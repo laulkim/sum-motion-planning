@@ -20,6 +20,37 @@ latest_ground_truth.png
 두 이미지에서 동일하고 차량 위치, 속도 및 이들로 계산한 추종 오차가
 서로 다릅니다.
 
+### 종료된 실행의 GT-추정 오차 분석
+
+각 세션에 저장된 두 odometry CSV를 시간 정렬하고 확대 가능한 그래프로
+보려면 다음 명령을 사용합니다.
+
+```bash
+python3 ~/ros2_ws/src/sum-motion-planning/\
+simp_planner_tools/simp_planner_tools/estimation_error_plot.py \
+  ~/Desktop/simp_planner/simp_planner_debug/winding_obstacle_course/20260904_153233
+```
+
+마우스 휠로 포인터 주변을 확대하고 Matplotlib 도구 모음으로 영역 확대,
+이동 및 원래 화면 복귀가 가능합니다. 시간 그래프 위에서 마우스를 움직이면
+해당 시점의 위치, yaw, 속도 및 global lateral 오차가 하단에 표시됩니다.
+
+기본값은 같은 수신 시각의 값을 비교하므로 estimator delay가 포함됩니다.
+`--alignment source`를 지정하면 각 logger가 정렬한 message header 시간축을
+사용합니다. 실행할 때 다음 파일도 세션 폴더에 생성됩니다.
+
+```text
+estimation_error_comparison.csv  # 시간 정렬된 상세 수치
+estimation_error_overview.png
+```
+
+PlotJuggler 없이 Python과 Matplotlib만 사용합니다. GUI 없이 파일만 만들려면
+`--no-show`를 추가합니다. 패키지를 빌드한 뒤에는 아래 명령도 같습니다.
+
+```bash
+ros2 run simp_planner_tools estimation_error_plot <세션 폴더>
+```
+
 ## 지원 시나리오
 
 ```text

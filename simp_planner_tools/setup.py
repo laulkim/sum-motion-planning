@@ -26,6 +26,7 @@ setup(
             "scenario_manager_node = simp_planner_tools.scenario_manager_node:main",
             "track_map_provider_node = simp_planner_tools.track_map_provider_node:main",
             "debug_plot_node = simp_planner_tools.debug_plot_node:main",
+            "estimation_error_plot = simp_planner_tools.estimation_error_plot:main",
         ],
     },
 )
