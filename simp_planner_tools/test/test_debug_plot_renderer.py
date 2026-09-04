@@ -72,3 +72,8 @@ def test_renderer_creates_timestamp_aligned_dashboard(tmp_path: Path) -> None:
     result = Path(render_debug_snapshot(snapshot, str(tmp_path), 1))
     assert result.exists()
     assert (tmp_path / "latest.png").exists()
+
+    snapshot["data_source_label"] = "ground_truth"
+    labeled_result = Path(render_debug_snapshot(snapshot, str(tmp_path), 2))
+    assert labeled_result.name == "snapshot_ground_truth_000002.png"
+    assert (tmp_path / "latest_ground_truth.png").exists()

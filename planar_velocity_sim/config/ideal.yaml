@@ -1,0 +1,11 @@
+planar_velocity_sim_node:
+  ros__parameters:
+    # Preserve the original command == motion == odometry behavior.
+    update_rate_hz: 100.0
+    estimator_rate_hz: 100.0
+    max_internal_step_sec: 0.01
+    command.delay_sec: 0.0
+    command.timeout_sec: 0.0
+    dynamics.enabled: false
+    estimator.enabled: false
+

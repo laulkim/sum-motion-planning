@@ -1,4 +1,5 @@
 import math
+from datetime import datetime
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -11,9 +12,13 @@ from simp_planner_tools.scenario_definition import load_scenario_definition
 
 def _resolved_nodes(context):
     scenario_name = LaunchConfiguration("scenario").perform(context)
+    sim_profile = LaunchConfiguration("sim_profile").perform(context).strip().lower()
+    if sim_profile not in ("ideal", "realistic"):
+        raise ValueError("sim_profile must be 'ideal' or 'realistic'")
     target_speed = float(LaunchConfiguration("target_speed").perform(context))
     save_period = float(LaunchConfiguration("save_period").perform(context))
     debug_output_dir = LaunchConfiguration("debug_output_dir").perform(context)
+    debug_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     path_update_distance = float(
         LaunchConfiguration("path_update_distance").perform(context)
     )
@@ -37,6 +42,10 @@ def _resolved_nodes(context):
     )
 
     share_directory = get_package_share_directory("simp_planner_tools")
+    sim_config_file = str(
+        get_package_share_directory("planar_velocity_sim")
+        + f"/config/{sim_profile}.yaml"
+    )
     scenario = load_scenario_definition(share_directory, scenario_name)
     footprint_circle_count = (
         int(scenario.footprint_circle_count)
@@ -65,6 +74,7 @@ def _resolved_nodes(context):
             name="planar_velocity_sim_node",
             output="screen",
             parameters=[
+                sim_config_file,
                 {
                     "initial_x": float(first_path.x[0]),
                     "initial_y": float(first_path.y[0]),
@@ -105,13 +115,32 @@ def _resolved_nodes(context):
         Node(
             package="simp_planner_tools",
             executable="debug_plot_node",
-            name="debug_plot_node",
+            name="debug_plot_estimate_node",
             output="screen",
             parameters=[
                 {
                     "scenario": scenario_name,
                     "save_period": save_period,
                     "output_dir": debug_output_dir,
+                    "session_id": debug_session_id,
+                    "data_source_label": "estimate",
+                    "odom_topic": "/odom",
+                }
+            ],
+        ),
+        Node(
+            package="simp_planner_tools",
+            executable="debug_plot_node",
+            name="debug_plot_ground_truth_node",
+            output="screen",
+            parameters=[
+                {
+                    "scenario": scenario_name,
+                    "save_period": save_period,
+                    "output_dir": debug_output_dir,
+                    "session_id": debug_session_id,
+                    "data_source_label": "ground_truth",
+                    "odom_topic": "/sim/ground_truth/odom",
                 }
             ],
         ),
@@ -122,6 +151,11 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
             DeclareLaunchArgument("scenario", default_value="stadium"),
+            DeclareLaunchArgument(
+                "sim_profile",
+                default_value="ideal",
+                description="planar_velocity_sim profile: ideal or realistic.",
+            ),
             DeclareLaunchArgument(
                 "target_speed",
                 default_value="-1.0",

@@ -29,6 +29,12 @@ from .path_geometry import PathProjection, project_open_path, wrap_angle
 MODE_NAMES = {0: "FORWARD", 1: "REVERSE", 2: "LEFT", 3: "RIGHT"}
 
 
+def labeled_filename(stem: str, suffix: str, data_source_label: str) -> str:
+    if not data_source_label:
+        return f"{stem}{suffix}"
+    return f"{stem}_{data_source_label}{suffix}"
+
+
 def quaternion_to_yaw(x: float, y: float, z: float, w: float) -> float:
     siny_cosp = 2.0 * (w * z + x * y)
     cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
@@ -49,6 +55,9 @@ class DebugPlotNode(Node):
         self.declare_parameter(
             "output_dir", "/home/sum/Desktop/simp_planner/simp_planner_debug"
         )
+        self.declare_parameter("session_id", "")
+        self.declare_parameter("data_source_label", "")
+        self.declare_parameter("odom_topic", "/odom")
         self.declare_parameter("save_period", 10.0)
         self.declare_parameter("frame_id", "odom")
         self.declare_parameter("vehicle_length", 3.0)
@@ -62,6 +71,15 @@ class DebugPlotNode(Node):
         self.declare_parameter("dynamic_topic_timeout", 2.0)
 
         self.scenario_name = str(self.get_parameter("scenario").value)
+        self.data_source_label = str(
+            self.get_parameter("data_source_label").value
+        ).strip().lower()
+        if self.data_source_label and not all(
+            character.isalnum() or character in "-_"
+            for character in self.data_source_label
+        ):
+            raise ValueError("data_source_label may contain only letters, numbers, - and _")
+        self.odom_topic = str(self.get_parameter("odom_topic").value)
         self.frame_id = str(self.get_parameter("frame_id").value)
         self.save_period = float(self.get_parameter("save_period").value)
         self.vehicle_length = float(self.get_parameter("vehicle_length").value)
@@ -89,12 +107,21 @@ class DebugPlotNode(Node):
         )
 
         base = Path(str(self.get_parameter("output_dir").value)).expanduser()
-        self.session_dir = (
-            base / self.scenario_name / datetime.now().strftime("%Y%m%d_%H%M%S")
-        )
-        self.session_dir.mkdir(parents=True, exist_ok=False)
+        requested_session_id = str(self.get_parameter("session_id").value).strip()
+        shared_session = bool(requested_session_id)
+        session_id = requested_session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+        if not all(
+            character.isalnum() or character in "-_"
+            for character in session_id
+        ):
+            raise ValueError("session_id may contain only letters, numbers, - and _")
+        self.session_dir = base / self.scenario_name / session_id
+        self.session_dir.mkdir(parents=True, exist_ok=shared_session)
 
-        self.csv_file = (self.session_dir / "odom_history.csv").open(
+        odom_history_name = labeled_filename(
+            "odom_history", ".csv", self.data_source_label
+        )
+        self.csv_file = (self.session_dir / odom_history_name).open(
             "w", newline="", encoding="utf-8", buffering=1
         )
         self.csv_writer = csv.writer(self.csv_file)
@@ -119,7 +146,10 @@ class DebugPlotNode(Node):
                 "planner_state", "planner_block_reason", "diagnosis",
             ]
         )
-        self.command_csv_file = (self.session_dir / "command_history.csv").open(
+        command_history_name = labeled_filename(
+            "command_history", ".csv", self.data_source_label
+        )
+        self.command_csv_file = (self.session_dir / command_history_name).open(
             "w", newline="", encoding="utf-8", buffering=1
         )
         self.command_csv_writer = csv.writer(self.command_csv_file)
@@ -137,7 +167,10 @@ class DebugPlotNode(Node):
             ]
         )
 
-        self.plan_csv_file = (self.session_dir / "plan_history.csv").open(
+        plan_history_name = labeled_filename(
+            "plan_history", ".csv", self.data_source_label
+        )
+        self.plan_csv_file = (self.session_dir / plan_history_name).open(
             "w", newline="", encoding="utf-8", buffering=1
         )
         self.plan_csv_writer = csv.writer(self.plan_csv_file)
@@ -170,7 +203,7 @@ class DebugPlotNode(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
-        self.create_subscription(Odometry, "/odom", self.odom_callback, 50)
+        self.create_subscription(Odometry, self.odom_topic, self.odom_callback, 50)
         self.create_subscription(
             ReferencePathMessage,
             "/reference_path_data",
@@ -329,7 +362,10 @@ class DebugPlotNode(Node):
         self.render_future: Optional[Future[str]] = None
         self.render_skip_count = 0
         self.save_timer = self.create_timer(self.save_period, self.save_output)
-        self.get_logger().info(f"Debug output: {self.session_dir}")
+        source = self.data_source_label or "odometry"
+        self.get_logger().info(
+            f"Debug output: {self.session_dir}, source={source} ({self.odom_topic})"
+        )
 
     def elapsed(self) -> float:
         return (self.get_clock().now() - self.start_time).nanoseconds * 1.0e-9
@@ -956,6 +992,7 @@ class DebugPlotNode(Node):
         execution = copy.deepcopy(self.planner_section("execution"))
         return {
             "scenario_name": self.scenario_name,
+            "data_source_label": self.data_source_label,
             "vehicle_length": self.vehicle_length,
             "vehicle_width": self.vehicle_width,
             "latest_cmd_vx": self.cmd_vx,
@@ -1063,7 +1100,10 @@ class DebugPlotNode(Node):
                 "render_skip_count": self.render_skip_count,
             },
         }
-        with (self.session_dir / "status_latest.json").open("w", encoding="utf-8") as file:
+        status_name = labeled_filename(
+            "status_latest", ".json", self.data_source_label
+        )
+        with (self.session_dir / status_name).open("w", encoding="utf-8") as file:
             json.dump(payload, file, ensure_ascii=False, indent=2, allow_nan=True)
         for file in (self.csv_file, self.command_csv_file, self.plan_csv_file):
             file.flush()

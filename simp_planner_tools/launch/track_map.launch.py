@@ -8,6 +8,7 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description() -> LaunchDescription:
     map_file = LaunchConfiguration("map_file")
+    sim_config_file = LaunchConfiguration("sim_config_file")
     target_speed = LaunchConfiguration("target_speed")
     save_period = LaunchConfiguration("save_period")
     debug_output_dir = LaunchConfiguration("debug_output_dir")
@@ -15,10 +16,14 @@ def generate_launch_description() -> LaunchDescription:
     default_map = PathJoinSubstitution(
         [FindPackageShare("simp_planner_tools"), "maps", "stadium_track.csv"]
     )
+    default_sim_config = PathJoinSubstitution(
+        [FindPackageShare("planar_velocity_sim"), "config", "ideal.yaml"]
+    )
 
     return LaunchDescription(
         [
             DeclareLaunchArgument("map_file", default_value=default_map),
+            DeclareLaunchArgument("sim_config_file", default_value=default_sim_config),
             DeclareLaunchArgument("target_speed", default_value="2.0"),
             DeclareLaunchArgument("save_period", default_value="10.0"),
             DeclareLaunchArgument(
@@ -30,6 +35,7 @@ def generate_launch_description() -> LaunchDescription:
                 executable="planar_velocity_sim_node",
                 name="planar_velocity_sim_node",
                 output="screen",
+                parameters=[sim_config_file],
             ),
             Node(
                 package="simp_planner_tools",

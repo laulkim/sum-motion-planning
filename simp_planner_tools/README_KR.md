@@ -2,6 +2,24 @@
 
 입력 시나리오, reference path/costmap 생성, debug plot 및 통합 launch를 제공합니다.
 
+## 현실화 시뮬레이션 디버그 출력
+
+`simulation.launch.py`는 같은 저장 주기마다 상태추정값과 ground truth를
+각각 렌더링합니다.
+
+```text
+snapshot_estimate_000010.png
+snapshot_ground_truth_000010.png
+latest_estimate.png
+latest_ground_truth.png
+```
+
+두 이미지는 같은 `scenario/session_id` 디렉터리에 저장됩니다. Estimate
+이미지는 Planner 입력인 `/odom`, ground-truth 이미지는
+`/sim/ground_truth/odom`을 사용합니다. 경로, 선택 궤적과 Planner 명령은
+두 이미지에서 동일하고 차량 위치, 속도 및 이들로 계산한 추종 오차가
+서로 다릅니다.
+
 ## 지원 시나리오
 
 ```text

@@ -439,9 +439,25 @@ def render_debug_snapshot(
     status_ax.text(0.51, 0.985, "\n".join(status_right), **text_style)
     status_ax.set_title("Current state and timestamp diagnostics")
 
-    figure.suptitle(f"SIMP Planner - {snapshot.get('scenario_name', 'N/A')} - {diagnosis}")
-    snapshot_path = session_dir / f"snapshot_{int(elapsed_int):06d}.png"
-    latest_path = session_dir / "latest.png"
+    data_source_label = str(snapshot.get("data_source_label", "")).strip().lower()
+    safe_label = "".join(
+        character
+        for character in data_source_label
+        if character.isalnum() or character in "-_"
+    )
+    source_title = f" - {safe_label.replace('_', ' ').upper()}" if safe_label else ""
+    figure.suptitle(
+        f"SIMP Planner - {snapshot.get('scenario_name', 'N/A')}"
+        f"{source_title} - {diagnosis}"
+    )
+    if safe_label:
+        snapshot_name = f"snapshot_{safe_label}_{int(elapsed_int):06d}.png"
+        latest_name = f"latest_{safe_label}.png"
+    else:
+        snapshot_name = f"snapshot_{int(elapsed_int):06d}.png"
+        latest_name = "latest.png"
+    snapshot_path = session_dir / snapshot_name
+    latest_path = session_dir / latest_name
     figure.savefig(snapshot_path, dpi=150)
     plt.close(figure)
     shutil.copy2(snapshot_path, latest_path)
