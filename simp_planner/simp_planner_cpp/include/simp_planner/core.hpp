@@ -29,16 +29,18 @@ struct PlanningCallCounts {
   int trajectory_planning{0};
   int allocation{0};
   // Raw number of generate_spatial_path_candidate() invocations, including
-  // the short-path fallback pass. Unlike spatial_path_generation above (one
-  // per generation-phase entry), this counts every individual
-  // candidate-generation attempt. A candidate whose required curvature
-  // exceeds the limit is dropped outright (no retry), so this no longer
-  // includes curvature-violation re-attempts.
+  // every curvature-violation retry (up to 8x recursive re-attempts with an
+  // extended length) and the short-path fallback pass. Unlike
+  // spatial_path_generation above (one per generation-phase entry), this
+  // counts every individual candidate-generation attempt.
   int spatial_candidate_generation_attempts{0};
-  // How many of the attempts above were dropped because the candidate's
-  // required curvature exceeded curvature_max (the generate_spatial_path_
-  // candidate() early return). A subset of spatial_candidate_generation_
-  // attempts, not an additional count.
+  // How many times a candidate's required curvature was found to exceed
+  // curvature_max. Each occurrence either triggers a retry with an extended
+  // length or, once the retry budget/max_length is exhausted, lets the
+  // over-limit candidate through to screen_spatial_candidate() (which then
+  // marks it curvature_valid=false there). A retried candidate can be
+  // counted here more than once, so this is not a count of distinct
+  // rejected n_targets.
   int curvature_rejected_candidates{0};
 };
 
@@ -56,8 +58,8 @@ struct PlanningBlockTimings {
   // Cross-cutting breakdown by computation kind, orthogonal to the five
   // stage buckets above (a stage's time is also counted here under whichever
   // kind of work it was doing). candidate_generation_ms sums every
-  // generate_spatial_path_candidate() call in the cycle, including the
-  // short-path fallback pass.
+  // generate_spatial_path_candidate() call in the cycle, including
+  // curvature-violation retries and the short-path fallback pass.
   // feasibility_check_ms is the open-loop trajectory simulation plus its
   // dynamic/kinematic constraint checks. collision_check_ms covers every
   // obstacle-clearance query (spatial screening, trajectory-level clearance,
@@ -83,8 +85,8 @@ struct PlanningBlockTimings {
   // candidate_boundary_setup_ms is the initial Frenet boundary conditions
   // plus the spatial (S) extent/sample-array setup -- a fixed amount of
   // work per attempt. candidate_polynomial_fit_ms is solving for the
-  // septic/quartic lateral-offset polynomial coefficients.
-  // candidate_sample_points_ms is evaluating
+  // septic/quartic lateral-offset polynomial coefficients, redone on every
+  // curvature-violation retry. candidate_sample_points_ms is evaluating
   // that polynomial (Horner) at each sample point. candidate_curvature_
   // cartesian_ms is evaluating the reference path (with virtual extension)
   // at every sample point of a candidate's full curve, turning the result

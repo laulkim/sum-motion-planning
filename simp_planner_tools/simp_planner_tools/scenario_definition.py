@@ -132,6 +132,101 @@ def gate_on_path(
     )
     return gate, lower, upper
 
+
+def _ramp_loop_kappa(
+    s: float,
+    ramp_length: float,
+    transition_length: float,
+    kappa_circle: float,
+    sweep_length: float,
+) -> float:
+    s1 = ramp_length
+    s2 = s1 + transition_length
+    s3 = s2 + sweep_length
+    s4 = s3 + transition_length
+    if s <= s1:
+        return 0.0
+    if s <= s2:
+        return kappa_circle * (s - s1) / transition_length
+    if s <= s3:
+        return kappa_circle
+    if s <= s4:
+        return kappa_circle * (1.0 - (s - s3) / transition_length)
+    return 0.0
+
+
+def build_ramp_loop_path(
+    *,
+    ramp_length: float,
+    transition_length: float,
+    circle_radius: float,
+    sweep_deg: float,
+    ds: float = 0.2,
+) -> ScenarioPath:
+    """Straight entry ramp -> clothoid-in -> constant-curvature circular
+    sweep -> clothoid-out -> straight exit ramp, the shape of a parking-
+    garage ramp that loops around before continuing on.  Curvature is
+    integrated with a trapezoidal rule at a fixed arc-length step, which
+    keeps consecutive yaw steps well inside ScenarioPath.from_arrays'
+    tolerances even through the tightest part of the sweep.
+    """
+    kappa_circle = 1.0 / float(circle_radius)
+    sweep_length = math.radians(float(sweep_deg)) * float(circle_radius)
+    total_length = 2.0 * float(ramp_length) + 2.0 * float(transition_length) + sweep_length
+    count = int(math.ceil(total_length / ds)) + 1
+    s_values = np.linspace(0.0, total_length, count)
+    kappa = np.array(
+        [
+            _ramp_loop_kappa(
+                float(s), ramp_length, transition_length, kappa_circle, sweep_length
+            )
+            for s in s_values
+        ]
+    )
+    yaw = np.zeros(count)
+    x = np.zeros(count)
+    y = np.zeros(count)
+    for i in range(1, count):
+        d = s_values[i] - s_values[i - 1]
+        yaw[i] = yaw[i - 1] + 0.5 * (kappa[i - 1] + kappa[i]) * d
+        mean_yaw = 0.5 * (yaw[i - 1] + yaw[i])
+        x[i] = x[i - 1] + d * math.cos(mean_yaw)
+        y[i] = y[i - 1] + d * math.sin(mean_yaw)
+    mode = np.zeros(count, dtype=np.uint8)
+    return ScenarioPath.from_arrays(x, y, yaw, kappa, mode, closed_loop=False)
+
+
+def wall_segments_along_path(
+    path: ScenarioPath,
+    s_start: float,
+    s_end: float,
+    *,
+    lateral_offset: float,
+    segment_length: float = 1.6,
+    spacing: float = 1.2,
+    thickness: float = 0.25,
+) -> list[ScenarioObstacle]:
+    """Approximate a continuous wall alongside a (possibly curved) path
+    segment as a sequence of short, overlapping rectangles.  Each segment
+    picks up the local path tangent from obstacle_on_path, so the wall
+    follows the curve instead of cutting a chord across it; the overlap
+    between consecutive segments (segment_length > spacing) keeps the
+    rasterized costmap from leaking a gap between them.
+    """
+    segments: list[ScenarioObstacle] = []
+    s = float(s_start)
+    end = float(s_end)
+    while s <= end + 1.0e-6:
+        segments.append(
+            obstacle_on_path(
+                path, s, lateral_offset=lateral_offset,
+                length=segment_length, width=thickness,
+            )
+        )
+        s += spacing
+    return segments
+
+
 def load_scenario_definition(
     share_directory: Path | str,
     scenario_name: str,
@@ -671,7 +766,7 @@ def load_scenario_definition(
     if name == "winding_obstacle_course_wide_gates":
         # Same reference path, gate positions, and standalone obstacles as
         # "winding_obstacle_course". Only the gate barrier walls are made
-        # thicker along the path direction (obstacle_length x3.8) so each
+        # thicker along the path direction (obstacle_length x3.5) so each
         # wall reaches further to the sides of the corridor as the
         # vehicle passes through, while the lateral reach (barrier_extent)
         # and gap openings stay unchanged. Kept as a separate scenario so
@@ -698,7 +793,7 @@ def load_scenario_definition(
         for s_position, center, gap, obstacle_length in gate_specs:
             gate, lower, upper = gate_on_path(
                 path, s_position, lateral_center=center, gap_width=gap,
-                barrier_extent=14.0, obstacle_length=obstacle_length * 3.8,
+                barrier_extent=14.0, obstacle_length=obstacle_length * 3.5,
             )
             gates.append(gate)
             obstacles.extend((lower, upper))
@@ -728,11 +823,53 @@ def load_scenario_definition(
             terminal_margin=3.0,
         )
 
+    if name == "parking_ramp_loop":
+        # Straight entry ramp -> loop most of the way around a circle ->
+        # straight exit ramp, walled in on both sides the entire way (a
+        # parking-garage-style ramp loop). This is a flat 2D plane (no Z
+        # axis), so a near-360 deg sweep makes the entry/exit ramps
+        # physically overlap the walled corridor near the start -- there is
+        # no elevation change to separate them like a real multi-level ramp.
+        # 270 deg with a 30 m circle radius keeps the entry- and exit-ramp
+        # walls at least ~11 m apart (checked numerically, well clear of the
+        # 4 m corridor width) while still reading as "most of the way
+        # around a big circle".
+        ramp_length = 15.0
+        transition_length = 4.0
+        circle_radius = 30.0
+        sweep_deg = 270.0
+        corridor_half_width = 2.0
+
+        path = build_ramp_loop_path(
+            ramp_length=ramp_length,
+            transition_length=transition_length,
+            circle_radius=circle_radius,
+            sweep_deg=sweep_deg,
+        )
+        phase = ScenarioPhase(
+            name="parking_ramp_loop",
+            path=path,
+            cruise_speed=1.2,
+        )
+
+        obstacles = tuple(
+            wall_segments_along_path(
+                path, 0.0, path.total_length, lateral_offset=corridor_half_width,
+            )
+            + wall_segments_along_path(
+                path, 0.0, path.total_length, lateral_offset=-corridor_half_width,
+            )
+        )
+        return ScenarioDefinition(
+            name=name, phases=(phase,), obstacles=obstacles, gates=tuple(),
+            terminal_margin=3.0,
+        )
+
     supported = (
         "stadium, crab_switch, reverse_switch, hdmap_crab1_switch, fmtc_demo, hdmap_lap_switch, s_curve, "
         "straight_long, obstacle_avoidance, terminal_safe_region, s_curve_obstacles, "
         "alternating_gate_corridor, curved_gate_maze, winding_obstacle_course, "
-        "winding_obstacle_course_wide_gates, "
+        "winding_obstacle_course_wide_gates, parking_ramp_loop, "
         "narrow_22m_stop_corridor, narrow_28m_corridor, narrow_offset_corridor"
     )
     raise ValueError(f"Unsupported scenario '{scenario_name}'. Supported: {supported}")
