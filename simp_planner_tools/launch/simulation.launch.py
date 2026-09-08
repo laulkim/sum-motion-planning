@@ -24,6 +24,13 @@ def _resolved_nodes(context):
         LaunchConfiguration("command_frequency_hz").perform(context)
     )
     kinematics_model = LaunchConfiguration("kinematics_model").perform(context)
+    tracking_parameters = {
+        "tracking_enabled": LaunchConfiguration("tracking_enabled").perform(context).lower() == "true",
+        **{
+            name: float(LaunchConfiguration(name).perform(context))
+            for name in ("tracking_longitudinal_kp", "tracking_lateral_kp", "tracking_heading_kp")
+        },
+    }
     requested_footprint_circle_count = int(
         LaunchConfiguration("oriented_footprint_circle_count").perform(context)
     )
@@ -98,6 +105,7 @@ def _resolved_nodes(context):
             parameters=[
                 {
                     "command_frequency_hz": command_frequency_hz,
+                    **tracking_parameters,
                     "oriented_footprint_circle_count": footprint_circle_count,
                     "oriented_footprint_translation_step_m": footprint_translation_step,
                     "oriented_footprint_yaw_step_deg": footprint_yaw_step,
@@ -136,6 +144,10 @@ def generate_launch_description() -> LaunchDescription:
                 description="Vehicle-side drive-mode transition duration.",
             ),
             DeclareLaunchArgument("command_frequency_hz", default_value="100.0"),
+            DeclareLaunchArgument("tracking_enabled", default_value="true", choices=["true", "false"]),
+            DeclareLaunchArgument("tracking_longitudinal_kp", default_value="0.08"),
+            DeclareLaunchArgument("tracking_lateral_kp", default_value="0.06"),
+            DeclareLaunchArgument("tracking_heading_kp", default_value="0.15"),
             DeclareLaunchArgument(
                 "kinematics_model",
                 default_value="ideal",

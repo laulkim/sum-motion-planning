@@ -22,6 +22,10 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("map_file", default_value=default_map),
             DeclareLaunchArgument("target_speed", default_value="2.0"),
             DeclareLaunchArgument("save_period", default_value="10.0"),
+            DeclareLaunchArgument("tracking_enabled", default_value="true", choices=["true", "false"]),
+            DeclareLaunchArgument("tracking_longitudinal_kp", default_value="0.8"),
+            DeclareLaunchArgument("tracking_lateral_kp", default_value="0.6"),
+            DeclareLaunchArgument("tracking_heading_kp", default_value="1.5"),
             DeclareLaunchArgument(
                 "kinematics_model",
                 default_value="ideal",
@@ -55,6 +59,13 @@ def generate_launch_description() -> LaunchDescription:
                 executable="planner_node_cpp",
                 name="planner_node_cpp",
                 output="screen",
+                parameters=[{
+                    "tracking_enabled": ParameterValue(LaunchConfiguration("tracking_enabled"), value_type=bool),
+                    **{
+                        name: ParameterValue(LaunchConfiguration(name), value_type=float)
+                        for name in ("tracking_longitudinal_kp", "tracking_lateral_kp", "tracking_heading_kp")
+                    },
+                }],
             ),
             Node(
                 package="simp_planner_tools",

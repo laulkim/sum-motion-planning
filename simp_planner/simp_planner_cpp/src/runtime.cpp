@@ -182,7 +182,145 @@ BodyCommand sample_body_command(const AllocationResult& allocation,
   return {vx, vy, yaw_rate, speed, acceleration, jerk, heading_acceleration,
           motion_heading, kappa, motion_heading_rate, beta, beta_rate,
           yaw_acceleration, start_x, start_y, motion_heading, end_x, end_y,
-          end_heading, interval, interval, action_index, elapsed};
+          end_heading, interval, interval, action_index, elapsed, {}};
+}
+
+void TrackingConfig::validate() const {
+  for (const double value : {longitudinal_kp, lateral_kp, heading_kp,
+                            max_speed_correction, max_heading_rate_correction,
+                            stop_speed_threshold}) {
+    if (!std::isfinite(value) || value < 0.0)
+      throw std::invalid_argument("tracking gains and limits must be finite and non-negative");
+  }
+  if (!std::isfinite(odom_timeout_sec) || odom_timeout_sec <= 0.0)
+    throw std::invalid_argument("tracking odom timeout must be finite and positive");
+}
+
+BodyCommand apply_tracking_feedback(
+    const BodyCommand& reference, const PlannerState& measured,
+    const TrackingConfig& config, const ConstraintConfig& constraints,
+    double execution_dt, const BodyCommand* previous_command) {
+  BodyCommand command = reference;
+  command.tracking = {};
+  // A stationary reference, safety stop, or disabled controller must never be
+  // turned into a departure/pivot by a residual position or heading error.
+  if (!config.enabled || reference.planned_speed <= config.stop_speed_threshold)
+    return command;
+  if (!(execution_dt > 0.0) || !std::isfinite(execution_dt))
+    throw std::invalid_argument("tracking execution dt must be finite and positive");
+  if (!std::isfinite(measured.x) || !std::isfinite(measured.y) ||
+      !std::isfinite(measured.chi) || !std::isfinite(reference.segment_start_x) ||
+      !std::isfinite(reference.segment_start_y)) return command;
+
+  auto& feedback = command.tracking;
+  const double dx = reference.segment_start_x - measured.x;
+  const double dy = reference.segment_start_y - measured.y;
+  const double c = std::cos(reference.motion_heading);
+  const double s = std::sin(reference.motion_heading);
+  feedback.active = true;
+  feedback.longitudinal_error = c * dx + s * dy;
+  feedback.lateral_error = -s * dx + c * dy;
+  feedback.heading_error = wrap_angle(reference.motion_heading - measured.chi);
+  const double speed_correction_limit = std::min(config.max_speed_correction,
+      reference.planned_speed - config.stop_speed_threshold);
+  const double speed_delta = std::clamp(
+      config.longitudinal_kp * feedback.longitudinal_error,
+      -speed_correction_limit, speed_correction_limit);
+  const TrackingFeedback previous = previous_command
+      ? previous_command->tracking : TrackingFeedback{};
+  // Rate-limit the P correction so sensor noise does not produce acceleration
+  // and jerk spikes. The reference consumes part of the available budget.
+  const double accel_low = std::max(
+      constraints.a_min - reference.planned_acceleration,
+      previous.speed_correction_rate +
+          (-constraints.jerk_max - reference.planned_jerk) * execution_dt);
+  const double accel_high = std::min(
+      constraints.a_max - reference.planned_acceleration,
+      previous.speed_correction_rate +
+          (constraints.jerk_max - reference.planned_jerk) * execution_dt);
+  // Begin releasing correction acceleration before reaching its target;
+  // clamping only the next speed would create a jerk-limited limit cycle.
+  const auto approach_rate = [execution_dt](double error, double jerk_limit) {
+    const double step = jerk_limit * execution_dt;
+    const double braking_rate = std::sqrt(step * step + 2.0 * jerk_limit * std::abs(error)) - step;
+    return std::copysign(std::min(std::abs(error) / execution_dt, braking_rate), error);
+  };
+  const double target_accel = approach_rate(speed_delta - previous.speed_correction,
+      std::max(0.0, constraints.jerk_max - std::abs(reference.planned_jerk)));
+  const double limited_speed_delta = accel_low <= accel_high
+      ? previous.speed_correction + std::clamp(target_accel, accel_low, accel_high) * execution_dt
+      : previous.speed_correction;
+  const double speed = std::clamp(reference.planned_speed + std::clamp(
+                                    limited_speed_delta, -speed_correction_limit,
+                                    speed_correction_limit),
+                                0.0, constraints.v_max);
+  const AllocationLimits allocation_limits;
+  // Fade in angular feedback over the allocator's existing low-speed range
+  // to avoid a position/heading correction becoming a near-stationary pivot.
+  const double heading_activation = std::clamp(
+      (std::min(speed, reference.planned_speed) - config.stop_speed_threshold) /
+          std::max(1.0e-6, allocation_limits.allocation_active_speed - config.stop_speed_threshold),
+      0.0, 1.0);
+  const double heading_delta = heading_activation * std::clamp(
+      config.lateral_kp * feedback.lateral_error +
+          config.heading_kp * feedback.heading_error,
+      -config.max_heading_rate_correction, config.max_heading_rate_correction);
+  // Scale curvature feedforward with the corrected speed. Bound both motion
+  // heading rate and body yaw rate while preserving the allocated beta rate.
+  const double beta_rate = speed > 1.0e-12 ? reference.beta_rate : 0.0;
+  const double heading_limit = std::min(
+      constraints.heading_rate_max, constraints.a_lat_max / std::max(speed, 1.0e-6));
+  const double yaw_limit = allocation_limits.yaw_rate_max;
+  const double low = std::max(-heading_limit, beta_rate - yaw_limit);
+  const double high = std::min(heading_limit, beta_rate + yaw_limit);
+  // The nominal allocator should make this interval feasible. If it is not,
+  // keep its command rather than calling clamp with an inverted interval.
+  if (low > high) return reference;
+  const double previous_yaw_accel = previous_command
+      ? previous_command->yaw_acceleration : reference.yaw_acceleration;
+  const double yaw_accel_low = std::max(-allocation_limits.yaw_accel_max,
+      previous_yaw_accel - allocation_limits.yaw_jerk_max * execution_dt);
+  const double yaw_accel_high = std::min(allocation_limits.yaw_accel_max,
+      previous_yaw_accel + allocation_limits.yaw_jerk_max * execution_dt);
+  const double correction_low = previous.heading_rate_correction +
+      (yaw_accel_low - reference.yaw_acceleration) * execution_dt;
+  const double correction_high = previous.heading_rate_correction +
+      (yaw_accel_high - reference.yaw_acceleration) * execution_dt;
+  const double desired_correction = speed * reference.motion_curvature + heading_delta
+      - reference.motion_heading_rate;
+  const double target_yaw_accel = approach_rate(
+      desired_correction - previous.heading_rate_correction, allocation_limits.yaw_jerk_max);
+  const double limited_correction = correction_low <= correction_high
+      ? std::clamp(previous.heading_rate_correction + target_yaw_accel * execution_dt,
+                   correction_low, correction_high)
+      : previous.heading_rate_correction;
+  const double heading_rate = speed > 1.0e-12
+      ? std::clamp(reference.motion_heading_rate + limited_correction, low, high)
+      : 0.0;
+
+  feedback.speed_correction = speed - reference.planned_speed;
+  feedback.heading_rate_correction = heading_rate - reference.motion_heading_rate;
+  feedback.speed_correction_rate =
+      (feedback.speed_correction - previous.speed_correction) / execution_dt;
+  command.planned_speed = speed;
+  command.planned_acceleration += feedback.speed_correction_rate;
+  command.planned_jerk +=
+      (feedback.speed_correction_rate - previous.speed_correction_rate) / execution_dt;
+  command.planned_heading_acceleration +=
+      (feedback.heading_rate_correction - previous.heading_rate_correction) / execution_dt;
+  command.motion_heading_rate = heading_rate;
+  command.motion_curvature = speed > 1.0e-12 ? heading_rate / speed : 0.0;
+  command.beta_rate = beta_rate;
+  command.vx = speed * std::cos(command.beta);
+  command.vy = speed * std::sin(command.beta);
+  command.yaw_rate = heading_rate - beta_rate;
+  command.yaw_acceleration +=
+      (feedback.heading_rate_correction - previous.heading_rate_correction) / execution_dt;
+  if (previous_command) {
+    command.yaw_acceleration =
+        (command.yaw_rate - previous_command->yaw_rate) / execution_dt;
+  }
+  return command;
 }
 
 std::int64_t align_time_ns(std::int64_t time_ns, double period_sec) {
@@ -200,7 +338,8 @@ PredictedHandoverState predict_handover_state(
     const AllocationResult* allocation,
     const std::vector<PlannerAction>* planned_actions,
     double integration_dt, double safety_deceleration_limit,
-    double safety_jerk_limit) {
+    double safety_jerk_limit, const TrackingConfig* tracking_config,
+    const ConstraintConfig& constraints, const BodyCommand* previous_command) {
   if (!std::isfinite(current_body_yaw) || !(integration_dt > 0.0) ||
       !std::isfinite(integration_dt) || handover_time_ns < current_state_time_ns) {
     throw std::invalid_argument("invalid handover prediction input");
@@ -217,6 +356,21 @@ PredictedHandoverState predict_handover_state(
   double x = current_state.x;
   double y = current_state.y;
   double body_yaw = current_body_yaw;
+  std::optional<BodyCommand> previous = previous_command
+      ? std::optional<BodyCommand>(*previous_command) : std::nullopt;
+  auto sample_tracked = [&](double elapsed, double dt) {
+    auto command = sample_body_command(*allocation, *planned_actions, elapsed, integration_dt);
+    if (tracking_config) {
+      PlannerState measured = current_state;
+      measured.x = x;
+      measured.y = y;
+      measured.chi = wrap_angle(body_yaw + command.beta);
+      command = apply_tracking_feedback(command, measured, *tracking_config,
+                                        constraints, dt, previous ? &*previous : nullptr);
+    }
+    previous = command;
+    return command;
+  };
   auto integrate = [&](const BodyCommand& command, double dt) {
     const double yaw_mid = body_yaw + 0.5 * command.yaw_rate * dt;
     x += (std::cos(yaw_mid) * command.vx - std::sin(yaw_mid) * command.vy) * dt;
@@ -227,13 +381,17 @@ PredictedHandoverState predict_handover_state(
   const double active_target = std::min(end_elapsed, trajectory_end);
   while (active_elapsed < active_target - 1.0e-12) {
     const double dt = std::min(integration_dt, active_target - active_elapsed);
-    integrate(sample_body_command(*allocation, *planned_actions,
-                                  active_elapsed + 0.5 * dt, integration_dt), dt);
+    // Feedback uses the reference at the pose's own time. The historical
+    // feedforward-only prediction retains midpoint sampling.
+    integrate(tracking_config && tracking_config->enabled
+                  ? sample_tracked(active_elapsed, dt)
+                  : sample_body_command(*allocation, *planned_actions,
+                                        active_elapsed + 0.5 * dt, integration_dt), dt);
     active_elapsed += dt;
   }
   BodyCommand expected;
   if (end_elapsed <= trajectory_end + 1.0e-12) {
-    expected = sample_body_command(*allocation, *planned_actions, end_elapsed, integration_dt);
+    expected = sample_tracked(end_elapsed, integration_dt);
   } else {
     if (!(safety_deceleration_limit > 0.0) || !(safety_jerk_limit > 0.0))
       throw std::invalid_argument("invalid safety braking limits");
@@ -310,7 +468,7 @@ BodyCommand JerkLimitedSafetyStop::sample() const {
   const double nan = std::numeric_limits<double>::quiet_NaN();
   return {vx, vy, heading_rate, speed, acceleration, jerk, heading_accel,
           motion_heading_, curvature_, heading_rate, beta_, 0.0, heading_accel,
-          nan, nan, motion_heading_, nan, nan, motion_heading_, 0, 0, 0, elapsed_};
+          nan, nan, motion_heading_, nan, nan, motion_heading_, 0, 0, 0, elapsed_, {}};
 }
 
 void JerkLimitedSafetyStop::advance(double dt) {
