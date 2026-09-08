@@ -23,6 +23,7 @@ def _resolved_nodes(context):
     command_frequency_hz = float(
         LaunchConfiguration("command_frequency_hz").perform(context)
     )
+    kinematics_model = LaunchConfiguration("kinematics_model").perform(context)
     requested_footprint_circle_count = int(
         LaunchConfiguration("oriented_footprint_circle_count").perform(context)
     )
@@ -71,6 +72,7 @@ def _resolved_nodes(context):
                     "initial_yaw": initial_body_yaw,
                     "initial_drive_mode": first_mode,
                     "mode_transition_duration_sec": mode_transition_duration,
+                    "kinematics_model": kinematics_model,
                 }
             ],
         ),
@@ -134,6 +136,12 @@ def generate_launch_description() -> LaunchDescription:
                 description="Vehicle-side drive-mode transition duration.",
             ),
             DeclareLaunchArgument("command_frequency_hz", default_value="100.0"),
+            DeclareLaunchArgument(
+                "kinematics_model",
+                default_value="ideal",
+                choices=["ideal", "noisy"],
+                description="Select ideal or vehicle-response/noisy kinematics.",
+            ),
             DeclareLaunchArgument(
                 "oriented_footprint_circle_count", default_value="0",
                 description="0 uses the scenario-recommended footprint resolution.",

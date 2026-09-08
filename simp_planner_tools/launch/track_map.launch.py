@@ -11,6 +11,7 @@ def generate_launch_description() -> LaunchDescription:
     target_speed = LaunchConfiguration("target_speed")
     save_period = LaunchConfiguration("save_period")
     debug_output_dir = LaunchConfiguration("debug_output_dir")
+    kinematics_model = LaunchConfiguration("kinematics_model")
 
     default_map = PathJoinSubstitution(
         [FindPackageShare("simp_planner_tools"), "maps", "stadium_track.csv"]
@@ -22,6 +23,11 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("target_speed", default_value="2.0"),
             DeclareLaunchArgument("save_period", default_value="10.0"),
             DeclareLaunchArgument(
+                "kinematics_model",
+                default_value="ideal",
+                choices=["ideal", "noisy"],
+            ),
+            DeclareLaunchArgument(
                 "debug_output_dir",
                 default_value="/home/sum/Desktop/simp_planner/simp_planner_debug",
             ),
@@ -30,6 +36,7 @@ def generate_launch_description() -> LaunchDescription:
                 executable="planar_velocity_sim_node",
                 name="planar_velocity_sim_node",
                 output="screen",
+                parameters=[{"kinematics_model": kinematics_model}],
             ),
             Node(
                 package="simp_planner_tools",

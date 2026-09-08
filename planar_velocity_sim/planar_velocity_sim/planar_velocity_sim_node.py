@@ -13,6 +13,7 @@ from simp_planner_msgs.msg import DriveModeState
 from std_msgs.msg import UInt8
 
 from .kinematics import integrate_body_velocity
+from .kinematics_noise import KinematicsNoiseModel
 from .mode_transition import DriveModeTransitionModel, VALID_DRIVE_MODES
 
 
@@ -36,6 +37,7 @@ class PlanarVelocitySimNode(Node):
         self.declare_parameter("mode_state_topic", "/vehicle/drive_mode_state")
         self.declare_parameter("odom_frame", "odom")
         self.declare_parameter("base_frame", "base_link")
+        self.declare_parameter("kinematics_model", "ideal")
 
         update_rate_hz = float(self.get_parameter("update_rate_hz").value)
         mode_state_rate_hz = float(self.get_parameter("mode_state_rate_hz").value)
@@ -47,6 +49,11 @@ class PlanarVelocitySimNode(Node):
         self.yaw = float(self.get_parameter("initial_yaw").value)
         self.odom_frame = str(self.get_parameter("odom_frame").value)
         self.base_frame = str(self.get_parameter("base_frame").value)
+        self.kinematics_model_name = str(
+            self.get_parameter("kinematics_model").value
+        ).strip().lower()
+        if self.kinematics_model_name not in ("ideal", "noisy"):
+            raise ValueError("kinematics_model must be 'ideal' or 'noisy'")
 
         self.command_vx = 0.0
         self.command_vy = 0.0
@@ -54,6 +61,12 @@ class PlanarVelocitySimNode(Node):
         self.applied_vx = 0.0
         self.applied_vy = 0.0
         self.applied_yaw_rate = 0.0
+        self.beta = 0.0
+        self.kinematics_noise = (
+            KinematicsNoiseModel()
+            if self.kinematics_model_name == "noisy"
+            else None
+        )
 
         initial_mode = int(self.get_parameter("initial_drive_mode").value)
         if initial_mode not in VALID_DRIVE_MODES:
@@ -109,7 +122,10 @@ class PlanarVelocitySimNode(Node):
         if requested not in VALID_DRIVE_MODES:
             self.get_logger().error(f"Unsupported drive-mode command: {requested}")
             return
-        speed = math.hypot(self.applied_vx, self.applied_vy)
+        if self.kinematics_noise is not None:
+            speed = self.kinematics_noise.actual_speed
+        else:
+            speed = math.hypot(self.applied_vx, self.applied_vy)
         accepted = self.mode_model.command(
             requested, measured_speed=speed, now_sec=self.now_seconds()
         )
@@ -155,20 +171,41 @@ class PlanarVelocitySimNode(Node):
             )
             self.publish_mode_state()
 
-        self.applied_vx, self.applied_vy, self.applied_yaw_rate = (
-            self.mode_model.applied_velocity(
-                self.command_vx, self.command_vy, self.command_yaw_rate
+        target_vx, target_vy, target_yaw_rate = self.mode_model.applied_velocity(
+            self.command_vx, self.command_vy, self.command_yaw_rate
+        )
+        if self.kinematics_noise is not None:
+            (
+                self.x,
+                self.y,
+                self.yaw,
+                self.applied_vx,
+                self.applied_vy,
+                self.applied_yaw_rate,
+                self.beta,
+            ) = self.kinematics_noise.step(
+                self.x,
+                self.y,
+                self.yaw,
+                target_vx,
+                target_vy,
+                target_yaw_rate,
+                dt,
             )
-        )
-        self.x, self.y, self.yaw = integrate_body_velocity(
-            self.x,
-            self.y,
-            self.yaw,
-            self.applied_vx,
-            self.applied_vy,
-            self.applied_yaw_rate,
-            dt,
-        )
+        else:
+            self.applied_vx = target_vx
+            self.applied_vy = target_vy
+            self.applied_yaw_rate = target_yaw_rate
+            self.beta = math.atan2(self.applied_vy, self.applied_vx)
+            self.x, self.y, self.yaw = integrate_body_velocity(
+                self.x,
+                self.y,
+                self.yaw,
+                self.applied_vx,
+                self.applied_vy,
+                self.applied_yaw_rate,
+                dt,
+            )
 
         odom = Odometry()
         odom.header.stamp = now.to_msg()
@@ -193,7 +230,8 @@ def main(args=None) -> None:
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
