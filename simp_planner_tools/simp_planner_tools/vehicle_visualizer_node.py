@@ -5,10 +5,16 @@
       다시 그려서 publish한다: 채운 CUBE 몸체(진한 남색) + 위에 겹치는 굵은
       LINE_STRIP 테두리(검정에 가까운 진한 색). debug_plot_node.py의
       vehicle_polygon()과 동일한 규약: 위치는 차량 중심, 앞뒤/좌우 대칭
-      (vehicle_length x vehicle_width).
+      (vehicle_length x vehicle_width). 같은 MarkerArray에 차량↔플래너 사이
+      드라이브 모드 상태 전이 값(아래 참고)을 보여주는 텍스트 마커도 함께
+      publish한다.
   /viz/traveled_path      (nav_msgs/Path)
       /odom 포즈가 min_recorded_distance(m) 이상 움직일 때마다 누적해서,
       지금까지 실제로 지나온 경로를 계속 자라나는 Path로 publish한다.
+
+  드라이브 모드 상태 전이 텍스트는 /vehicle/drive_mode_state(차량->플래너
+  피드백)의 current_mode/requested_mode/transition_in_progress/
+  transition_complete 4개 필드를 그대로 보여준다.
 """
 from __future__ import annotations
 
@@ -20,7 +26,16 @@ from nav_msgs.msg import Odometry
 from nav_msgs.msg import Path as PathMessage
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from simp_planner_msgs.msg import DriveModeState
 from visualization_msgs.msg import Marker, MarkerArray
+
+MODE_NAMES = {0: "FORWARD", 1: "REVERSE", 2: "LEFT", 3: "RIGHT"}
+
+
+def mode_name(value: int | None) -> str:
+    if value is None:
+        return "?"
+    return MODE_NAMES.get(int(value), str(value))
 
 
 def quaternion_to_yaw(x: float, y: float, z: float, w: float) -> float:
@@ -52,11 +67,15 @@ class VehicleVisualizerNode(Node):
         self.declare_parameter("vehicle_width", 2.0)
         self.declare_parameter("min_recorded_distance", 0.10)
         self.declare_parameter("max_path_points", 20000)
+        self.declare_parameter("status_text_offset_m", 8.0)
+        self.declare_parameter("status_text_scale", 2.5)
 
         self.vehicle_length = float(self.get_parameter("vehicle_length").value)
         self.vehicle_width = float(self.get_parameter("vehicle_width").value)
         self.min_recorded_distance = float(self.get_parameter("min_recorded_distance").value)
         self.max_path_points = int(self.get_parameter("max_path_points").value)
+        self.status_text_offset_m = float(self.get_parameter("status_text_offset_m").value)
+        self.status_text_scale = float(self.get_parameter("status_text_scale").value)
 
         static_qos = QoSProfile(
             depth=1,
@@ -68,8 +87,27 @@ class VehicleVisualizerNode(Node):
 
         self.traveled_path = PathMessage()
         self.last_recorded_xy: tuple[float, float] | None = None
+        self.vehicle_mode_state: DriveModeState | None = None
 
         self.create_subscription(Odometry, "/odom", self.odom_callback, 50)
+        self.create_subscription(
+            DriveModeState, "/vehicle/drive_mode_state", self.mode_state_callback, static_qos
+        )
+
+    def mode_state_callback(self, message: DriveModeState) -> None:
+        self.vehicle_mode_state = message
+
+    def drive_mode_status_text(self) -> str:
+        lines: list[str] = []
+        state = self.vehicle_mode_state
+        if state is None:
+            lines.append("vehicle: (no feedback yet)")
+        else:
+            lines.append(f"vehicle current: {mode_name(state.current_mode)}")
+            lines.append(f"vehicle requested: {mode_name(state.requested_mode)}")
+            lines.append(f"in_progress: {state.transition_in_progress}")
+            lines.append(f"complete: {state.transition_complete}")
+        return "\n".join(lines)
 
     def odom_callback(self, message: Odometry) -> None:
         frame_id = message.header.frame_id or "odom"
@@ -116,7 +154,27 @@ class VehicleVisualizerNode(Node):
             )
         ]
 
-        self.footprint_pub.publish(MarkerArray(markers=[body, outline]))
+        # Deliberately offset away from the vehicle footprint (not stacked on
+        # top of it) in a fixed world-frame direction, and rendered large --
+        # a marker sized/placed to sit inside the vehicle box is unreadable
+        # once the view is zoomed out to see the whole scenario.
+        status_text = Marker()
+        status_text.header = body.header
+        status_text.ns = "drive_mode_status"
+        status_text.id = 0
+        status_text.type = Marker.TEXT_VIEW_FACING
+        status_text.action = Marker.ADD
+        status_text.pose.position.x = x
+        status_text.pose.position.y = y + self.status_text_offset_m
+        status_text.pose.position.z = 2.0
+        status_text.scale.z = self.status_text_scale
+        status_text.color.r = 0.85
+        status_text.color.g = 0.05
+        status_text.color.b = 0.05
+        status_text.color.a = 1.0
+        status_text.text = self.drive_mode_status_text()
+
+        self.footprint_pub.publish(MarkerArray(markers=[body, outline, status_text]))
 
         moved_enough = (
             self.last_recorded_xy is None
