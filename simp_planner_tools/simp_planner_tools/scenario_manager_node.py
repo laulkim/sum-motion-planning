@@ -14,7 +14,6 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as PathMessage
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from simp_planner_msgs.msg import DriveModeState
 from simp_planner_msgs.msg import ReferencePath as ReferencePathMessage
 from std_msgs.msg import Float64, String, UInt8
 
@@ -44,7 +43,6 @@ def yaw_to_quaternion(yaw: float) -> tuple[float, float, float, float]:
 class ScenarioState(Enum):
     RUNNING = auto()
     STOPPING = auto()
-    WAITING_MODE_CONFIRMATION = auto()
     COMPLETE = auto()
 
 
@@ -158,19 +156,12 @@ class ScenarioManagerNode(Node):
             String, "/scenario/status", static_qos
         )
         self.create_subscription(Odometry, "/odom", self.odom_callback, 50)
-        self.create_subscription(
-            DriveModeState,
-            "/vehicle/drive_mode_state",
-            self.vehicle_mode_callback,
-            static_qos,
-        )
 
         self.phase_paths = [phase.path for phase in self.scenario.phases]
         self.phase_index = 0
         for index, path in enumerate(tuple(self.phase_paths)):
             self.phase_paths[index] = self.execution_path_for_phase(index, path)
         self.state = ScenarioState.RUNNING
-        self.mode_wait_start_time: Optional[float] = None
         self.last_projection: Optional[PathProjection] = None
         self.last_published_s: Optional[float] = None
         self.last_mode: Optional[int] = None
@@ -188,10 +179,6 @@ class ScenarioManagerNode(Node):
         self.startup_republish_count = 0
         self.current_map_yaw = math.nan
         self.current_motion_yaw = math.nan
-        self.vehicle_current_mode: Optional[int] = None
-        self.vehicle_requested_mode: Optional[int] = None
-        self.vehicle_transition_in_progress = False
-        self.vehicle_transition_complete = False
 
         self.heartbeat_timer = self.create_timer(0.5, self.publish_heartbeat)
         self.costmap_timer = self.create_timer(
@@ -237,18 +224,12 @@ class ScenarioManagerNode(Node):
         return float(self.active_phase.cruise_speed)
 
     def current_target_speed(self) -> float:
-        if self.state in (
-            ScenarioState.WAITING_MODE_CONFIRMATION,
-            ScenarioState.COMPLETE,
-        ):
+        if self.state == ScenarioState.COMPLETE:
             return 0.0
         return self.active_cruise_speed()
 
     def current_mode(self) -> int:
         return int(self.active_phase.mode)
-
-    def elapsed_seconds(self) -> float:
-        return self.get_clock().now().nanoseconds * 1.0e-9
 
     def publish_command(self, *, force: bool = False) -> None:
         target_speed = self.current_target_speed()
@@ -438,16 +419,15 @@ class ScenarioManagerNode(Node):
             )
         self.phase_index = next_index
         self.phase_switch_count += 1
-        self.state = ScenarioState.WAITING_MODE_CONFIRMATION
-        self.mode_wait_start_time = self.elapsed_seconds()
+        self.state = ScenarioState.RUNNING
         self.last_projection = None
         self.last_published_s = None
         self.publish_active_reference(0.0, force=True)
         self.publish_global_path()
         self.publish_command(force=True)
         self.get_logger().info(
-            f"Stopped and requested phase '{self.active_phase.name}', "
-            f"requested_mode={self.current_mode()}; waiting for vehicle confirmation"
+            f"Stopped and started phase '{self.active_phase.name}', "
+            f"requested_mode={self.current_mode()}"
         )
 
     def update_scenario_state(
@@ -466,10 +446,7 @@ class ScenarioManagerNode(Node):
         self.current_stop_error = stop_s - float(projection.s)
         self.current_remaining = max(0.0, self.current_stop_error)
 
-        if self.state in (
-            ScenarioState.WAITING_MODE_CONFIRMATION,
-            ScenarioState.COMPLETE,
-        ):
+        if self.state == ScenarioState.COMPLETE:
             return
 
         # The active reference is clipped exactly at the phase stop target.
@@ -497,28 +474,6 @@ class ScenarioManagerNode(Node):
         if captured:
             self.switch_to_next_phase(x, y, body_yaw)
 
-    def vehicle_mode_callback(self, message: DriveModeState) -> None:
-        self.vehicle_current_mode = int(message.current_mode)
-        self.vehicle_requested_mode = int(message.requested_mode)
-        self.vehicle_transition_in_progress = bool(message.transition_in_progress)
-        self.vehicle_transition_complete = bool(message.transition_complete)
-        if (
-            self.state == ScenarioState.WAITING_MODE_CONFIRMATION
-            and self.vehicle_transition_complete
-            and not self.vehicle_transition_in_progress
-            and self.vehicle_current_mode == self.current_mode()
-        ):
-            self.state = ScenarioState.RUNNING
-            self.mode_wait_start_time = None
-            self.last_published_s = None
-            self.publish_active_reference(0.0, force=True)
-            self.publish_command(force=True)
-            self.get_logger().info(
-                f"Vehicle confirmed mode={self.vehicle_current_mode}. "
-                f"Starting phase '{self.active_phase.name}'."
-            )
-        self.publish_status()
-
     def publish_status(self) -> None:
         payload = {
             "scenario": self.scenario.name,
@@ -527,17 +482,12 @@ class ScenarioManagerNode(Node):
             "phase_count": len(self.scenario.phases),
             "phase_name": self.active_phase.name,
             "requested_drive_mode": self.current_mode(),
-            "vehicle_current_mode": self.vehicle_current_mode,
-            "vehicle_requested_mode": self.vehicle_requested_mode,
-            "vehicle_transition_in_progress": self.vehicle_transition_in_progress,
-            "vehicle_transition_complete": self.vehicle_transition_complete,
             "target_speed": self.current_target_speed(),
             "measured_speed": self.current_measured_speed,
             "remaining_to_terminal": self.current_remaining,
             "signed_stop_error": self.current_stop_error,
             "switch_s": self.active_phase.switch_s,
             "stop_request_distance": self.scenario.stop_request_distance,
-            "mode_confirmation_wait_sec": (0.0 if self.mode_wait_start_time is None else max(0.0, self.elapsed_seconds() - self.mode_wait_start_time)),
             "phase_switch_count": self.phase_switch_count,
             "path_publish_count": self.path_publish_count,
             "obstacle_count": len(self.scenario.obstacles),
