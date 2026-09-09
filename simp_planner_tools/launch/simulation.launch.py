@@ -10,7 +10,9 @@ from launch_ros.actions import Node
 
 from simp_planner_tools.scenario_definition import load_scenario_definition
 
-_HDMAP_DIR = "/home/sum/Desktop/simp_planner/HDMap"
+# Relative to this package's own installed share directory (see setup.py),
+# not an absolute path tied to any one machine/user.
+_HDMAP_DIR = os.path.join(get_package_share_directory("simp_planner_tools"), "HDMap")
 
 
 def _resolved_nodes(context):

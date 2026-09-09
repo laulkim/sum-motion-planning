@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 
 import rclpy
+from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import Point
 from osgeo import ogr
 from rclpy.node import Node
@@ -79,13 +80,16 @@ def load_lane_markers(
 class HDMapLaneVisualizerNode(Node):
     def __init__(self) -> None:
         super().__init__("hdmap_lane_visualizer_node")
+        hdmap_dir = os.path.join(
+            get_package_share_directory("simp_planner_tools"), "HDMap"
+        )
         self.declare_parameter(
             "shapefile_path",
-            "/home/sum/Desktop/simp_planner/HDMap/HDMAP/B2_SURFACELINEMARK.shp",
+            os.path.join(hdmap_dir, "HDMAP", "B2_SURFACELINEMARK.shp"),
         )
         self.declare_parameter(
             "origin_file",
-            "/home/sum/Desktop/simp_planner/HDMap/output/hdmap_lap_switch_origin.txt",
+            os.path.join(hdmap_dir, "output", "hdmap_lap_switch_origin.txt"),
         )
         self.declare_parameter("frame_id", "odom")
 

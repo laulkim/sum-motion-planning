@@ -15,6 +15,8 @@ setup(
         (join("share", package_name, "maps"), glob("maps/*.csv")),
         (join("share", package_name, "launch"), glob("launch/*.launch.py")),
         (join("share", package_name, "rviz"), glob("rviz/*.rviz")),
+        (join("share", package_name, "HDMap", "HDMAP"), glob("../HDMap/HDMAP/*")),
+        (join("share", package_name, "HDMap", "output"), glob("../HDMap/output/*")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
