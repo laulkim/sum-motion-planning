@@ -168,9 +168,12 @@ class VehicleVisualizerNode(Node):
         status_text.pose.position.y = y + self.status_text_offset_m
         status_text.pose.position.z = 2.0
         status_text.scale.z = self.status_text_scale
-        status_text.color.r = 0.85
-        status_text.color.g = 0.05
-        status_text.color.b = 0.05
+        # Deep teal: distinct from every other color already in the scene
+        # (traveled path orange, global path purple, active reference green,
+        # selected trajectory red, HD map lane yellow/blue, vehicle navy).
+        status_text.color.r = 0.0
+        status_text.color.g = 0.55
+        status_text.color.b = 0.55
         status_text.color.a = 1.0
         status_text.text = self.drive_mode_status_text()
 
