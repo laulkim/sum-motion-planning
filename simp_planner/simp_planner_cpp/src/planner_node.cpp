@@ -144,14 +144,6 @@ class PlannerNodeCpp final : public rclcpp::Node {
     tracking_config_.longitudinal_kp = declare_parameter<double>("tracking_longitudinal_kp", 0.8);
     tracking_config_.lateral_kp = declare_parameter<double>("tracking_lateral_kp", 0.6);
     tracking_config_.heading_kp = declare_parameter<double>("tracking_heading_kp", 1.5);
-    tracking_config_.max_speed_correction =
-        declare_parameter<double>("tracking_max_speed_correction_mps", 0.5);
-    tracking_config_.max_heading_rate_correction =
-        declare_parameter<double>("tracking_max_heading_rate_correction_radps", 0.35);
-    tracking_config_.stop_speed_threshold =
-        declare_parameter<double>("tracking_stop_speed_threshold_mps", 0.03);
-    tracking_config_.odom_timeout_sec =
-        declare_parameter<double>("tracking_odom_timeout_sec", 0.25);
     tracking_config_.validate();
     footprint_circle_count_ = declare_parameter<int>("oriented_footprint_circle_count", 3);
     footprint_translation_step_m_ = declare_parameter<double>("oriented_footprint_translation_step_m", 0.20);
@@ -620,11 +612,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
               std::llround(handover_timing_.recommended_lead_sec() * 1.0e9)),
           command_dt_);
       std::shared_ptr<const ExecutablePlan> active;
-      std::optional<BodyCommand> previous_command;
       {
         std::lock_guard<std::mutex> lock(execution_mutex_);
         active = active_plan_;
-        previous_command = last_command_;
       }
       const auto handover = predict_handover_state(
           input->state, input->body_yaw, input->state_time_ns, scheduled_start,
@@ -633,9 +623,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
           active ? &active->result.trajectory.actions : nullptr,
           command_dt_, std::min(std::abs(config_.constraints.a_min),
                                 config_.longitudinal.service_deceleration),
-          std::min(config_.constraints.jerk_max, config_.longitudinal.comfort_jerk),
-          &tracking_config_, config_.constraints,
-          previous_command ? &*previous_command : nullptr);
+          std::min(config_.constraints.jerk_max, config_.longitudinal.comfort_jerk));
 
       if (active) {
         const auto handover_projection = planner_->path().project(
@@ -846,8 +834,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
     }
 
     const double odom_age = 1.0e-9 * (stamp_ns - odom_stamp_ns);
-    const bool tracking_state_fresh = odom_age >= 0.0 &&
-        odom_age <= tracking_config_.odom_timeout_sec;
+    const bool tracking_state_fresh = odom_age >= 0.0;
     if (tracking_state_fresh) {
       // Compare pose and trajectory at the same time rather than treating the
       // odometry transport interval as longitudinal tracking error.
@@ -918,14 +905,13 @@ class PlannerNodeCpp final : public rclcpp::Node {
           command = sample_body_command(active->allocation,
                                         active->result.trajectory.actions,
                                         elapsed, command_dt_);
-          if (tracking_state_fresh) {
+          if (tracking_state_fresh && command->planned_speed > 0.0) {
             // Pose yaw is the heading feedback. Transport it into the motion
             // frame using allocated beta, rather than differentiating noisy
             // velocity direction: e_chi = (chi_ref - beta_ref) - body_yaw.
             tracking_state.chi = wrap_angle(tracking_body_yaw + command->beta);
             command = apply_tracking_feedback(
-                *command, tracking_state, tracking_config_, config_.constraints,
-                command_dt_, last_command_ && !activated ? &*last_command_ : nullptr);
+                *command, tracking_state, tracking_config_);
           }
         } else {
           if (!safety_stop_) {

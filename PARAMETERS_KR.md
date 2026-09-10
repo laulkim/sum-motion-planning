@@ -302,7 +302,7 @@ Allocation-failure 기반 weight scheduler는 현재 production 경로에서
 
 실행 단계의 위치·헤딩 P 피드백 파라미터(`tracking_*`) 및 수식은
 [`simp_planner/README_KR.md`](simp_planner/README_KR.md#위치헤딩-p-피드백)에 정리되어 있다.
-P 보정은 기본 활성화이며, allocation 이후 실행 명령과 handover 예측에 적용된다.
+P 보정은 기본 활성화이며, allocation 이후 실행 명령에만 적용된다.
 
 | 값 | Mode | `beta_center` | 일반적인 Body 속도 방향 |
 |---:|---|---:|---|
