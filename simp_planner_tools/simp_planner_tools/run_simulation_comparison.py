@@ -24,6 +24,7 @@ def build_launch_command(
     model: str,
     save_period: float,
     debug_output_root: Path,
+    tracking_enabled: bool = True,
 ) -> list[str]:
     return [
         "ros2",
@@ -35,6 +36,7 @@ def build_launch_command(
         f"kinematics_model:={model}",
         f"save_period:={save_period}",
         f"debug_output_dir:={debug_output_root}",
+        f"tracking_enabled:={str(tracking_enabled).lower()}",
     ]
 
 
@@ -118,19 +120,24 @@ def run_comparison(
 
     batch_directory = create_batch_directory(output_root, scenario)
     runs: dict[str, Path] = {}
-    for model in ("ideal", "noisy"):
-        model_output_root = batch_directory / "raw" / model
+    for label, model, tracking_enabled in (
+        ("ideal", "ideal", True),
+        ("noisy", "noisy", True),
+        ("noisy_off", "noisy", False),
+    ):
+        model_output_root = batch_directory / "raw" / label
         command = build_launch_command(
             scenario,
             target_speed,
             model,
             save_period,
             model_output_root,
+            tracking_enabled=tracking_enabled,
         )
-        print(f"\n[{model}] running for {duration_sec:.1f} s", flush=True)
+        print(f"\n[{label}, P {'ON' if tracking_enabled else 'OFF'}] running for {duration_sec:.1f} s", flush=True)
         run_for_duration(command, duration_sec)
-        runs[model] = find_run_directory(model_output_root, scenario)
-        print(f"[{model}] data: {runs[model]}", flush=True)
+        runs[label] = find_run_directory(model_output_root, scenario)
+        print(f"[{label}] data: {runs[label]}", flush=True)
 
     comparison_directory = batch_directory / "comparison"
     compare_runs(
@@ -139,6 +146,7 @@ def run_comparison(
         comparison_directory,
         sample_period=sample_period,
         show=show,
+        noisy_off_directory=runs["noisy_off"],
     )
     return runs["ideal"], runs["noisy"], comparison_directory
 
@@ -146,7 +154,7 @@ def run_comparison(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Run ideal and noisy simulations sequentially for a fixed duration, "
+            "Run ideal (P ON), noisy P ON and noisy P OFF sequentially, "
             "then compare their saved data."
         )
     )
@@ -156,7 +164,7 @@ def main() -> None:
         "--duration",
         type=float,
         default=120.0,
-        help="Wall-clock seconds for each of the ideal and noisy runs.",
+        help="Wall-clock seconds for EACH of the three runs (plus startup/shutdown time).",
     )
     parser.add_argument(
         "--output-root",
@@ -168,7 +176,7 @@ def main() -> None:
     parser.add_argument(
         "--show",
         action="store_true",
-        help="Open the comparison plots after both runs finish.",
+        help="Open comparison, tracking-error and per-run target/feedback plots after all three runs finish.",
     )
     args = parser.parse_args()
 
@@ -186,7 +194,7 @@ def main() -> None:
         print("\nComparison run interrupted; the active simulation was stopped.")
         return
 
-    print("\nCompleted ideal/noisy comparison")
+    print("\nCompleted ideal/noisy comparison and P OFF/ON tracking evaluation")
     print(f"Ideal data: {ideal}")
     print(f"Noisy data: {noisy}")
     print(f"Comparison: {comparison}")

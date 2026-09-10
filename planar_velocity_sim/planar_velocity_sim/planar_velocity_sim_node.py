@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 
 import rclpy
 from geometry_msgs.msg import Twist
@@ -101,6 +102,7 @@ class PlanarVelocitySimNode(Node):
         self.odom_pub = self.create_publisher(
             Odometry, str(self.get_parameter("odom_topic").value), 20
         )
+        self.truth_pub = self.create_publisher(Odometry, "/ground_truth/odom", 20)
         self.mode_state_pub = self.create_publisher(
             DriveModeState,
             str(self.get_parameter("mode_state_topic").value),
@@ -219,6 +221,16 @@ class PlanarVelocitySimNode(Node):
         odom.twist.twist.linear.y = self.applied_vy
         odom.twist.twist.angular.z = self.applied_yaw_rate
         self.odom_pub.publish(odom)
+        truth = deepcopy(odom)
+        if self.kinematics_noise is not None:
+            model = self.kinematics_noise
+            truth.pose.pose.position.x, truth.pose.pose.position.y, truth_yaw = model.actual_pose
+            truth.pose.pose.orientation.z = math.sin(0.5 * truth_yaw)
+            truth.pose.pose.orientation.w = math.cos(0.5 * truth_yaw)
+            truth.twist.twist.linear.x = model.actual_vx
+            truth.twist.twist.linear.y = model.actual_vy
+            truth.twist.twist.angular.z = model.actual_yaw_rate
+        self.truth_pub.publish(truth)
 
 
 def main(args=None) -> None:

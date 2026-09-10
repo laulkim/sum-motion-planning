@@ -93,6 +93,11 @@ class DebugPlotNode(Node):
             base / self.scenario_name / datetime.now().strftime("%Y%m%d_%H%M%S")
         )
         self.session_dir.mkdir(parents=True, exist_ok=False)
+        self.truth_csv_file = (self.session_dir / "ground_truth_history.csv").open(
+            "w", newline="", encoding="utf-8", buffering=1
+        )
+        self.truth_csv_writer = csv.writer(self.truth_csv_file)
+        self.truth_csv_writer.writerow(["source_stamp_ns", "x", "y", "body_yaw", "vx", "vy", "yaw_rate"])
 
         self.csv_file = (self.session_dir / "odom_history.csv").open(
             "w", newline="", encoding="utf-8", buffering=1
@@ -117,6 +122,7 @@ class DebugPlotNode(Node):
                 "allocation_min_clearance", "coarse_collision_free",
                 "precise_collision_free", "allocation_collision_free",
                 "planner_state", "planner_block_reason", "diagnosis",
+                "source_stamp_ns",
             ]
         )
         self.command_csv_file = (self.session_dir / "command_history.csv").open(
@@ -134,6 +140,8 @@ class DebugPlotNode(Node):
                 "beta_deviation", "beta_rate", "beta_acceleration",
                 "yaw_acceleration", "rate_split_residual",
                 "speed_reconstruction_error", "mode", "plan_id",
+                "source_stamp_ns", "reference_valid", "reference_x", "reference_y",
+                "reference_chi_rad", "reference_body_yaw_rad",
             ]
         )
 
@@ -171,6 +179,7 @@ class DebugPlotNode(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
         self.create_subscription(Odometry, "/odom", self.odom_callback, 50)
+        self.create_subscription(Odometry, "/ground_truth/odom", self.truth_callback, 50)
         self.create_subscription(
             ReferencePathMessage,
             "/reference_path_data",
@@ -520,8 +529,27 @@ class DebugPlotNode(Node):
                 f"{rate_split_residual_deg:.12f}",
                 f"{speed_reconstruction_error:.12f}",
                 "" if self.mode is None else self.mode, int(message.plan_id),
+                message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec,
+                bool(message.plan_id > 0 and message.trajectory_time > 0.0 and
+                     all(math.isfinite(value) for value in (
+                         message.segment_start_x, message.segment_start_y,
+                         message.motion_heading, message.beta))),
+                f"{message.segment_start_x:.12f}", f"{message.segment_start_y:.12f}",
+                f"{message.motion_heading:.12f}",
+                f"{message.motion_heading - message.beta:.12f}",
             ]
         )
+
+    def truth_callback(self, message: Odometry) -> None:
+        q = message.pose.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        self.truth_csv_writer.writerow([
+            message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec,
+            message.pose.pose.position.x, message.pose.pose.position.y, yaw,
+            message.twist.twist.linear.x, message.twist.twist.linear.y,
+            message.twist.twist.angular.z,
+        ])
 
     def execution_state_callback(self, message: String) -> None:
         self.mark("execution_state")
@@ -807,6 +835,7 @@ class DebugPlotNode(Node):
                 bool(plan.get("allocation_collision_free", False)),
                 self.planner_status.get("state", "UNKNOWN"),
                 self.planner_status.get("block_reason", "UNKNOWN"), diagnosis,
+                message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec,
             ]
         )
 
@@ -1065,7 +1094,7 @@ class DebugPlotNode(Node):
         }
         with (self.session_dir / "status_latest.json").open("w", encoding="utf-8") as file:
             json.dump(payload, file, ensure_ascii=False, indent=2, allow_nan=True)
-        for file in (self.csv_file, self.command_csv_file, self.plan_csv_file):
+        for file in (self.csv_file, self.command_csv_file, self.plan_csv_file, self.truth_csv_file):
             file.flush()
 
         if self.render_future is not None:
@@ -1086,7 +1115,7 @@ class DebugPlotNode(Node):
             except Exception as exc:  # pragma: no cover - ROS runtime path
                 self.get_logger().error(f"Final debug rendering failed: {exc}")
         self.render_executor.shutdown(wait=True, cancel_futures=False)
-        for file in (self.csv_file, self.command_csv_file, self.plan_csv_file):
+        for file in (self.csv_file, self.command_csv_file, self.plan_csv_file, self.truth_csv_file):
             if not file.closed:
                 file.flush()
                 file.close()

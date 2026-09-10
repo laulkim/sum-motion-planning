@@ -269,6 +269,7 @@ def compare_runs(
     output_directory: Path | None,
     sample_period: float = 0.01,
     show: bool = False,
+    noisy_off_directory: Path | None = None,
 ) -> dict[str, object]:
     if sample_period <= 0.0:
         raise ValueError("sample_period must be positive")
@@ -354,6 +355,13 @@ def compare_runs(
             "w", encoding="utf-8"
         ) as file:
             json.dump(metrics, file, indent=2, ensure_ascii=False)
+    if noisy_off_directory is not None:
+        from .compare_tracking_runs import compare_tracking_runs
+
+        compare_tracking_runs(
+            ideal_directory, noisy_off_directory, noisy_directory,
+            output_directory, str(ideal_raw["scenario"]),
+        )
     if show:
         plt.show()
     plt.close("all")

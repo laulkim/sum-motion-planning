@@ -89,6 +89,8 @@ class KinematicsNoiseModel:
         )
         self._errors = [0.0, 0.0, 0.0]
         self._biases = [0.0, 0.0, 0.0]
+        self.actual_pose: tuple[float, float, float] | None = None
+        self._previous_measurement = (0.0, 0.0, 0.0)
 
     @property
     def actual_speed(self) -> float:
@@ -193,6 +195,11 @@ class KinematicsNoiseModel:
         command_yaw_rate: float,
         dt: float = 0.01,
     ) -> KinematicsState:
+        """Advance truth independently; x/y/yaw are the previous estimated pose.
+
+        The first call after reset initializes truth at the same pose. Returned
+        pose dead-reckons sensor twist; subsequent estimates never reset truth.
+        """
         dt = float(dt)
         if not math.isfinite(dt) or dt <= 0.0:
             raise ValueError("dt must be finite and positive")
@@ -207,10 +214,10 @@ class KinematicsNoiseModel:
             dt,
         )
 
-        next_x, next_y, next_yaw = integrate_body_velocity(
-            x,
-            y,
-            yaw,
+        if self.actual_pose is None:
+            self.actual_pose = (x, y, yaw)
+        self.actual_pose = integrate_body_velocity(
+            *self.actual_pose,
             0.5 * (previous_vx + self.actual_vx),
             0.5 * (previous_vy + self.actual_vy),
             0.5 * (previous_yaw_rate + self.actual_yaw_rate),
@@ -223,6 +230,13 @@ class KinematicsNoiseModel:
         )
         self._advance_sensor_error(dt)
         estimated_vx, estimated_vy, estimated_yaw_rate = self._sensor_output()
+        measurement = (estimated_vx, estimated_vy, estimated_yaw_rate)
+        next_x, next_y, next_yaw = integrate_body_velocity(
+            x, y, yaw,
+            *(0.5 * (old + new) for old, new in zip(self._previous_measurement, measurement)),
+            dt,
+        )
+        self._previous_measurement = measurement
         longest_sensor_delay = max(row[0] for row in SENSOR_PARAMETERS)
         _trim_history(self._sensor_history, self._time - longest_sensor_delay)
 
@@ -233,5 +247,5 @@ class KinematicsNoiseModel:
             estimated_vx,
             estimated_vy,
             estimated_yaw_rate,
-            self.beta,
+            math.atan2(estimated_vy, estimated_vx),
         )

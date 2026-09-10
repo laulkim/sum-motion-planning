@@ -145,9 +145,9 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument("command_frequency_hz", default_value="100.0"),
             DeclareLaunchArgument("tracking_enabled", default_value="true", choices=["true", "false"]),
-            DeclareLaunchArgument("tracking_longitudinal_kp", default_value="0.08"),
-            DeclareLaunchArgument("tracking_lateral_kp", default_value="0.06"),
-            DeclareLaunchArgument("tracking_heading_kp", default_value="0.15"),
+            DeclareLaunchArgument("tracking_longitudinal_kp", default_value="2.0"),
+            DeclareLaunchArgument("tracking_lateral_kp", default_value="1.5"),
+            DeclareLaunchArgument("tracking_heading_kp", default_value="1.5"),
             DeclareLaunchArgument(
                 "kinematics_model",
                 default_value="ideal",
