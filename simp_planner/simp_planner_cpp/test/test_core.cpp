@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -729,6 +730,151 @@ void test_scheduler_and_safety_tail() {
   require(lead >= 0.12 && lead <= 0.60, "adaptive lead out of bounds");
 }
 
+void test_tracking_feedback_p_terms() {
+  using namespace simp_planner;
+  TrackingConfig config;
+  config.validate();
+  BodyCommand reference;
+  reference.planned_speed = reference.vx = 1.0;
+  reference.motion_heading = 0.5 * kPi;
+  reference.segment_start_x = 3.0;
+  reference.segment_start_y = 4.0;
+  PlannerState measured{3.1, 3.9, reference.motion_heading - 0.1};
+  const auto output = apply_tracking_feedback(reference, measured, config);
+  require(std::abs(output.tracking.longitudinal_error - 0.1) < 1e-12,
+          "longitudinal error frame/sign mismatch");
+  require(std::abs(output.tracking.lateral_error - 0.1) < 1e-12,
+          "lateral error frame/sign mismatch");
+  require(std::abs(output.planned_speed - 1.08) < 1e-12, "speed must receive the direct P term");
+  require(std::abs(output.motion_heading_rate - 0.21) < 1e-12,
+          "chi_dot must receive the direct lateral and heading P terms");
+  // No hidden cap, fade-in or command-history-dependent dynamics.
+  measured = {13.0, -6.0, reference.motion_heading};
+  const auto large = apply_tracking_feedback(reference, measured, config);
+  require(std::abs(large.tracking.speed_correction - 8.0) < 1e-12, "unexpected speed limiter");
+  require(std::abs(large.tracking.heading_rate_correction - 6.0) < 1e-12, "unexpected yaw limiter");
+  reference.planned_speed = reference.vx = 0.01;
+  const auto slow = apply_tracking_feedback(reference, measured, config);
+  require(std::abs(slow.tracking.heading_rate_correction - 6.0) < 1e-12, "unexpected low-speed fade");
+
+  reference.motion_heading = -kPi + 0.02;
+  measured.chi = kPi - 0.02;
+  const auto wrapped = apply_tracking_feedback(reference, measured, config);
+  require(std::abs(wrapped.tracking.heading_error - 0.04) < 1e-12, "heading wrap mismatch");
+  config.enabled = false;
+  const auto disabled = apply_tracking_feedback(reference, measured, config);
+  require(disabled.vx == reference.vx && disabled.yaw_rate == reference.yaw_rate &&
+          !disabled.tracking.active, "disabled P changed commands");
+  require(std::abs(disabled.tracking.heading_error - 0.04) < 1e-12,
+          "disabled P must still report errors");
+  config.heading_kp = -1.0;
+  bool rejected = false;
+  try { config.validate(); } catch (const std::invalid_argument&) { rejected = true; }
+  require(rejected, "negative P gain accepted");
+}
+
+void test_tracking_zero_error_preserves_allocated_curve() {
+  using namespace simp_planner;
+  PlannerMotionTrajectory trajectory;
+  for (int i = 0; i <= 40; ++i) {
+    const double t = i * 0.1;
+    const double chi = 0.2 * t;
+    trajectory.t.push_back(t);
+    trajectory.x.push_back(10.0 * std::sin(chi));
+    trajectory.y.push_back(10.0 * (1.0 - std::cos(chi)));
+    trajectory.chi.push_back(chi);
+    trajectory.kappa.push_back(0.1);
+    trajectory.kappa_s.push_back(0.0);
+    trajectory.speed.push_back(2.0);
+    trajectory.acceleration.push_back(0.0);
+    trajectory.longitudinal_jerk.push_back(0.0);
+    trajectory.motion_heading_rate.push_back(0.2);
+    trajectory.motion_heading_acceleration.push_back(0.0);
+    trajectory.drive_mode.push_back(DriveMode::Forward);
+  }
+  const auto allocation = allocate_trajectory(trajectory);
+  const std::vector<PlannerAction> actions(40);
+  for (bool zero_gains : {false, true}) {
+    TrackingConfig config;
+    if (zero_gains) config.longitudinal_kp = config.lateral_kp = config.heading_kp = 0.0;
+    for (int i = 0; i <= 400; ++i) {
+      const auto reference = sample_body_command(allocation, actions, i * 0.01);
+      PlannerState measured{reference.segment_start_x, reference.segment_start_y,
+                            reference.motion_heading, reference.planned_speed};
+      // Zero gains must also preserve feedforward with nonzero pose errors.
+      if (zero_gains) { measured.x += 0.5; measured.y -= 0.5; measured.chi += 0.1; }
+      const auto output = apply_tracking_feedback(reference, measured, config);
+      require(output.vx == reference.vx && output.vy == reference.vy &&
+              output.yaw_rate == reference.yaw_rate &&
+              output.planned_speed == reference.planned_speed &&
+              output.motion_heading_rate == reference.motion_heading_rate &&
+              output.tracking.speed_correction == 0.0 &&
+              output.tracking.heading_rate_correction == 0.0,
+              "zero error/gain modified an allocated curve command");
+      require(output.planned_acceleration == reference.planned_acceleration &&
+              output.planned_jerk == reference.planned_jerk &&
+              output.planned_heading_acceleration == reference.planned_heading_acceleration &&
+              output.yaw_acceleration == reference.yaw_acceleration &&
+              output.motion_curvature == reference.motion_curvature &&
+              output.beta == reference.beta && output.beta_rate == reference.beta_rate,
+              "P feedback modified reference dynamics or allocation");
+    }
+  }
+}
+
+void test_tracking_feedback_closed_loop_modes() {
+  using namespace simp_planner;
+  const TrackingConfig tracking;
+  constexpr double dt = 0.01;
+  constexpr double heading = 0.7;
+  const double c = std::cos(heading);
+  const double s = std::sin(heading);
+  for (const auto mode : {DriveMode::Forward, DriveMode::Reverse, DriveMode::Left, DriveMode::Right}) {
+    for (const bool lagged : {false, true}) {
+      const double beta = drive_mode_heading_offset(mode);
+      double x = -0.5 * c - 0.5 * s;
+      double y = -0.5 * s + 0.5 * c;
+      double yaw = heading - beta + 0.1;
+      double vx = std::cos(beta);
+      double vy = std::sin(beta);
+      double yaw_rate = 0.0;
+      std::optional<BodyCommand> previous;
+      for (int i = 0; i < 2000; ++i) {
+        BodyCommand reference;
+        reference.planned_speed = 1.0;
+        reference.vx = std::cos(beta);
+        reference.vy = std::sin(beta);
+        reference.beta = beta;
+        reference.motion_heading = heading;
+        reference.segment_start_x = i * dt * c;
+        reference.segment_start_y = i * dt * s;
+        PlannerState measured{x, y, wrap_angle(yaw + std::atan2(vy, vx)), std::hypot(vx, vy)};
+        auto command = apply_tracking_feedback(reference, measured, tracking);
+        const double response = lagged ? 1.0 - std::exp(-dt / 0.24) : 1.0;
+        vx += response * (command.vx - vx);
+        vy += response * (command.vy - vy);
+        yaw_rate += response * (command.yaw_rate - yaw_rate);
+        const double yaw_mid = yaw + 0.5 * yaw_rate * dt;
+        x += (std::cos(yaw_mid) * vx - std::sin(yaw_mid) * vy) * dt;
+        y += (std::sin(yaw_mid) * vx + std::cos(yaw_mid) * vy) * dt;
+        yaw = wrap_angle(yaw + yaw_rate * dt);
+        previous = command;
+      }
+      if (std::hypot(x - 20.0 * c, y - 20.0 * s) >= 0.04) {
+        throw std::runtime_error("tracking convergence: mode=" +
+            std::to_string(static_cast<int>(mode)) + " lagged=" + std::to_string(lagged) +
+            " position_error=" + std::to_string(std::hypot(x - 20.0 * c, y - 20.0 * s)) +
+            " heading_error=" + std::to_string(wrap_angle(yaw + beta - heading)) +
+            " dv=" + std::to_string(previous->tracking.speed_correction) +
+            " dchi_dot=" + std::to_string(previous->tracking.heading_rate_correction));
+      }
+      require(std::abs(wrap_angle(yaw + beta - heading)) < 0.02,
+              "tracking failed to converge motion heading in a drive mode");
+    }
+  }
+}
+
+
 }  // namespace
 
 int main() {
@@ -751,6 +897,9 @@ int main() {
     test_terminal_braking_fallback_recovers_from_early_stop();
     test_terminal_virtual_extension_within_tolerance();
     test_scheduler_and_safety_tail();
+    test_tracking_feedback_p_terms();
+    test_tracking_zero_error_preserves_allocated_curve();
+    test_tracking_feedback_closed_loop_modes();
     std::cout << "all standalone C++ core tests passed\n";
     return 0;
   } catch (const std::exception& error) {

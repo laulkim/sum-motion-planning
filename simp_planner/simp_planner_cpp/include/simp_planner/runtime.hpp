@@ -72,6 +72,24 @@ class DriveModeSupervisor {
 
 const char* drive_mode_control_state_name(DriveModeControlState state);
 
+struct TrackingConfig {
+  bool enabled{true};
+  double longitudinal_kp{0.8};          // 1/s
+  double lateral_kp{0.6};               // rad/(m s)
+  double heading_kp{1.5};               // 1/s
+
+  void validate() const;
+};
+
+struct TrackingFeedback {
+  bool active{false};
+  double longitudinal_error{0.0};
+  double lateral_error{0.0};
+  double heading_error{0.0};
+  double speed_correction{0.0};
+  double heading_rate_correction{0.0};
+};
+
 struct BodyCommand {
   double vx{0.0};
   double vy{0.0};
@@ -96,12 +114,22 @@ struct BodyCommand {
   std::size_t yaw_index{0};
   std::size_t action_index{0};
   double trajectory_time{0.0};
+  TrackingFeedback tracking;
 };
 
 BodyCommand sample_body_command(const AllocationResult& allocation,
                                 const std::vector<PlannerAction>& planned_actions,
                                 double trajectory_time,
                                 double execution_dt = 0.01);
+
+// Errors are reference minus measured pose, expressed in the reference motion
+// frame. Preserve the allocated beta profile and apply chi_dot feedback through
+// yaw_rate = chi_dot - beta_rate; this also works for reverse and crab motion.
+// Supply measured.chi = measured_body_yaw + reference.beta for pose-based
+// heading tracking (equivalent to reference body yaw minus measured body yaw).
+BodyCommand apply_tracking_feedback(
+    const BodyCommand& reference, const PlannerState& measured,
+    const TrackingConfig& config);
 
 std::int64_t align_time_ns(std::int64_t time_ns, double period_sec);
 

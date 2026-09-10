@@ -21,3 +21,12 @@ float64 segment_start_heading
 float64 segment_end_x
 float64 segment_end_y
 float64 segment_end_heading
+# Position errors are reference minus measured pose in the reference motion frame.
+# Heading error is wrap(chi_ref - (measured_body_yaw + allocated_beta)),
+# equivalently reference body yaw minus measured body yaw.
+bool tracking_active
+float64 tracking_longitudinal_error
+float64 tracking_lateral_error
+float64 tracking_heading_error
+float64 tracking_speed_correction
+float64 tracking_heading_rate_correction

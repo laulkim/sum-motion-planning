@@ -1,7 +1,16 @@
 <launch>
+  <arg name="tracking_enabled" default="true" />
+  <arg name="tracking_longitudinal_kp" default="0.8" />
+  <arg name="tracking_lateral_kp" default="0.6" />
+  <arg name="tracking_heading_kp" default="1.5" />
   <node
     pkg="simp_planner_cpp"
     exec="planner_node_cpp"
     name="planner_node"
-    output="screen" />
+    output="screen">
+    <param name="tracking_enabled" value="$(var tracking_enabled)" />
+    <param name="tracking_longitudinal_kp" value="$(var tracking_longitudinal_kp)" />
+    <param name="tracking_lateral_kp" value="$(var tracking_lateral_kp)" />
+    <param name="tracking_heading_kp" value="$(var tracking_heading_kp)" />
+  </node>
 </launch>

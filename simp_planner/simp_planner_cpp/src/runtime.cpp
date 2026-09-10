@@ -182,7 +182,50 @@ BodyCommand sample_body_command(const AllocationResult& allocation,
   return {vx, vy, yaw_rate, speed, acceleration, jerk, heading_acceleration,
           motion_heading, kappa, motion_heading_rate, beta, beta_rate,
           yaw_acceleration, start_x, start_y, motion_heading, end_x, end_y,
-          end_heading, interval, interval, action_index, elapsed};
+          end_heading, interval, interval, action_index, elapsed, {}};
+}
+
+void TrackingConfig::validate() const {
+  for (const double value : {longitudinal_kp, lateral_kp, heading_kp}) {
+    if (!std::isfinite(value) || value < 0.0)
+      throw std::invalid_argument("tracking gains must be finite and non-negative");
+  }
+}
+
+BodyCommand apply_tracking_feedback(
+    const BodyCommand& reference, const PlannerState& measured,
+    const TrackingConfig& config) {
+  BodyCommand command = reference;
+  command.tracking = {};
+  if (!std::isfinite(measured.x) || !std::isfinite(measured.y) ||
+      !std::isfinite(measured.chi) || !std::isfinite(reference.segment_start_x) ||
+      !std::isfinite(reference.segment_start_y)) return command;
+
+  auto& feedback = command.tracking;
+  const double dx = reference.segment_start_x - measured.x;
+  const double dy = reference.segment_start_y - measured.y;
+  const double c = std::cos(reference.motion_heading);
+  const double s = std::sin(reference.motion_heading);
+  feedback.longitudinal_error = c * dx + s * dy;
+  feedback.lateral_error = -s * dx + c * dy;
+  feedback.heading_error = wrap_angle(reference.motion_heading - measured.chi);
+  if (!config.enabled) return command;
+
+  feedback.active = true;
+  feedback.speed_correction = config.longitudinal_kp * feedback.longitudinal_error;
+  feedback.heading_rate_correction = config.lateral_kp * feedback.lateral_error +
+      config.heading_kp * feedback.heading_error;
+
+  // Pure P additions to the existing feedforward commands. In particular,
+  // do not change the reference or infer acceleration/jerk from corrections.
+  if (feedback.speed_correction != 0.0) {
+    command.planned_speed += feedback.speed_correction;
+    command.vx = command.planned_speed * std::cos(reference.beta);
+    command.vy = command.planned_speed * std::sin(reference.beta);
+  }
+  command.motion_heading_rate += feedback.heading_rate_correction;
+  command.yaw_rate += feedback.heading_rate_correction;
+  return command;
 }
 
 std::int64_t align_time_ns(std::int64_t time_ns, double period_sec) {
@@ -310,7 +353,7 @@ BodyCommand JerkLimitedSafetyStop::sample() const {
   const double nan = std::numeric_limits<double>::quiet_NaN();
   return {vx, vy, heading_rate, speed, acceleration, jerk, heading_accel,
           motion_heading_, curvature_, heading_rate, beta_, 0.0, heading_accel,
-          nan, nan, motion_heading_, nan, nan, motion_heading_, 0, 0, 0, elapsed_};
+          nan, nan, motion_heading_, nan, nan, motion_heading_, 0, 0, 0, elapsed_, {}};
 }
 
 void JerkLimitedSafetyStop::advance(double dt) {

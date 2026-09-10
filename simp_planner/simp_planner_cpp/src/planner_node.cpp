@@ -140,6 +140,11 @@ class PlannerNodeCpp final : public rclcpp::Node {
     command_dt_ = 1.0 / command_frequency_hz_;
     config_.longitudinal.dt = trajectory_knot_dt_;
     config_.longitudinal.execution_dt = command_dt_;
+    tracking_config_.enabled = declare_parameter<bool>("tracking_enabled", true);
+    tracking_config_.longitudinal_kp = declare_parameter<double>("tracking_longitudinal_kp", 0.8);
+    tracking_config_.lateral_kp = declare_parameter<double>("tracking_lateral_kp", 0.6);
+    tracking_config_.heading_kp = declare_parameter<double>("tracking_heading_kp", 1.5);
+    tracking_config_.validate();
     footprint_circle_count_ = declare_parameter<int>("oriented_footprint_circle_count", 3);
     footprint_translation_step_m_ = declare_parameter<double>("oriented_footprint_translation_step_m", 0.20);
     footprint_yaw_step_deg_ = declare_parameter<double>("oriented_footprint_yaw_step_deg", 2.0);
@@ -304,6 +309,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       current_state_ = {msg->pose.pose.position.x, msg->pose.pose.position.y,
                         chi, speed, acceleration, heading_rate};
       current_body_yaw_ = body_yaw;
+      current_body_yaw_rate_ = msg->twist.twist.angular.z;
       current_state_time_ns_ = rclcpp::Time(msg->header.stamp).nanoseconds();
       if (current_state_time_ns_ <= 0) current_state_time_ns_ = now_ns();
       odom_frame_ = msg->header.frame_id;
@@ -812,11 +818,33 @@ class PlannerNodeCpp final : public rclcpp::Node {
     DriveModeControlState mode_state;
     bool mode_ready;
     double measured_speed;
+    PlannerState tracking_state;
+    double tracking_body_yaw;
+    double tracking_body_yaw_rate;
+    std::int64_t odom_stamp_ns;
     {
       std::lock_guard<std::mutex> lock(input_mutex_);
       measured_speed = current_state_.speed;
       mode_ready = mode_supervisor_.ready();
       mode_state = mode_supervisor_.state(measured_speed, mode_change_stop_speed_);
+      tracking_state = current_state_;
+      tracking_body_yaw = current_body_yaw_;
+      tracking_body_yaw_rate = current_body_yaw_rate_;
+      odom_stamp_ns = current_state_time_ns_;
+    }
+
+    const double odom_age = 1.0e-9 * (stamp_ns - odom_stamp_ns);
+    const bool tracking_state_fresh = odom_age >= 0.0;
+    if (tracking_state_fresh) {
+      // Compare pose and trajectory at the same time rather than treating the
+      // odometry transport interval as longitudinal tracking error.
+      const double chi_mid = tracking_state.chi +
+          0.5 * tracking_state.motion_heading_rate * odom_age;
+      tracking_state.x += tracking_state.speed * std::cos(chi_mid) * odom_age;
+      tracking_state.y += tracking_state.speed * std::sin(chi_mid) * odom_age;
+      tracking_state.chi = wrap_angle(tracking_state.chi +
+          tracking_state.motion_heading_rate * odom_age);
+      tracking_body_yaw = wrap_angle(tracking_body_yaw + tracking_body_yaw_rate * odom_age);
     }
 
     if (!mode_ready) {
@@ -877,6 +905,14 @@ class PlannerNodeCpp final : public rclcpp::Node {
           command = sample_body_command(active->allocation,
                                         active->result.trajectory.actions,
                                         elapsed, command_dt_);
+          if (tracking_state_fresh && command->planned_speed > 0.0) {
+            // Pose yaw is the heading feedback. Transport it into the motion
+            // frame using allocated beta, rather than differentiating noisy
+            // velocity direction: e_chi = (chi_ref - beta_ref) - body_yaw.
+            tracking_state.chi = wrap_angle(tracking_body_yaw + command->beta);
+            command = apply_tracking_feedback(
+                *command, tracking_state, tracking_config_);
+          }
         } else {
           if (!safety_stop_) {
             const auto final_command = sample_body_command(
@@ -903,6 +939,10 @@ class PlannerNodeCpp final : public rclcpp::Node {
     const bool terminal_hold = terminal_hold_active();
     if (terminal_hold) command = zero_command();
     if (!command) command = zero_command();
+    {
+      std::lock_guard<std::mutex> lock(execution_mutex_);
+      last_command_ = command;
+    }
     const std::string execution_state = terminal_hold ? "TERMINAL_HOLD"
         : (using_safety_stop ? "SAFETY_STOP"
                             : (active ? "ACTIVE_PLAN" : "IDLE"));
@@ -992,6 +1032,12 @@ class PlannerNodeCpp final : public rclcpp::Node {
     executed.segment_end_x = command.segment_end_x;
     executed.segment_end_y = command.segment_end_y;
     executed.segment_end_heading = command.segment_end_heading;
+    executed.tracking_active = command.tracking.active;
+    executed.tracking_longitudinal_error = command.tracking.longitudinal_error;
+    executed.tracking_lateral_error = command.tracking.lateral_error;
+    executed.tracking_heading_error = command.tracking.heading_error;
+    executed.tracking_speed_correction = command.tracking.speed_correction;
+    executed.tracking_heading_rate_correction = command.tracking.heading_rate_correction;
     executed_pub_->publish(executed);
   }
 
@@ -1209,6 +1255,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
   AdaptiveHandoverTiming handover_timing_;
   TerminalHoldLatch terminal_hold_;
   EnvConfig config_;
+  TrackingConfig tracking_config_;
   std::unique_ptr<PathVelocityPlanner> planner_;
   std::uint64_t planner_structural_revision_{std::numeric_limits<std::uint64_t>::max()};
   std::uint64_t planner_path_revision_{std::numeric_limits<std::uint64_t>::max()};
@@ -1219,6 +1266,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
   std::shared_ptr<const Costmap2D> costmap_;
   PlannerState current_state_;
   double current_body_yaw_{0.0};
+  double current_body_yaw_rate_{0.0};
   std::int64_t current_state_time_ns_{0};
   double target_speed_{0.0};
   DriveMode reference_mode_{DriveMode::Forward};
