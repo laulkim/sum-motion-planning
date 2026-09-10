@@ -137,8 +137,7 @@ class PlanarVelocitySimNode(Node):
         message.header.frame_id = self.base_frame
         message.current_mode = feedback.current_mode
         message.requested_mode = feedback.requested_mode
-        message.transition_in_progress = feedback.transition_in_progress
-        message.transition_complete = feedback.transition_complete
+        message.status = int(feedback.status)
         self.mode_state_pub.publish(message)
 
     def update(self) -> None:

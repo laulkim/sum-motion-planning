@@ -281,8 +281,7 @@ class DebugPlotNode(Node):
         self.target_speed: Optional[float] = None
         self.mode: Optional[int] = None
         self.requested_mode: Optional[int] = None
-        self.vehicle_transition_in_progress = False
-        self.vehicle_transition_complete = False
+        self.vehicle_status: Optional[int] = None
         self.execution_state = "STARTUP"
         self.cmd_vx = 0.0
         self.cmd_vy = 0.0
@@ -484,8 +483,7 @@ class DebugPlotNode(Node):
     def vehicle_mode_callback(self, message: DriveModeState) -> None:
         self.mark("vehicle_mode")
         self.mode = int(message.current_mode)
-        self.vehicle_transition_in_progress = bool(message.transition_in_progress)
-        self.vehicle_transition_complete = bool(message.transition_complete)
+        self.vehicle_status = int(message.status)
 
     def executed_command_callback(self, message: ExecutedCommand) -> None:
         self.mark("cmd_vel")
@@ -932,7 +930,7 @@ class DebugPlotNode(Node):
                 f"p95={p95:.1f} ms, miss ratio={100.0 * miss_ratio:.1f}%",
             )
 
-        if self.vehicle_transition_in_progress:
+        if self.vehicle_status == DriveModeState.STATUS_ALIGNING:
             return (
                 "MODE_TRANSITION_IN_PROGRESS",
                 f"vehicle mode {self.mode} -> requested {self.requested_mode}",
@@ -1038,8 +1036,7 @@ class DebugPlotNode(Node):
             "latest_cmd_yaw_rate": self.cmd_yaw_rate,
             "requested_drive_mode": self.requested_mode,
             "vehicle_drive_mode": self.mode,
-            "vehicle_transition_in_progress": self.vehicle_transition_in_progress,
-            "vehicle_transition_complete": self.vehicle_transition_complete,
+            "vehicle_status": self.vehicle_status,
             "planning_deadline_ms": self.planning_deadline_ms,
             "diagnosis": diagnosis,
             "detail": detail,

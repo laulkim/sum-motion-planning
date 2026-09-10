@@ -188,8 +188,7 @@ struct ModeStatusSnapshot {
   int vehicle_requested_mode{-1};
   int reference_mode{-1};
   bool ready{false};
-  bool transition_in_progress{false};
-  bool transition_complete{false};
+  int vehicle_status{-1};  // DriveModeState::STATUS_ALIGNING(0)/STATUS_READY(1), -1 = 피드백 없음
 };
 
 }  // namespace
@@ -841,7 +840,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       confirmed_changed = mode_supervisor_.update_vehicle_feedback(
           static_cast<DriveMode>(msg->current_mode),
           static_cast<DriveMode>(msg->requested_mode),
-          msg->transition_in_progress, msg->transition_complete);
+          static_cast<VehicleModeStatus>(msg->status));
       received_vehicle_mode_ = true;
       became_ready = !was_ready && mode_supervisor_.ready();
       if (confirmed_changed) {
@@ -1478,8 +1477,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
     }
     status.reference_mode = received_path_ ? static_cast<int>(reference_mode_) : -1;
     status.ready = mode_supervisor_.ready();
-    status.transition_in_progress = mode_supervisor_.transition_in_progress();
-    status.transition_complete = mode_supervisor_.transition_complete();
+    if (mode_supervisor_.current_mode()) {
+      status.vehicle_status = static_cast<int>(mode_supervisor_.vehicle_status());
+    }
     return status;
   }
 
@@ -1526,10 +1526,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
            << mode_status.vehicle_requested_mode
            << ",\"reference_mode\":" << mode_status.reference_mode
            << ",\"ready\":" << (mode_status.ready ? "true" : "false")
-           << ",\"transition_in_progress\":"
-           << (mode_status.transition_in_progress ? "true" : "false")
-           << ",\"transition_complete\":"
-           << (mode_status.transition_complete ? "true" : "false") << "}"
+           << ",\"vehicle_status\":" << mode_status.vehicle_status << "}"
            << ",\"execution\":{"
            << "\"current_plan_id\":" << plan.plan_id
            << ",\"state\":\"" << current_execution_state() << "\"}"
@@ -1653,10 +1650,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
            << mode_status.vehicle_requested_mode
            << ",\"reference_mode\":" << mode_status.reference_mode
            << ",\"ready\":" << (mode_status.ready ? "true" : "false")
-           << ",\"transition_in_progress\":"
-           << (mode_status.transition_in_progress ? "true" : "false")
-           << ",\"transition_complete\":"
-           << (mode_status.transition_complete ? "true" : "false") << "}"
+           << ",\"vehicle_status\":" << mode_status.vehicle_status << "}"
            << ",\"execution\":{\"current_plan_id\":"
            << current_plan_id()
            << ",\"state\":\"" << current_execution_state() << "\"}"

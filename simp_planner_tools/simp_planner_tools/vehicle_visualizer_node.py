@@ -13,8 +13,7 @@
       지금까지 실제로 지나온 경로를 계속 자라나는 Path로 publish한다.
 
   드라이브 모드 상태 전이 텍스트는 /vehicle/drive_mode_state(차량->플래너
-  피드백)의 current_mode/requested_mode/transition_in_progress/
-  transition_complete 4개 필드를 그대로 보여준다.
+  피드백)의 current_mode/requested_mode/status 3개 필드를 그대로 보여준다.
 """
 from __future__ import annotations
 
@@ -30,12 +29,22 @@ from simp_planner_msgs.msg import DriveModeState
 from visualization_msgs.msg import Marker, MarkerArray
 
 MODE_NAMES = {0: "FORWARD", 1: "REVERSE", 2: "LEFT", 3: "RIGHT"}
+STATUS_NAMES = {
+    DriveModeState.STATUS_ALIGNING: "ALIGNING",
+    DriveModeState.STATUS_READY: "READY",
+}
 
 
 def mode_name(value: int | None) -> str:
     if value is None:
         return "?"
     return MODE_NAMES.get(int(value), str(value))
+
+
+def status_name(value: int | None) -> str:
+    if value is None:
+        return "?"
+    return STATUS_NAMES.get(int(value), str(value))
 
 
 def quaternion_to_yaw(x: float, y: float, z: float, w: float) -> float:
@@ -105,8 +114,7 @@ class VehicleVisualizerNode(Node):
         else:
             lines.append(f"vehicle current: {mode_name(state.current_mode)}")
             lines.append(f"vehicle requested: {mode_name(state.requested_mode)}")
-            lines.append(f"in_progress: {state.transition_in_progress}")
-            lines.append(f"complete: {state.transition_complete}")
+            lines.append(f"status: {status_name(state.status)}")
         return "\n".join(lines)
 
     def odom_callback(self, message: Odometry) -> None:

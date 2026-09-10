@@ -670,7 +670,7 @@ def render_debug_snapshot(
         f"planner   {snapshot.get('planner_state', 'N/A')}",
         f"hold      {snapshot.get('hold_latched', False)}",
         f"mode req/actual {snapshot.get('requested_drive_mode', 'N/A')} / {snapshot.get('vehicle_drive_mode', 'N/A')}",
-        f"mode transition {snapshot.get('vehicle_transition_in_progress', False)} complete={snapshot.get('vehicle_transition_complete', False)}", "",
+        f"mode status {snapshot.get('vehicle_status', 'N/A')}", "",
         *costmap_status, "",
         "[TIMESTAMP LOGGING]",
         f"odom samples {len(odom_time)}",

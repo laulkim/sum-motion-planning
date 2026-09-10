@@ -33,11 +33,10 @@ bool DriveModeSupervisor::set_requested_mode(DriveMode mode) {
 
 bool DriveModeSupervisor::update_vehicle_feedback(
     DriveMode current_mode, DriveMode vehicle_requested_mode,
-    bool transition_in_progress, bool transition_complete) {
+    VehicleModeStatus vehicle_status) {
   current_mode_ = current_mode;
   vehicle_requested_mode_ = vehicle_requested_mode;
-  transition_in_progress_ = transition_in_progress;
-  transition_complete_ = transition_complete;
+  vehicle_status_ = vehicle_status;
   if (!ready()) return false;
   const bool changed = !last_confirmed_mode_ || *last_confirmed_mode_ != current_mode;
   if (changed) {
@@ -50,7 +49,7 @@ bool DriveModeSupervisor::update_vehicle_feedback(
 bool DriveModeSupervisor::ready() const {
   return requested_mode_ && current_mode_ &&
          *requested_mode_ == *current_mode_ &&
-         !transition_in_progress_ && transition_complete_;
+         vehicle_status_ == VehicleModeStatus::Ready;
 }
 
 bool DriveModeSupervisor::should_publish_command(
@@ -58,7 +57,7 @@ bool DriveModeSupervisor::should_publish_command(
   if (!requested_mode_ || !current_mode_) return false;
   if (ready()) return false;
   if (measured_speed > stop_speed_threshold) return false;
-  if (transition_in_progress_ && vehicle_requested_mode_ &&
+  if (vehicle_status_ == VehicleModeStatus::Aligning && vehicle_requested_mode_ &&
       *vehicle_requested_mode_ == *requested_mode_) {
     return false;
   }

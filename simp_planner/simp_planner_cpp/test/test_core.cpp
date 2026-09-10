@@ -254,6 +254,7 @@ void test_drive_mode_feedback_supervisor() {
   require(std::abs(simp_planner::motion_heading_from_body_yaw(0.0, DriveMode::Right) + 0.5 * simp_planner::kPi) < 1e-12,
           "right-crab stationary motion heading mismatch");
   using simp_planner::DriveModeControlState;
+  using simp_planner::VehicleModeStatus;
   simp_planner::DriveModeSupervisor supervisor;
   require(supervisor.state(0.0, 0.03) ==
               DriveModeControlState::WaitingForRequest,
@@ -264,7 +265,8 @@ void test_drive_mode_feedback_supervisor() {
               DriveModeControlState::WaitingForFeedback,
           "mode supervisor should wait for vehicle feedback");
   require(!supervisor.update_vehicle_feedback(
-              DriveMode::Forward, DriveMode::Forward, false, true),
+              DriveMode::Forward, DriveMode::Forward,
+              VehicleModeStatus::Ready),
           "unconfirmed mode must not increment generation");
   require(supervisor.state(0.5, 0.03) ==
               DriveModeControlState::StoppingForChange,
@@ -274,13 +276,14 @@ void test_drive_mode_feedback_supervisor() {
   require(supervisor.should_publish_command(0.0, 0.03),
           "mode command should be sent at standstill");
   require(!supervisor.update_vehicle_feedback(
-              DriveMode::Forward, DriveMode::Left, true, false),
+              DriveMode::Forward, DriveMode::Left,
+              VehicleModeStatus::Aligning),
           "in-progress mode must not be confirmed");
   require(!supervisor.ready(), "in-progress mode reported ready");
   require(!supervisor.should_publish_command(0.0, 0.03),
           "matching in-progress command should not be resent");
   require(supervisor.update_vehicle_feedback(
-              DriveMode::Left, DriveMode::Left, false, true),
+              DriveMode::Left, DriveMode::Left, VehicleModeStatus::Ready),
           "completed vehicle mode was not confirmed");
   require(supervisor.ready(), "completed vehicle mode not ready");
   require(supervisor.current_mode() == DriveMode::Left,
@@ -288,7 +291,7 @@ void test_drive_mode_feedback_supervisor() {
   require(supervisor.confirmed_generation() == 1,
           "confirmed mode generation mismatch");
   require(!supervisor.update_vehicle_feedback(
-              DriveMode::Left, DriveMode::Left, false, true),
+              DriveMode::Left, DriveMode::Left, VehicleModeStatus::Ready),
           "repeated feedback must not create a new generation");
 }
 
