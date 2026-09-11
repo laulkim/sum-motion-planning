@@ -352,8 +352,8 @@ std::vector<double> cumulative_arc_length(const std::vector<double>& x,
   return s;
 }
 
-// Same forward difference used for normal references. At a coincident turn
-// seam it also supplies the large curvature used to split the raw input.
+// Same forward difference every reference path uses to report its own
+// per-point curvature.
 std::vector<double> estimate_curvature_from_yaw(const std::vector<double>& psi,
                                                const std::vector<double>& s) {
   std::vector<double> kappa(psi.size() - 1, 0.0);
@@ -365,103 +365,30 @@ std::vector<double> estimate_curvature_from_yaw(const std::vector<double>& psi,
 
 }  // namespace
 
-std::shared_ptr<ReferencePath> SpotTurnReferenceBuffer::update(
+std::shared_ptr<ReferencePath> build_reference_path(
     const std::vector<double>& x, const std::vector<double>& y,
-    const std::vector<double>& yaw, DriveMode mode, double kappa_threshold) {
+    const std::vector<double>& yaw) {
   if (x.size() < 4 || x.size() != y.size() || x.size() != yaw.size()) {
     throw std::invalid_argument("reference arrays require at least three points plus padding");
-  }
-  if (!std::isfinite(kappa_threshold) || kappa_threshold <= 0.0) {
-    throw std::invalid_argument("invalid spot turn curvature threshold");
   }
   for (std::size_t i = 0; i < x.size(); ++i) {
     if (!std::isfinite(x[i]) || !std::isfinite(y[i]) || !std::isfinite(yaw[i])) {
       throw std::invalid_argument("reference path contains non-finite values");
     }
   }
-  const bool same_mode = mode_ && *mode_ == mode;
-  if (same_mode && pending()) return nullptr;  // Finish this absolute-coordinate snapshot.
   const auto s = cumulative_arc_length(x, y);
   const auto psi = unwrap_angles(yaw);
   const auto kappa = estimate_curvature_from_yaw(psi, s);
-  const auto used = kappa.size();
-  std::vector<std::size_t> seams;
-  std::size_t begin = 0;
-  for (std::size_t i = 0; i < used; ++i) {
-    const double ds = s[i + 1] - s[i];
-    if (std::abs(kappa[i]) > kappa_threshold) {
-      if (ds > 1.0e-6 || std::abs(psi[i + 1] - psi[i]) <= 1.0e-9) {
-        throw std::invalid_argument("spot turn seam must have coincident positions");
-      }
-      seams.push_back(i);
-      if (same_mode) {
-        for (const auto& corner : completed_) {
-          if (std::hypot(x[i] - corner.x, y[i] - corner.y) <= 1.0e-4 &&
-              std::abs(wrap_angle(psi[i] - corner.before)) <= 1.0e-6 &&
-              std::abs(wrap_angle(psi[i + 1] - corner.after)) <= 1.0e-6) {
-            begin = i + 1;
-          }
-        }
-      }
-    } else if (ds <= 1.0e-4) {
-      throw std::invalid_argument("duplicate reference point without a turn");
-    }
-  }
-  // Build everything before committing: an invalid short remainder must not
-  // leave a pending maneuver that would block later valid references.
-  std::deque<std::shared_ptr<ReferencePath>> paths;
-  const auto append = [&](std::size_t first, std::size_t end, bool turn_end) {
-    if (end - first < 3) {
-      throw std::invalid_argument("each driving segment needs at least three usable points");
-    }
-    const auto f = static_cast<std::ptrdiff_t>(first);
-    const auto e = static_cast<std::ptrdiff_t>(end);
-    std::vector<double> segment_kappa(kappa.begin() + f, kappa.begin() + e);
-    if (turn_end) segment_kappa.back() = 0.0;  // No driving across the removed seam.
-    paths.push_back(std::make_shared<ReferencePath>(
-        std::vector<double>(s.begin() + f, s.begin() + e),
-        std::vector<double>(x.begin() + f, x.begin() + e),
-        std::vector<double>(y.begin() + f, y.begin() + e),
-        std::vector<double>(psi.begin() + f, psi.begin() + e), segment_kappa));
-  };
-  for (const auto seam : seams) {
-    if (seam < begin) continue;
-    append(begin, seam + 1, true);
-    begin = seam + 1;
-  }
-  append(begin, used, false);
-  paths_ = std::move(paths);
-  if (!same_mode) completed_.clear();
-  mode_ = mode;
-  return paths_.front();
+  const auto used = kappa.size();  // Drop the trailing curvature-sampling point.
+  return std::make_shared<ReferencePath>(
+      std::vector<double>(s.begin(), s.begin() + static_cast<std::ptrdiff_t>(used)),
+      std::vector<double>(x.begin(), x.begin() + static_cast<std::ptrdiff_t>(used)),
+      std::vector<double>(y.begin(), y.begin() + static_cast<std::ptrdiff_t>(used)),
+      std::vector<double>(psi.begin(), psi.begin() + static_cast<std::ptrdiff_t>(used)), kappa);
 }
 
-double SpotTurnReferenceBuffer::target_body_yaw() const {
-  if (!pending()) throw std::logic_error("no pending spot turn");
-  return wrap_angle(paths_[1]->psi().front() - drive_mode_heading_offset(*mode_));
-}
-
-bool SpotTurnReferenceBuffer::arrived(const PlannerState& state, double tolerance) const {
-  if (!pending()) return false;
-  const auto& path = *paths_.front();
-  const auto projection = path.project(state.x, state.y, state.chi);
-  return path.s_max() - projection.s <= tolerance &&
-         std::hypot(state.x - path.x().back(), state.y - path.y().back()) <= tolerance;
-}
-
-std::shared_ptr<ReferencePath> SpotTurnReferenceBuffer::complete_turn() {
-  if (!pending()) throw std::logic_error("no spot turn remainder");
-  const auto& head = *paths_.front();
-  completed_.push_back({head.x().back(), head.y().back(), head.psi().back(),
-                        paths_[1]->psi().front()});
-  paths_.pop_front();
-  return paths_.front();
-}
-
-void SpotTurnReferenceBuffer::reset() {
-  paths_.clear();
-  completed_.clear();
-  mode_.reset();
+double spot_turn_target_body_yaw(double path_start_psi, DriveMode mode) {
+  return wrap_angle(path_start_psi - drive_mode_heading_offset(mode));
 }
 
 bool spot_turn_feasible(const Costmap2D& costmap, const PlannerState& state,

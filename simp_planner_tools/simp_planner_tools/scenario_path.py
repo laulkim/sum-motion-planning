@@ -4,7 +4,6 @@ import csv
 import math
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 
@@ -58,7 +57,7 @@ class ScenarioPath:
         tangent_tolerance_deg: float = 5.0,
         curvature_limit: float = 0.2,
         yaw_step_limit_deg: float = 15.0,
-        skip_continuity_at: frozenset[int] = frozenset(),
+        spot_turn_kappa_threshold: float = 1000.0,
     ) -> "ScenarioPath":
         x = np.asarray(x, dtype=float)
         y = np.asarray(y, dtype=float)
@@ -89,6 +88,7 @@ class ScenarioPath:
             chord_yaw = np.arctan2(next_y - y, next_x - x)
             yaw_step = np.asarray(wrap_angle(np.roll(yaw, -1) - yaw), dtype=float)
             s = np.r_[0.0, np.cumsum(segment_length[:-1])]
+            is_seam = np.zeros(len(segment_length), dtype=bool)
         else:
             dx = np.diff(x)
             dy = np.diff(y)
@@ -97,19 +97,24 @@ class ScenarioPath:
             yaw_step = np.diff(yaw)
             s = np.r_[0.0, np.cumsum(segment_length)]
 
-        # skip_continuity_at 자리(제자리턴 이음매)는 차량이 그 자리에서 헤딩만
-        # 바꾸는 지점이라 두 점 사이 거리/헤딩변화/접선 일치를 요구하는 아래
-        # 세 검사의 전제(연속 주행) 자체가 성립하지 않는다 -- 그 자리만 빼고 나머지
-        # 구간(실제 주행 구간)에는 그대로 적용한다.
-        continuity_mask = np.ones(len(segment_length), dtype=bool)
-        for index in skip_continuity_at:
-            if closed_loop or index < 0 or index >= len(segment_length):
-                raise ValueError("Invalid spot-turn seam index")
-            if segment_length[index] > 1.0e-6 or abs(yaw_step[index]) <= 1.0e-9:
-                raise ValueError("Spot-turn seams require coincident positions and a heading change")
-            if mode[index] != mode[index + 1]:
-                raise ValueError("A spot-turn seam cannot change drive mode")
-            continuity_mask[index] = False
+            # 제자리턴 이음매 자동 탐지: C++ 플래너(estimate_curvature_from_yaw)와
+            # 똑같은 방식으로 순간 곡률(헤딩변화/거리)을 다시 계산한다. 그 값이
+            # 비정상적으로 크면(사실상 같은 위치에서 헤딩만 꺾인 지점) 이음매로
+            # 보고 아래 세 연속성 검사에서만 제외한다 -- 호출자가 이음매 위치를
+            # 미리 알려줄 필요가 없고, 슬라이스/클립된 부분 배열에 대해서도 같은
+            # 방식으로 다시 계산하면 그대로 재탐지된다.
+            instantaneous_kappa = yaw_step / np.maximum(segment_length, 1.0e-15)
+            is_seam = np.abs(instantaneous_kappa) > spot_turn_kappa_threshold
+            if np.any(is_seam):
+                bad = is_seam & ((segment_length > 1.0e-6) | (np.abs(yaw_step) <= 1.0e-9))
+                if np.any(bad):
+                    raise ValueError(
+                        "Spot-turn seam requires coincident positions and a heading change"
+                    )
+                if np.any(mode[:-1][is_seam] != mode[1:][is_seam]):
+                    raise ValueError("A spot-turn seam cannot change drive mode")
+
+        continuity_mask = ~is_seam
 
         if np.any(segment_length[continuity_mask] <= 1.0e-4):
             raise ValueError("Scenario path contains a zero-length segment")
@@ -142,42 +147,7 @@ class ScenarioPath:
             map_yaw=map_yaw.copy(),
             heading_semantics=str(heading_semantics),
             closed_loop=bool(closed_loop),
-            skip_continuity_at=frozenset(skip_continuity_at),
-        )
-
-    @classmethod
-    def join_with_turns(cls, segments: Sequence["ScenarioPath"]) -> "ScenarioPath":
-        """Concatenate already-validated drivable segments into one path.
-
-        Each segment has already passed from_arrays' own continuity checks.
-        The junction between two consecutive segments is a spot-turn corner
-        -- the vehicle stays in place while its heading jumps -- so the
-        curvature/yaw-step/tangent checks that guard against broken authored
-        geometry do not apply there and are skipped only at those junctions.
-        """
-        if len(segments) < 1:
-            raise ValueError("join_with_turns requires at least one segment")
-        if any(segment.closed_loop for segment in segments):
-            raise ValueError("Closed-loop segments cannot be joined with spot turns")
-
-        seam_indices = set()
-        offset = 0
-        for number, segment in enumerate(segments):
-            seam_indices.update(offset + index for index in segment.skip_continuity_at)
-            offset += len(segment.x)
-            if number + 1 < len(segments):
-                seam_indices.add(offset - 1)
-
-        return cls.from_arrays(
-            np.concatenate([segment.x for segment in segments]),
-            np.concatenate([segment.y for segment in segments]),
-            np.concatenate([segment.yaw for segment in segments]),
-            np.concatenate([segment.kappa for segment in segments]),
-            np.concatenate([segment.mode for segment in segments]),
-            map_yaw=np.concatenate([segment.map_yaw for segment in segments]),
-            heading_semantics=segments[0].heading_semantics,
-            closed_loop=False,
-            skip_continuity_at=frozenset(seam_indices),
+            skip_continuity_at=frozenset(np.flatnonzero(is_seam).tolist()),
         )
 
     @classmethod
@@ -268,13 +238,6 @@ class ScenarioPath:
         delta = float(wrap_angle(self.map_yaw[next_index] - self.map_yaw[index]))
         return float(wrap_angle(self.map_yaw[index] + projection.t * delta))
 
-    def _slice_seams(self, indices) -> frozenset[int]:
-        indices = list(indices)
-        return frozenset(
-            local for local, (first, second) in enumerate(zip(indices, indices[1:]))
-            if first in self.skip_continuity_at and second == first + 1
-        )
-
     def local_slice(
         self,
         projection_s: float,
@@ -362,7 +325,6 @@ class ScenarioPath:
                 map_yaw=self.map_yaw[pad_idx],
                 heading_semantics=self.heading_semantics,
                 closed_loop=False,
-                skip_continuity_at=self._slice_seams(pad_idx),
             )
 
         # The window already reaches the real end of this path -- there is no
@@ -384,7 +346,6 @@ class ScenarioPath:
             map_yaw=np.r_[self.map_yaw[idx], float(self.map_yaw[last])],
             heading_semantics=self.heading_semantics,
             closed_loop=False,
-            skip_continuity_at=self._slice_seams(idx),
         )
 
 
@@ -409,7 +370,6 @@ class ScenarioPath:
             return ScenarioPath.from_arrays(
                 self.x[idx], self.y[idx], self.yaw[idx], self.kappa[idx], self.mode[idx],
                 map_yaw=self.map_yaw[idx], heading_semantics=self.heading_semantics,
-                skip_continuity_at=self._slice_seams(range(exact + 1)),
             )
         upper = int(np.searchsorted(self.s, end_s, side="right"))
         upper = max(1, min(upper, len(self.s) - 1))
@@ -438,7 +398,6 @@ class ScenarioPath:
                 self.x[idx], self.y[idx], self.yaw[idx], self.kappa[idx], self.mode[idx],
                 map_yaw=self.map_yaw[idx], heading_semantics=self.heading_semantics,
                 closed_loop=False,
-                skip_continuity_at=self._slice_seams(range(lower + 1)),
             )
 
         return ScenarioPath.from_arrays(
@@ -450,7 +409,6 @@ class ScenarioPath:
             map_yaw=np.r_[self.map_yaw[:upper], map_yaw_end],
             heading_semantics=self.heading_semantics,
             closed_loop=False,
-            skip_continuity_at=self._slice_seams(range(upper)),
         )
 
     def translated(self, dx: float, dy: float) -> "ScenarioPath":

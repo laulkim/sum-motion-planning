@@ -186,19 +186,18 @@ class PlannerNodeCpp final : public rclcpp::Node {
         get_parameter("planning_handover_max_lead_sec").as_double();
     mode_change_stop_speed_ = declare_parameter<double>("mode_change_stop_speed_mps", 0.03);
     mode_command_period_sec_ = declare_parameter<double>("mode_command_period_sec", 0.25);
-    spot_turn_config_.kappa_threshold = declare_parameter<double>("spot_turn_kappa_threshold", 1000.0);
-    spot_turn_config_.arrival_tolerance_m = declare_parameter<double>("spot_turn_arrival_tolerance_m", 0.20);
+    spot_turn_config_.heading_jump_threshold_rad =
+        declare_parameter<double>("spot_turn_heading_jump_threshold_rad", 0.349066);
     spot_turn_config_.safety_margin = declare_parameter<double>("spot_turn_safety_margin", 0.0);
     spot_turn_config_.yaw_rate_max = declare_parameter<double>("spot_turn_yaw_rate_max", 0.3);
     spot_turn_config_.yaw_rate_accel_max = declare_parameter<double>("spot_turn_yaw_rate_accel_max", 0.3);
     spot_turn_config_.yaw_tolerance_rad = declare_parameter<double>("spot_turn_yaw_tolerance_rad", 0.02);
     spot_turn_config_.yaw_rate_tolerance = declare_parameter<double>("spot_turn_yaw_rate_tolerance", 0.02);
-    if (!std::isfinite(spot_turn_config_.kappa_threshold) ||
-        spot_turn_config_.kappa_threshold <= config_.constraints.curvature_max ||
-        !std::isfinite(spot_turn_config_.arrival_tolerance_m) ||
-        spot_turn_config_.arrival_tolerance_m <= 0.0 ||
+    if (!std::isfinite(spot_turn_config_.heading_jump_threshold_rad) ||
+        spot_turn_config_.heading_jump_threshold_rad <= 0.0 ||
+        spot_turn_config_.heading_jump_threshold_rad > kPi ||
         !std::isfinite(spot_turn_config_.safety_margin) || spot_turn_config_.safety_margin < 0.0) {
-      throw std::invalid_argument("invalid spot turn detection/arrival/clearance settings");
+      throw std::invalid_argument("invalid spot turn detection/clearance settings");
     }
     maneuver_ = SpotTurnManeuver(spot_turn_config_);
     if (!(trajectory_knot_dt_ > 0.0) || !(command_frequency_hz_ > 0.0) ||
@@ -591,9 +590,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
   void path_callback(const ReferencePathMsg::SharedPtr msg) {
     try {
       // Publishers append one waypoint beyond the window they want planned
-      // (see SpotTurnReferenceBuffer), so at least 5 points are required
-      // for a usable 4-point reference path after that trailing point is
-      // dropped.
+      // (see build_reference_path()), so at least 5 points are required for
+      // a usable 4-point reference path after that trailing point is dropped.
       if (msg->x.size() < 5 || msg->x.size() != msg->y.size() ||
           msg->x.size() != msg->yaw.size() || msg->x.size() != msg->mode.size()) {
         throw std::invalid_argument("reference path arrays must have equal length >= 5");
@@ -616,27 +614,41 @@ class PlannerNodeCpp final : public rclcpp::Node {
           if (reference_mode != reference_mode_ || frame != path_frame_) deferred_reference_ = msg;
           return;
         }
-        std::shared_ptr<ReferencePath> path;
-        if (frame != path_frame_) {
-          SpotTurnReferenceBuffer fresh;
-          path = fresh.update(msg->x, msg->y, msg->yaw, reference_mode, spot_turn_config_.kappa_threshold);
-          reference_buffer_ = std::move(fresh);
-        } else {
-          path = reference_buffer_.update(
-              msg->x, msg->y, msg->yaw, reference_mode, spot_turn_config_.kappa_threshold);
-        }
-        if (!path) return;
-        const bool split_for_turn = reference_buffer_.pending();
-        identical = !split_for_turn && reference_path_ && reference_mode == reference_mode_ &&
-                    same_reference_path(*reference_path_, *path);
-        if (!identical) {
-          hard_change = split_for_turn || !is_soft_reference_continuation_locked(*path, reference_mode);
-          reference_path_ = std::move(path);
-          reference_mode_ = reference_mode;
-          path_frame_ = msg->header.frame_id.empty() ? "map" : msg->header.frame_id;
+        auto path = build_reference_path(msg->x, msg->y, msg->yaw);
+        // 급코너(제자리턴) 자동 판별 (1절): 배열 내부에서 이음매를 스캔하는
+        // 게 아니라, 이 새 경로가 요구하는 시작 차체각과 차량의 실측 현재
+        // 차체각을 전역좌표에서 바로 비교한다. phase는 이제 다리(leg)마다
+        // 나뉘므로, 코너는 항상 phase 경계(=새 메시지 도착 시점)에 있다.
+        const double target_body_yaw = spot_turn_target_body_yaw(path->psi().front(), reference_mode);
+        const bool needs_spot_turn =
+            std::abs(wrap_angle(target_body_yaw - current_body_yaw_)) >
+            spot_turn_config_.heading_jump_threshold_rad;
+        if (needs_spot_turn) {
+          pending_spot_turn_target_yaw_ = target_body_yaw;
+          pending_spot_turn_mode_ = reference_mode;
+          pending_post_turn_path_ = std::move(path);
+          path_frame_ = frame;
           received_path_ = true;
-          ++path_revision_;
-          if (hard_change) ++command_revision_;
+          // reference_path_/reference_mode_는 일부러 안 건드린다 --
+          // 시나리오 매니저는 차량이 이전 phase를 끝까지 몰고 도착한 뒤에만
+          // 다음 phase를 보내므로, 지금 활성 경로는 이미 다 주행되어 그
+          // 자리에 자연히 멈춰 있다. reference_mode_를 여기서 새 모드로
+          // 바꾸면 아래 command_callback()의 트리거 가드(차량이 여전히
+          // 회전 전 모드로 안정적으로 있는지 확인)가 어긋나므로, 회전이
+          // 실제로 끝나 새 경로를 설치하는 시점(1292절 부근)까지 그대로
+          // 둔다.
+        } else {
+          identical = reference_path_ && reference_mode == reference_mode_ &&
+                      same_reference_path(*reference_path_, *path);
+          if (!identical) {
+            hard_change = !is_soft_reference_continuation_locked(*path, reference_mode);
+            reference_path_ = std::move(path);
+            reference_mode_ = reference_mode;
+            path_frame_ = frame;
+            received_path_ = true;
+            ++path_revision_;
+            if (hard_change) ++command_revision_;
+          }
         }
       }
       if (identical) return;
@@ -1281,7 +1293,10 @@ class PlannerNodeCpp final : public rclcpp::Node {
       mode_ready = mode_supervisor_.ready();
       mode_state = mode_supervisor_.state(measured_speed, mode_change_stop_speed_);
       if (maneuver_.on_mode_ready(mode_supervisor_)) {
-        reference_path_ = reference_buffer_.complete_turn();
+        reference_path_ = std::move(pending_post_turn_path_);
+        pending_post_turn_path_.reset();
+        reference_mode_ = *pending_spot_turn_mode_;
+        pending_spot_turn_mode_.reset();
         ++path_revision_;
         ++command_revision_;
         resumed_after_turn = true;
@@ -1290,11 +1305,11 @@ class PlannerNodeCpp final : public rclcpp::Node {
       spot_turn_waiting_clearance_ = false;
       if (mode_ready && maneuver_.state() == SpotTurnManeuverState::Inactive &&
           mode_supervisor_.current_mode() == reference_mode_ && received_costmap_ &&
-          measured_speed <= mode_change_stop_speed_ &&
-          reference_buffer_.arrived(current_state_, spot_turn_config_.arrival_tolerance_m)) {
+          measured_speed <= mode_change_stop_speed_ && pending_spot_turn_target_yaw_) {
         if (spot_turn_feasible(*costmap_, current_state_, config_.vehicle, spot_turn_config_.safety_margin)) {
-          maneuver_.trigger(reference_buffer_.target_body_yaw(), *mode_supervisor_.requested_mode());
+          maneuver_.trigger(*pending_spot_turn_target_yaw_, *pending_spot_turn_mode_);
           mode_supervisor_.set_requested_mode(DriveMode::SpotTurn);
+          pending_spot_turn_target_yaw_.reset();
           ++command_revision_;
           mode_ready = false;
           mode_state = mode_supervisor_.state(measured_speed, mode_change_stop_speed_);
@@ -1567,7 +1582,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
     status.reference_mode = received_path_ ? static_cast<int>(reference_mode_) : -1;
     status.ready = mode_supervisor_.ready();
     status.spot_turn_state = maneuver_.state_name();
-    if (maneuver_.state() == SpotTurnManeuverState::Inactive && reference_buffer_.pending()) {
+    if (maneuver_.state() == SpotTurnManeuverState::Inactive && pending_spot_turn_target_yaw_) {
       status.spot_turn_state = spot_turn_waiting_clearance_ ? "SPOT_TURN_WAITING_CLEARANCE" : "SPOT_TURN_APPROACH";
     }
     if (mode_supervisor_.current_mode()) {
@@ -1780,7 +1795,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
   std::uint64_t planner_mode_revision_{std::numeric_limits<std::uint64_t>::max()};
   DriveModeSupervisor mode_supervisor_;
   SpotTurnConfig spot_turn_config_;
-  SpotTurnReferenceBuffer reference_buffer_;
+  std::optional<double> pending_spot_turn_target_yaw_;
+  std::optional<DriveMode> pending_spot_turn_mode_;
+  std::shared_ptr<ReferencePath> pending_post_turn_path_;
   SpotTurnManeuver maneuver_;
   ReferencePathMsg::SharedPtr deferred_reference_;
   bool spot_turn_waiting_clearance_{false};

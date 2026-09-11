@@ -18,10 +18,17 @@ if np.max(np.abs(yaw_step)) > math.radians(yaw_step_limit_deg):  # 정상 주행
 ```
 
 그래서 **급코너를 하나의 `ScenarioPath`(= 하나의 phase) 안에 그대로 담을 수 있습니다** —
-`ScenarioPath.join_with_turns()`(`scenario_path.py`)로 두 개의 정상 구간을 이어붙이면, 이음매의
-두 점은 **완전히 같은 위치(구간 길이 0)**, 그 사이에서 헤딩만 크게 꺾입니다. `join_with_turns()`는
-이 이음매 인덱스만 곡률/헤딩-스텝/접선-일치 검사에서 제외하고, 나머지 구간(실제 주행 구간)에는
-검사를 그대로 적용합니다 — 정상 구간 저작 실수는 여전히 걸러집니다.
+정상 구간(직진/곡선) 두 개의 x/y/yaw/kappa/mode 배열을 그냥 이어붙여서(`np.concatenate`)
+`ScenarioPath.from_arrays()`에 한 번에 넘기면 됩니다. 이음매의 두 점은 **완전히 같은
+위치(구간 길이 0)**, 그 사이에서 헤딩만 크게 꺾입니다. `from_arrays()`는 이어붙인 배열의
+(x, y, yaw)로부터 C++ 플래너(`estimate_curvature_from_yaw()`)와 똑같은 방식으로 순간
+곡률(헤딩변화/거리)을 다시 계산해서, 그 값이 비정상적으로 크면(기본 임계값 1000 m⁻¹, C++와
+동일) 그 지점을 이음매로 자동 판별합니다 — 호출자가 이음매 위치를 따로 표시해 줄 필요가
+없습니다. 판별된 이음매 인덱스만 곡률/헤딩-스텝/접선-일치 검사에서 제외하고, 나머지
+구간(실제 주행 구간)에는 검사를 그대로 적용합니다 — 정상 구간 저작 실수는 여전히
+걸러집니다. 결과 객체의 `skip_continuity_at` 필드에 판별된 이음매 인덱스가 남아 있고,
+`local_slice()`/`clipped()`로 잘라낸 부분 배열에 대해서도 같은 재계산으로 그대로
+재탐지됩니다 — 이음매 위치를 슬라이스마다 손으로 옮겨 담을 필요가 없습니다.
 
 역할 분담:
 - **시나리오 매니저(Python)**: phase 분할은 **드라이브 모드가 바뀔 때만** 합니다. 급코너
@@ -55,7 +62,7 @@ Forward/Reverse/Left/Right(0~3)는 **항상 외부에서 요청이 들어오는 
 
 `path_callback()`이 사용하는 입력 처리 코드는 `estimate_curvature_from_yaw()`로 곡률을 계산하고
 있습니다 (`s`, `psi`로부터 전진차분 `kappa[i] = (psi[i+1]-psi[i]) / max(s[i+1]-s[i], 1e-15)`).
-`join_with_turns()`로 이어붙인 이음매는 `s[i+1]-s[i] ≈ 0`인 채로 헤딩만 크게 꺾이므로, 이
+이어붙인 구간 경계(이음매)는 `s[i+1]-s[i] ≈ 0`인 채로 헤딩만 크게 꺾이므로, 이
 함수가 그 지점에서 **자연히 비정상적으로 큰 값**(정상 주행 곡률과는 몇 자릿수 차이 나는 값)을
 내놓습니다. 별도의 헤딩-점프 스캔 함수를 새로 만들 필요가 없습니다 — **이미 계산되는 이
 곡률값 자체가 급코너 판별 기준**입니다:
@@ -198,7 +205,7 @@ if (mode_ready && maneuver_.state() == Inactive && pending_spot_turn_target_yaw_
 
 ### 1-5. Phase 분할은 이제 드라이브 모드 전환에서만 일어남
 
-`ScenarioPath.join_with_turns()`로 이음매의 연속성 검사만 예외 처리하므로(0절), 40도/60도/70도급 급코너를 여러 개 가진 웨이포인트도 **하나의 연속
+`ScenarioPath.from_arrays()`가 이음매의 연속성 검사만 자동으로 예외 처리하므로(0절), 40도/60도/70도급 급코너를 여러 개 가진 웨이포인트도 **하나의 연속
 `ScenarioPath`(= 하나의 phase)** 로 저작할 수 있습니다. `ScenarioPhase`는 원래 형태 그대로
 유지합니다 (신규 필드 없음):
 
@@ -540,7 +547,7 @@ forward_4_plain       FORWARD  곡선 구간, 코너 없음 (36.0 m)
 |---|---|---|
 | 급코너 탐지 + 경로 절단 (플래너 내부, C++) | `path_callback()`의 `estimate_curvature_from_yaw()` 결과 스캔 | 절단 로직만 신규 — 곡률 계산 자체는 기존 것 그대로 재사용, 별도 탐지 함수 안 만듦 (1-2절) |
 | Phase 분할 (시나리오) | `ScenarioPhase` | 구조체 변경 없음 — 단, 분할 기준이 모드 전환으로 바뀜(급코너는 더 이상 분할 이유 아님, 1-5절) |
-| 경로 저작 검증 | `ScenarioPath.from_arrays()` / `join_with_turns()` | 검사 자체는 유지 — 이음매 인덱스만 `skip_continuity_at`로 예외 처리 (0절) |
+| 경로 저작 검증 | `ScenarioPath.from_arrays()` | 검사 자체는 유지 — 이어붙인 배열의 곡률을 스스로 재계산해서 이음매를 자동 판별하고, 그 인덱스만 `skip_continuity_at`에 담아 예외 처리 (0절) |
 | 계획 무효화(hard_change) | `is_soft_reference_continuation_locked()` | **판정 로직은 무변경** — 코너 절단 메시지는 그 판정과 무관하게 `hard_change` 강제 (1-2절) |
 | 도착 확인 | `reference_path_->project()` + `s_max()` 비교 | 신규이지만 `terminal_hold_active()`와 동일한 패턴 재사용 (1-3절) |
 | 회전 트리거 | `command_callback()` 매 틱 재시도 | 신규 — 시나리오 관여 없음 (1-3절) |

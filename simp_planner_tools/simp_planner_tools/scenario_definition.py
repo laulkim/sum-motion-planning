@@ -229,11 +229,30 @@ def _curved_segment(
     return ScenarioPath.from_arrays(x, y, yaw, kappa, mode_array)
 
 
+def _concat_segments(segments: tuple[ScenarioPath, ...]) -> ScenarioPath:
+    """Concatenate driving segments into one path.
+
+    A spot-turn corner between two segments is simply the raw x/y/yaw
+    concatenation -- ScenarioPath.from_arrays() recomputes curvature from
+    (x, y, yaw) itself and recognizes a corner wherever that recomputed
+    curvature is abnormally large, so no caller-side bookkeeping of where
+    the corner sits is needed.
+    """
+    return ScenarioPath.from_arrays(
+        np.concatenate([segment.x for segment in segments]),
+        np.concatenate([segment.y for segment in segments]),
+        np.concatenate([segment.yaw for segment in segments]),
+        np.concatenate([segment.kappa for segment in segments]),
+        np.concatenate([segment.mode for segment in segments]),
+        map_yaw=np.concatenate([segment.map_yaw for segment in segments]),
+        heading_semantics=segments[0].heading_semantics,
+    )
+
+
 def build_spot_turn_crab_course_phases(
     *,
     forward_leg_length: float = 36.0,
     crab_leg_length: float = 24.0,
-    stub_length: float = 0.6,
     turn_degrees: tuple[float, float, float] = (40.0, -60.0, 70.0),
     curvature_after_turn1: float = 0.018,
     curvature_final_leg: float = -0.015,
@@ -241,47 +260,40 @@ def build_spot_turn_crab_course_phases(
     crab_speed: float = 1.0,
     ds: float = 0.2,
 ) -> tuple["ScenarioPhase", ...]:
-    """일반주행 -> 제자리턴+주행 -> 크랩 -> 제자리턴+주행 -> 크랩 ->
-    제자리턴+주행 -> 크랩 -> 그냥주행, 7-phase 코스.
+    """일반주행 -> 제자리턴 -> 주행 -> 크랩 -> 제자리턴 -> 주행 -> 크랩 ->
+    제자리턴 -> 주행 -> 크랩 -> 그냥주행, 8-phase 코스.
 
-    제자리턴 코너는 phase 분할이 아니라 각 FORWARD phase 자신의 경로 배열
-    안에서 ScenarioPath.join_with_turns()로 이어붙인 이음매로 표현된다
-    (phase는 모드가 바뀔 때만 나뉜다). 크랩(LEFT) 구간 바로 다음에 오는
-    FORWARD phase는, 크랩이 끝난 자리에서 옛 헤딩으로 아주 짧게(stub_length)
-    서 있다가 그 자리에서 제자리턴하는 모양이 되도록, 그 stub을 이음매 앞
-    구간으로 쓴다. 크랩은 몸체 헤딩을 바꾸지 않으므로(옆으로만 이동), 다음
-    제자리턴은 항상 크랩 진입 직전의 헤딩에서 시작한다.
+    각 다리(leg)는 완전히 독립된 phase다 -- 코너 앞뒤를 하나의 경로 배열로
+    이어붙이지 않는다. phase 분할은 이제 모드가 바뀔 때뿐 아니라 다리(제자리턴
+    포함)마다 일어나고, 그 다리에 들어서기 전에 제자리턴이 필요한지는 전부
+    플래너(C++)가 새로 받은 phase의 시작 헤딩과 차량의 실제 현재 헤딩을 비교해서
+    스스로 판단한다. 크랩(LEFT) 구간은 몸체 헤딩을 바꾸지 않으므로(옆으로만
+    이동), 크랩 바로 다음 phase의 시작 헤딩은 항상 그 크랩 진입 직전 헤딩
+    기준으로 다음 제자리턴 각도만큼 돌아간 값이다.
     """
     turns = [math.radians(value) for value in turn_degrees]
     heading = 0.0
     x, y = 0.0, 0.0
 
-    seg_a = _straight_segment(x, y, heading, forward_leg_length, mode=0, ds=ds)
-    x, y = float(seg_a.x[-1]), float(seg_a.y[-1])
+    forward1a = _straight_segment(x, y, heading, forward_leg_length, mode=0, ds=ds)
+    x, y = float(forward1a.x[-1]), float(forward1a.y[-1])
     heading += turns[0]
-    seg_b = _curved_segment(x, y, heading, curvature_after_turn1, forward_leg_length, mode=0, ds=ds)
-    forward1 = ScenarioPath.join_with_turns([seg_a, seg_b])
-    heading = float(seg_b.yaw[-1])
-    x, y = float(forward1.x[-1]), float(forward1.y[-1])
+    forward1b = _curved_segment(x, y, heading, curvature_after_turn1, forward_leg_length, mode=0, ds=ds)
+    heading = float(forward1b.yaw[-1])
+    x, y = float(forward1b.x[-1]), float(forward1b.y[-1])
 
     crab1 = _straight_segment(x, y, heading + 0.5 * math.pi, crab_leg_length, mode=2, ds=ds)
     x, y = float(crab1.x[-1]), float(crab1.y[-1])
 
-    stub_b = _straight_segment(x, y, heading, stub_length, mode=0, ds=ds)
-    x, y = float(stub_b.x[-1]), float(stub_b.y[-1])
     heading += turns[1]
-    seg_c = _straight_segment(x, y, heading, forward_leg_length, mode=0, ds=ds)
-    forward2 = ScenarioPath.join_with_turns([stub_b, seg_c])
+    forward2 = _straight_segment(x, y, heading, forward_leg_length, mode=0, ds=ds)
     x, y = float(forward2.x[-1]), float(forward2.y[-1])
 
     crab2 = _straight_segment(x, y, heading + 0.5 * math.pi, crab_leg_length, mode=2, ds=ds)
     x, y = float(crab2.x[-1]), float(crab2.y[-1])
 
-    stub_c = _straight_segment(x, y, heading, stub_length, mode=0, ds=ds)
-    x, y = float(stub_c.x[-1]), float(stub_c.y[-1])
     heading += turns[2]
-    seg_d = _straight_segment(x, y, heading, forward_leg_length, mode=0, ds=ds)
-    forward3 = ScenarioPath.join_with_turns([stub_c, seg_d])
+    forward3 = _straight_segment(x, y, heading, forward_leg_length, mode=0, ds=ds)
     x, y = float(forward3.x[-1]), float(forward3.y[-1])
 
     crab3 = _straight_segment(x, y, heading + 0.5 * math.pi, crab_leg_length, mode=2, ds=ds)
@@ -298,11 +310,12 @@ def build_spot_turn_crab_course_phases(
         )
 
     return (
-        _phase("forward_1_with_turn", forward1, forward_speed, True),
+        _phase("forward_1a", forward1a, forward_speed, True),
+        _phase("forward_1b_after_turn", forward1b, forward_speed, True),
         _phase("crab_1", crab1, crab_speed, True),
-        _phase("forward_2_with_turn", forward2, forward_speed, True),
+        _phase("forward_2_after_turn", forward2, forward_speed, True),
         _phase("crab_2", crab2, crab_speed, True),
-        _phase("forward_3_with_turn", forward3, forward_speed, True),
+        _phase("forward_3_after_turn", forward3, forward_speed, True),
         _phase("crab_3", crab3, crab_speed, True),
         _phase("forward_4_plain", forward4, forward_speed, False),
     )

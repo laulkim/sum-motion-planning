@@ -29,89 +29,67 @@ struct Input {
   }
 };
 
-void test_split_arrival_and_replanning() {
+void test_build_reference_path_drops_padding_and_matches_curvature() {
   Input input;
   input.leg(0, 0, 0, 8);
-  input.leg(8, 0, 40 * kPi / 180, 8);
   input.pad();
-  SpotTurnReferenceBuffer buffer;
-  auto path = buffer.update(input.x, input.y, input.yaw, DriveMode::Forward, 1000);
-  require(buffer.pending(), "missing turn");
-  require(path->x().back() == 8 && path->kappa().back() == 0, "seam curvature leaked into head");
-  require(!buffer.arrived(PlannerState{}, 0.2), "triggered at origin");
-  PlannerState near_end{};
-  near_end.x = 7.95;
-  require(buffer.arrived(near_end, 0.2), "failed to capture corner");
-  near_end.y = 3;
-  require(!buffer.arrived(near_end, 0.2), "projection alone incorrectly captured remote vehicle");
+  auto path = build_reference_path(input.x, input.y, input.yaw);
+  require(path->size() == input.x.size() - 1, "padding point was not dropped");
+  require(std::abs(path->x().back() - 8.0) < 1.0e-9, "kept the padding point's own coordinate");
+  require(path->kappa().back() == 0.0, "straight leg reports nonzero curvature");
 
   EnvConfig config;
   Costmap2D map(std::vector<std::int8_t>(300 * 300, 0), 300, 300, 0.2, -20, -20);
   PathVelocityPlanner planner(config, *path, map);
   auto result = planner.plan({}, {}, {1.5, DriveMode::Forward});
-  require(result.selected_path && result.trajectory.safe(), "split approach has no driving plan");
-  require(result.trajectory.states.back().speed > 1.0, "split approach cannot accelerate");
-  auto tail = buffer.complete_turn();
-  require(!buffer.pending(), "completed corner still pending");
-  require(std::hypot(tail->x().front() - 8, tail->y().front()) < 1.0e-9, "turn introduces position gap");
-  PlannerState after{};
-  after.x = 8;
-  after.chi = 40 * kPi / 180;
-  PathVelocityPlanner next(config, *tail, map);
-  auto resumed = next.plan(after, {}, {1.5, DriveMode::Forward});
-  require(resumed.selected_path && resumed.trajectory.states.back().speed > 1.0,
-          "cannot accelerate after restoring remainder");
-
-  // Republishing a rolling window resets s, but still contains the old seam.
-  input.x.erase(input.x.begin(), input.x.begin() + 20);
-  input.y.erase(input.y.begin(), input.y.begin() + 20);
-  input.yaw.erase(input.yaw.begin(), input.yaw.begin() + 20);
-  auto rolling = buffer.update(input.x, input.y, input.yaw, DriveMode::Forward, 1000);
-  require(!buffer.pending() && rolling->x().front() == 8, "completed seam replayed from rolling window");
-  Input later;
-  later.leg(20, 0, 0, 0.6);
-  later.leg(20.6, 0, -kPi / 3, 8);
-  later.pad();
-  buffer.update(later.x, later.y, later.yaw, DriveMode::Forward, 1000);
-  require(buffer.pending(), "future corner with smaller local s was skipped");
+  require(result.selected_path && result.trajectory.safe(), "leg has no driving plan");
+  require(result.trajectory.states.back().speed > 1.0, "leg cannot accelerate");
 }
 
-void test_multiple_turns_and_modes() {
-  Input input;
-  input.leg(0, 0, 0, 8);
-  input.leg(8, 0, kPi / 2, 8);
-  input.leg(8, 8, 0, 8);
-  input.pad();
+void test_heading_jump_between_legs_is_detected_per_mode() {
+  Input before;
+  before.leg(0, 0, 0, 8);
+  before.pad();
+  Input after;
+  after.leg(8, 0, 40 * kPi / 180, 8);
+  after.pad();
+  auto before_path = build_reference_path(before.x, before.y, before.yaw);
+  auto after_path = build_reference_path(after.x, after.y, after.yaw);
   for (auto mode : {DriveMode::Forward, DriveMode::Reverse, DriveMode::Left, DriveMode::Right}) {
-    SpotTurnReferenceBuffer buffer;
-    buffer.update(input.x, input.y, input.yaw, mode, 1000);
-    require(std::abs(wrap_angle(buffer.target_body_yaw() + drive_mode_heading_offset(mode) - kPi / 2)) < 1.0e-9,
+    const double target = spot_turn_target_body_yaw(after_path->psi().front(), mode);
+    require(std::abs(wrap_angle(target + drive_mode_heading_offset(mode) - 40 * kPi / 180)) < 1.0e-9,
             "target body yaw does not account for mode");
-    auto second = buffer.complete_turn();
-    require(buffer.pending() && second->kappa().back() == 0, "second split failed");
-    PlannerState old_corner{};
-    old_corner.x = 8;
-    old_corner.chi = kPi / 2;
-    require(!buffer.arrived(old_corner, 0.2), "second rotation triggered at first corner");
-    auto third = buffer.complete_turn();
-    require(!buffer.pending() && third->y().front() == 8, "third leg not restored");
+    const double current_body_yaw =
+        spot_turn_target_body_yaw(before_path->psi().back(), mode);
+    require(std::abs(wrap_angle(target - current_body_yaw)) > 0.349066,
+            "40 degree leg boundary was not flagged as a spot turn");
   }
+  // A small heading step (a gentle curve continuing into the next leg)
+  // must not be mistaken for a corner.
+  Input gentle;
+  gentle.leg(8, 0, 5 * kPi / 180, 8);
+  gentle.pad();
+  auto gentle_path = build_reference_path(gentle.x, gentle.y, gentle.yaw);
+  const double gentle_target = spot_turn_target_body_yaw(gentle_path->psi().front(), DriveMode::Forward);
+  const double straight_body_yaw =
+      spot_turn_target_body_yaw(before_path->psi().back(), DriveMode::Forward);
+  require(std::abs(wrap_angle(gentle_target - straight_body_yaw)) <= 0.349066,
+          "a 5 degree step was incorrectly flagged as a spot turn");
 }
 
-void test_invalid_split_is_atomic() {
-  SpotTurnReferenceBuffer buffer;
+void test_invalid_reference_arrays_are_rejected() {
+  bool rejected = false;
+  try {
+    build_reference_path({0, 1, 1, 1, 1, 1}, {0, 0, 0, 1, 2, 3},
+                         {0, 0, kPi / 2, kPi / 2, kPi / 2, kPi / 2});
+  } catch (const std::invalid_argument&) { rejected = true; }
+  require(rejected, "duplicate point without a heading change was accepted");
+
   Input straight;
   straight.leg(0, 0, 0, 8);
   straight.pad();
-  buffer.update(straight.x, straight.y, straight.yaw, DriveMode::Forward, 1000);
-  bool rejected = false;
-  try {
-    buffer.update({0, 1, 1, 1, 1, 1}, {0, 0, 0, 1, 2, 3},
-                  {0, 0, kPi / 2, kPi / 2, kPi / 2, kPi / 2}, DriveMode::Forward, 1000);
-  } catch (const std::invalid_argument&) { rejected = true; }
-  require(rejected && !buffer.pending(), "invalid short head left pending state");
-  require(static_cast<bool>(buffer.update(straight.x, straight.y, straight.yaw, DriveMode::Forward, 1000)),
-          "valid update blocked after malformed input");
+  require(static_cast<bool>(build_reference_path(straight.x, straight.y, straight.yaw)),
+          "a valid reference array was rejected");
 }
 
 void test_rotation_uses_feedback_and_accepts_new_return_mode() {
@@ -156,9 +134,9 @@ void test_clearance_gate() {
 
 int main() {
   try {
-    test_split_arrival_and_replanning();
-    test_multiple_turns_and_modes();
-    test_invalid_split_is_atomic();
+    test_build_reference_path_drops_padding_and_matches_curvature();
+    test_heading_jump_between_legs_is_detected_per_mode();
+    test_invalid_reference_arrays_are_rejected();
     test_rotation_uses_feedback_and_accepts_new_return_mode();
     test_clearance_gate();
     std::cout << "all spot-turn integration tests passed\n";

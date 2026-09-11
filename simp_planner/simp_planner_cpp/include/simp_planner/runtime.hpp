@@ -159,8 +159,7 @@ class JerkLimitedSafetyStop {
 };
 
 struct SpotTurnConfig {
-  double kappa_threshold{1000.0};
-  double arrival_tolerance_m{0.20};
+  double heading_jump_threshold_rad{0.349066};  // 20 deg
   double safety_margin{0.0};
   double yaw_rate_max{0.3};
   double yaw_rate_accel_max{0.3};
@@ -168,28 +167,16 @@ struct SpotTurnConfig {
   double yaw_rate_tolerance{0.02};
 };
 
-// Input includes the publisher's extra curvature-sampling point. Only the
-// temporary input may contain coincident turn points; every stored driving
-// segment has strictly increasing arc length and at least three points.
-class SpotTurnReferenceBuffer {
- public:
-  std::shared_ptr<ReferencePath> update(
-      const std::vector<double>& x, const std::vector<double>& y,
-      const std::vector<double>& yaw, DriveMode mode, double kappa_threshold);
-  bool pending() const { return paths_.size() > 1; }
-  double target_body_yaw() const;
-  bool arrived(const PlannerState& state, double tolerance) const;
-  std::shared_ptr<ReferencePath> complete_turn();
-  void reset();
+// Input includes the publisher's extra curvature-sampling point: the last
+// point is dropped after its forward-difference curvature estimates the
+// true last usable point.
+std::shared_ptr<ReferencePath> build_reference_path(
+    const std::vector<double>& x, const std::vector<double>& y,
+    const std::vector<double>& yaw);
 
- private:
-  struct Corner {
-    double x, y, before, after;
-  };
-  std::deque<std::shared_ptr<ReferencePath>> paths_;
-  std::vector<Corner> completed_;
-  std::optional<DriveMode> mode_;
-};
+// The body yaw a vehicle in `mode` must hold to drive a reference path whose
+// first point's motion heading is `path_start_psi`.
+double spot_turn_target_body_yaw(double path_start_psi, DriveMode mode);
 
 bool spot_turn_feasible(const Costmap2D& costmap, const PlannerState& state,
                         const VehicleConfig& vehicle, double safety_margin);
