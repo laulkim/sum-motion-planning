@@ -122,7 +122,7 @@ class DebugPlotNode(Node):
                 "allocation_min_clearance", "coarse_collision_free",
                 "precise_collision_free", "allocation_collision_free",
                 "planner_state", "planner_block_reason", "diagnosis",
-                "source_stamp_ns",
+                "source_stamp_ns", "measured_vx", "measured_vy", "measured_yaw_rate",
             ]
         )
         self.command_csv_file = (self.session_dir / "command_history.csv").open(
@@ -142,6 +142,7 @@ class DebugPlotNode(Node):
                 "speed_reconstruction_error", "mode", "plan_id",
                 "source_stamp_ns", "reference_valid", "reference_x", "reference_y",
                 "reference_chi_rad", "reference_body_yaw_rad",
+                "pre_p_vx", "pre_p_vy", "pre_p_yaw_rate",
             ]
         )
 
@@ -537,6 +538,11 @@ class DebugPlotNode(Node):
                 f"{message.segment_start_x:.12f}", f"{message.segment_start_y:.12f}",
                 f"{message.motion_heading:.12f}",
                 f"{message.motion_heading - message.beta:.12f}",
+                # Current pure-P controller preserves beta and adds these
+                # corrections directly; invert them in native SI units.
+                vx - message.tracking_speed_correction * math.cos(message.beta),
+                vy - message.tracking_speed_correction * math.sin(message.beta),
+                yaw_rate - message.tracking_heading_rate_correction,
             ]
         )
 
@@ -836,6 +842,8 @@ class DebugPlotNode(Node):
                 self.planner_status.get("state", "UNKNOWN"),
                 self.planner_status.get("block_reason", "UNKNOWN"), diagnosis,
                 message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec,
+                message.twist.twist.linear.x, message.twist.twist.linear.y,
+                message.twist.twist.angular.z,
             ]
         )
 

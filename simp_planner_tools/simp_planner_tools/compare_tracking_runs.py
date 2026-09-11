@@ -180,6 +180,64 @@ def compare_tracking_runs(
     else:
         print("Ground-truth evaluation skipped: record new runs with ground_truth_history.csv.")
     # The comparison caller shows all figures with one plt.show().
+    for label, directory, filename in (
+        ("ideal P ON", ideal_directory, "ideal_velocity_tracking.png"),
+        ("noisy P OFF", noisy_off_directory, "noisy_off_velocity_tracking.png"),
+        ("noisy P ON", noisy_on_directory, "noisy_on_velocity_tracking.png"),
+    ):
+        render_velocity_tracking(directory, f"{scenario}: {label}",
+                                 None if output_directory is None else output_directory / filename)
+    return result
+
+
+def render_velocity_tracking(directory: Path, label: str, output_path: Path | None) -> dict:
+    commands = _rows(directory / "command_history.csv")
+    odom = _rows(directory / "odom_history.csv")
+    keys = ("vx", "vy", "yaw_rate")
+    if (not commands or not odom or
+        not {"source_stamp_ns", *(f"pre_p_{key}" for key in keys)} <= commands[0].keys() or
+        not {"source_stamp_ns", *(f"measured_{key}" for key in keys)} <= odom[0].keys()):
+        print(f"Velocity tracking skipped for {label}: newly recorded velocity columns required.")
+        return {}
+    origin = int(next((row for row in commands if sum(abs(float(row[k])) for k in keys) > 1e-4),
+                      commands[0])["source_stamp_ns"])
+    poses = {int(row["source_stamp_ns"]): row for row in odom if int(row["source_stamp_ns"]) > 0}
+    stamps = sorted(poses)
+    if len(stamps) < 2:
+        raise ValueError(f"Not enough velocity feedback samples: {directory}")
+    odom_t = np.array([(stamp - origin) * 1e-9 for stamp in stamps])
+    samples = sorted((row for row in commands if int(row["source_stamp_ns"]) >= origin),
+                     key=lambda row: int(row["source_stamp_ns"]))
+    time = np.array([(int(row["source_stamp_ns"]) - origin) * 1e-9 for row in samples])
+    valid = (time >= odom_t[0]) & (time <= odom_t[-1])
+    result = {"time": time}
+    truth_path = directory / "ground_truth_history.csv"
+    truth_rows = _rows(truth_path) if truth_path.is_file() else []
+    truth = {int(row["source_stamp_ns"]): row for row in truth_rows}
+    truth_stamps = sorted(truth)
+    figure, axes = plt.subplots(3, 1, figsize=(13, 10), sharex=True, constrained_layout=True)
+    figure.suptitle(f"{label}: body velocity target / command / measured feedback")
+    for key, axis in zip(keys, axes):
+        pre = np.array([float(row[f"pre_p_{key}"]) for row in samples])
+        post = np.array([float(row[key]) for row in samples])
+        measured = np.interp(time, odom_t, [float(poses[stamp][f"measured_{key}"]) for stamp in stamps])
+        measured[~valid] = np.nan
+        result[key] = {"pre_p": pre, "post_p": post, "measured": measured}
+        axis.plot(time, pre, "--", label="Target before P (allocated)")
+        axis.plot(time, post, label="Command after P", alpha=.8)
+        axis.plot(time, measured, label="Odometry measured twist", alpha=.8)
+        if len(truth_stamps) >= 2 and all(key in truth[s] for s in truth_stamps):
+            truth_t = np.array([(s - origin) * 1e-9 for s in truth_stamps])
+            actual = np.interp(time, truth_t, [float(truth[s][key]) for s in truth_stamps])
+            actual[(time < truth_t[0]) | (time > truth_t[-1])] = np.nan
+            result[key]["ground_truth"] = actual
+            axis.plot(time, actual, ":", label="Ground truth (vehicle)", alpha=.9)
+        axis.set_ylabel(f"{key} [{'rad/s' if key == 'yaw_rate' else 'm/s'}]")
+        axis.grid(True, alpha=.3)
+        axis.legend()
+    axes[-1].set_xlabel("time from first non-zero command [s]; source timestamps")
+    if output_path is not None:
+        figure.savefig(output_path, dpi=160)
     return result
 
 

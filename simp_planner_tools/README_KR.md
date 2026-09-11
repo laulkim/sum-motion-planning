@@ -26,6 +26,12 @@ terminal_safe_region
 
 - `noisy_trajectories.png`: P OFF/ON의 각 목표와 추정/실제 XY 궤적.
 - `noisy_state_errors.png`: 목표−추정, 목표−실제, 추정−실제의 종·횡·차체 헤딩 오차.
+- `ideal_velocity_tracking.png`, `noisy_off_velocity_tracking.png`, `noisy_on_velocity_tracking.png`:
+  각 실행의 body vx·vy(m/s), yaw-rate(rad/s)에 P 보정 전 목표, 보정 후 명령,
+  `/odom` 측정 twist, `/ground_truth/odom` 실제 twist(기록이 있을 때)를 겹쳐 표시합니다.
+  보정 전 목표는 allocation 이후 값이며, 현재 가산형 P 보정량을 명령에서 빼서 복원합니다.
+  source timestamp로 정렬하며 피드백 기록 범위 밖은 외삽하지 않습니다.
+  새 속도 열이 필요한 그래프이므로 수정 후 시뮬레이션을 다시 실행해야 합니다.
 - `noisy_state_error_metrics.png`: 위 오차의 RMSE·최대 절댓값. 수치는 `noisy_state_metrics.json`에도 저장.
 
 각 실행 안에서 원본 timestamp로 정렬하고, 위치 오차는 목표 이동 방향 좌표계로 표시한다.

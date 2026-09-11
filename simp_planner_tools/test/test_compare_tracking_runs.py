@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pytest
 
-from simp_planner_tools.compare_tracking_runs import load_tracking_errors
+from simp_planner_tools.compare_tracking_runs import load_tracking_errors, render_velocity_tracking
 from simp_planner_tools.compare_simulation_runs import compare_runs
 
 
@@ -110,3 +110,30 @@ def test_old_two_run_comparison_still_has_two_windows(tmp_path, monkeypatch):
     monkeypatch.setattr(plt, "show", lambda: shown.append(len(plt.get_fignums())))
     compare_runs(tmp_path / "ideal", tmp_path / "noisy", None, show=True)
     assert shown == [2]
+
+
+def test_velocity_lines_use_source_time_and_distinguish_truth(tmp_path):
+    directory = tmp_path / "run"
+    odom, commands = make_run(directory)
+    keys = ("vx", "vy", "yaw_rate")
+    for i, row in enumerate(odom):
+        row.update({f"measured_{key}": float(i) for key in keys})
+    for row in commands:
+        row.update({f"pre_p_{key}": .25 for key in keys})
+    commands[-1]["source_stamp_ns"] += 2_000_000_000
+    write_csv(directory / "odom_history.csv", odom)
+    write_csv(directory / "command_history.csv", commands)
+    truth = [dict(row, **{key: float(i) + 10 for key in keys})
+             for i, row in enumerate(odom)]
+    write_csv(directory / "ground_truth_history.csv", truth)
+    result = render_velocity_tracking(directory, "test", tmp_path / "velocity.png")
+    for key in keys:
+        np.testing.assert_allclose(result[key]["pre_p"], .25)
+        np.testing.assert_allclose(result[key]["post_p"], [row[key] for row in commands])
+        np.testing.assert_allclose(result[key]["measured"][:3], [.5, 1.5, 2.5])
+        np.testing.assert_allclose(result[key]["ground_truth"][:3], [10.5, 11.5, 12.5])
+        assert np.isnan(result[key]["measured"][-1])
+        assert np.isnan(result[key]["ground_truth"][-1])
+    assert all(len(axis.lines) == 4 for axis in plt.gcf().axes)
+    assert (tmp_path / "velocity.png").is_file()
+    plt.close("all")
