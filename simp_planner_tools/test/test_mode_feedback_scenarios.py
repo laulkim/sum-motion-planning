@@ -2,7 +2,10 @@ from pathlib import Path
 
 import numpy as np
 
-from planar_velocity_sim.mode_transition import DriveModeTransitionModel
+from planar_velocity_sim.mode_transition import (
+    DriveModeTransitionModel,
+    VehicleModeStatus,
+)
 from simp_planner_tools.scenario_definition import load_scenario_definition
 
 
@@ -27,8 +30,7 @@ def planner_mode_ready(requested_mode: int, model: DriveModeTransitionModel) -> 
     feedback = model.feedback()
     return (
         feedback.current_mode == requested_mode
-        and feedback.transition_complete
-        and not feedback.transition_in_progress
+        and feedback.status == VehicleModeStatus.READY
     )
 
 

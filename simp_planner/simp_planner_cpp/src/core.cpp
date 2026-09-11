@@ -1,6 +1,7 @@
 #include "simp_planner/core.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -12,6 +13,27 @@
 
 namespace simp_planner {
 namespace {
+
+PlanningCallCounts g_planning_call_counts;
+PlanningBlockTimings g_planning_block_timings;
+
+// Accumulates elapsed wall-clock time into `bucket_ms` for the lifetime of
+// the scope it's declared in, regardless of how that scope is exited.
+class ScopedBlockTimer {
+ public:
+  explicit ScopedBlockTimer(double& bucket_ms)
+      : bucket_ms_(bucket_ms), start_(std::chrono::steady_clock::now()) {}
+  ~ScopedBlockTimer() {
+    bucket_ms_ += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start_).count();
+  }
+  ScopedBlockTimer(const ScopedBlockTimer&) = delete;
+  ScopedBlockTimer& operator=(const ScopedBlockTimer&) = delete;
+
+ private:
+  double& bucket_ms_;
+  std::chrono::steady_clock::time_point start_;
+};
 
 constexpr double kInf = std::numeric_limits<double>::infinity();
 
@@ -123,6 +145,32 @@ struct ProfileResult {
   std::vector<double> dddp;
 };
 
+double multiply_add(double multiplicand, double multiplier, double addend) {
+#if defined(__FMA__)
+  return std::fma(multiplicand, multiplier, addend);
+#else
+  return multiplicand * multiplier + addend;
+#endif
+}
+
+template <std::size_t N>
+double evaluate_polynomial_horner(const std::array<double, N>& coefficients,
+                                  double value) {
+  static_assert(N > 0, "a polynomial must contain at least one coefficient");
+  double result = coefficients.back();
+  for (std::size_t index = N - 1; index > 0; --index) {
+    result = multiply_add(result, value, coefficients[index - 1]);
+  }
+  return result;
+}
+
+double jerk_integrated_distance(double speed, double acceleration,
+                                double jerk, double duration) {
+  const double quadratic = multiply_add(
+      jerk / 6.0, duration, 0.5 * acceleration);
+  return duration * multiply_add(quadratic, duration, speed);
+}
+
 ProfileResult septic_boundary_profile(const std::vector<double>& q,
                                       double length,
                                       double p0,
@@ -131,56 +179,61 @@ ProfileResult septic_boundary_profile(const std::vector<double>& q,
                                       double dddp0,
                                       double p1) {
   const double L = std::max(length, 1.0e-6);
-  const double b0 = p0;
-  const double b1 = dp0 * L;
-  const double b2 = 0.5 * ddp0 * L * L;
-  const double b3 = (1.0 / 6.0) * dddp0 * L * L * L;
-  const std::array<double, 4> rhs{{
-      p1 - (b0 + b1 + b2 + b3),
-      -(b1 + 2.0 * b2 + 3.0 * b3),
-      -(2.0 * b2 + 6.0 * b3),
-      -6.0 * b3,
-  }};
-  const double b4 = 35.0 * rhs[0] - 15.0 * rhs[1] + 2.5 * rhs[2] - rhs[3] / 6.0;
-  const double b5 = -84.0 * rhs[0] + 39.0 * rhs[1] - 7.0 * rhs[2] + 0.5 * rhs[3];
-  const double b6 = 70.0 * rhs[0] - 34.0 * rhs[1] + 6.5 * rhs[2] - 0.5 * rhs[3];
-  const double b7 = -20.0 * rhs[0] + 10.0 * rhs[1] - 2.0 * rhs[2] + rhs[3] / 6.0;
-  const std::array<double, 8> c{{b0, b1, b2, b3, b4, b5, b6, b7}};
+  std::array<double, 8> c;
+  std::array<double, 7> dc;
+  std::array<double, 6> ddc;
+  std::array<double, 5> dddc;
+  double inv_L, inv_L2, inv_L3;
+  {
+    ScopedBlockTimer polynomial_fit_timer(g_planning_block_timings.candidate_polynomial_fit_ms);
+    const double b0 = p0;
+    const double b1 = dp0 * L;
+    const double b2 = 0.5 * ddp0 * L * L;
+    const double b3 = (1.0 / 6.0) * dddp0 * L * L * L;
+    const std::array<double, 4> rhs{{
+        p1 - (b0 + b1 + b2 + b3),
+        -(b1 + 2.0 * b2 + 3.0 * b3),
+        -(2.0 * b2 + 6.0 * b3),
+        -6.0 * b3,
+    }};
+    const double b4 = 35.0 * rhs[0] - 15.0 * rhs[1] + 2.5 * rhs[2] - rhs[3] / 6.0;
+    const double b5 = -84.0 * rhs[0] + 39.0 * rhs[1] - 7.0 * rhs[2] + 0.5 * rhs[3];
+    const double b6 = 70.0 * rhs[0] - 34.0 * rhs[1] + 6.5 * rhs[2] - 0.5 * rhs[3];
+    const double b7 = -20.0 * rhs[0] + 10.0 * rhs[1] - 2.0 * rhs[2] + rhs[3] / 6.0;
+    c = {{b0, b1, b2, b3, b4, b5, b6, b7}};
+    dc = {{b1, 2.0 * b2, 3.0 * b3, 4.0 * b4,
+           5.0 * b5, 6.0 * b6, 7.0 * b7}};
+    ddc = {{2.0 * b2, 6.0 * b3, 12.0 * b4,
+            20.0 * b5, 30.0 * b6, 42.0 * b7}};
+    dddc = {{6.0 * b3, 24.0 * b4, 60.0 * b5,
+             120.0 * b6, 210.0 * b7}};
+    inv_L = 1.0 / L;
+    inv_L2 = inv_L * inv_L;
+    inv_L3 = inv_L2 * inv_L;
+  }
 
   ProfileResult result;
   result.p.resize(q.size());
   result.dp.resize(q.size());
   result.ddp.resize(q.size());
   result.dddp.resize(q.size());
-  for (std::size_t k = 0; k < q.size(); ++k) {
-    const bool active = q[k] <= L;
-    const double tau = clamp_value(q[k] / L, 0.0, 1.0);
-    double p = 0.0;
-    double dp = 0.0;
-    double ddp = 0.0;
-    double dddp = 0.0;
-    double power = 1.0;
-    for (int i = 0; i < 8; ++i) {
-      p += c[static_cast<std::size_t>(i)] * power;
-      power *= tau;
+  {
+    ScopedBlockTimer sample_points_timer(g_planning_block_timings.candidate_sample_points_ms);
+    for (std::size_t k = 0; k < q.size(); ++k) {
+      const bool active = q[k] <= L;
+      if (!active) {
+        result.p[k] = p1;
+        result.dp[k] = 0.0;
+        result.ddp[k] = 0.0;
+        result.dddp[k] = 0.0;
+        continue;
+      }
+      const double tau = clamp_value(q[k] / L, 0.0, 1.0);
+      result.p[k] = evaluate_polynomial_horner(c, tau);
+      result.dp[k] = evaluate_polynomial_horner(dc, tau) * inv_L;
+      result.ddp[k] = evaluate_polynomial_horner(ddc, tau) * inv_L2;
+      result.dddp[k] = evaluate_polynomial_horner(dddc, tau) * inv_L3;
     }
-    for (int i = 1; i < 8; ++i) {
-      dp += static_cast<double>(i) * c[static_cast<std::size_t>(i)] *
-            std::pow(tau, i - 1) / L;
-    }
-    for (int i = 2; i < 8; ++i) {
-      ddp += static_cast<double>(i * (i - 1)) * c[static_cast<std::size_t>(i)] *
-             std::pow(tau, i - 2) / (L * L);
-    }
-    for (int i = 3; i < 8; ++i) {
-      dddp += static_cast<double>(i * (i - 1) * (i - 2)) *
-              c[static_cast<std::size_t>(i)] * std::pow(tau, i - 3) /
-              (L * L * L);
-    }
-    result.p[k] = active ? p : p1;
-    result.dp[k] = active ? dp : 0.0;
-    result.ddp[k] = active ? ddp : 0.0;
-    result.dddp[k] = active ? dddp : 0.0;
   }
   return result;
 }
@@ -223,26 +276,38 @@ ProfileResult terminal_position_profile(const std::vector<double>& q,
                                         double p1,
                                         double blend) {
   const double L = std::max(length, 1.0e-6);
-  const double c4 = (p1 - p0 - dp0 * L - 0.5 * ddp0 * L * L
-                    - (1.0 / 6.0) * dddp0 * L * L * L) /
-                    std::pow(L, 4.0);
+  double c4;
+  {
+    ScopedBlockTimer polynomial_fit_timer(g_planning_block_timings.candidate_polynomial_fit_ms);
+    const double L2 = L * L;
+    const double L4 = L2 * L2;
+    c4 = (p1 - p0 - dp0 * L - 0.5 * ddp0 * L * L
+         - (1.0 / 6.0) * dddp0 * L * L * L) /
+         L4;
+  }
   const auto seventh = septic_boundary_profile(q, L, p0, dp0, ddp0, dddp0, p1);
   const double b = clamp_value(blend, 0.0, 1.0);
   ProfileResult out;
   out.p.resize(q.size()); out.dp.resize(q.size()); out.ddp.resize(q.size()); out.dddp.resize(q.size());
-  for (std::size_t i = 0; i < q.size(); ++i) {
-    const double qc = clamp_value(q[i], 0.0, L);
-    const double p4 = p0 + dp0 * qc + 0.5 * ddp0 * qc * qc
-                    + (1.0 / 6.0) * dddp0 * std::pow(qc, 3.0)
-                    + c4 * std::pow(qc, 4.0);
-    const double dp4 = dp0 + ddp0 * qc + 0.5 * dddp0 * qc * qc
-                     + 4.0 * c4 * std::pow(qc, 3.0);
-    const double ddp4 = ddp0 + dddp0 * qc + 12.0 * c4 * qc * qc;
-    const double dddp4 = dddp0 + 24.0 * c4 * qc;
-    out.p[i] = (1.0 - b) * p4 + b * seventh.p[i];
-    out.dp[i] = (1.0 - b) * dp4 + b * seventh.dp[i];
-    out.ddp[i] = (1.0 - b) * ddp4 + b * seventh.ddp[i];
-    out.dddp[i] = (1.0 - b) * dddp4 + b * seventh.dddp[i];
+  {
+    ScopedBlockTimer sample_points_timer(g_planning_block_timings.candidate_sample_points_ms);
+    for (std::size_t i = 0; i < q.size(); ++i) {
+      const double qc = clamp_value(q[i], 0.0, L);
+      double p4 = multiply_add(c4, qc, dddp0 / 6.0);
+      p4 = multiply_add(p4, qc, 0.5 * ddp0);
+      p4 = multiply_add(p4, qc, dp0);
+      p4 = multiply_add(p4, qc, p0);
+      double dp4 = multiply_add(4.0 * c4, qc, 0.5 * dddp0);
+      dp4 = multiply_add(dp4, qc, ddp0);
+      dp4 = multiply_add(dp4, qc, dp0);
+      const double ddp4 = multiply_add(
+          multiply_add(12.0 * c4, qc, dddp0), qc, ddp0);
+      const double dddp4 = multiply_add(24.0 * c4, qc, dddp0);
+      out.p[i] = (1.0 - b) * p4 + b * seventh.p[i];
+      out.dp[i] = (1.0 - b) * dp4 + b * seventh.dp[i];
+      out.ddp[i] = (1.0 - b) * ddp4 + b * seventh.ddp[i];
+      out.dddp[i] = (1.0 - b) * dddp4 + b * seventh.dddp[i];
+    }
   }
   return out;
 }
@@ -330,9 +395,8 @@ ReferenceEvaluation evaluate_reference_with_virtual_extension(
   const std::size_t n = s_query.size();
   out.x.resize(n); out.y.resize(n); out.psi.resize(n); out.kappa.resize(n); out.kappa_s.resize(n); out.is_virtual.resize(n);
   real_end_s = clamp_value(real_end_s, path.s_min(), path.s_max());
-  double xe, ye, psie, kappae;
-  path.evaluate(real_end_s, xe, ye, psie, kappae);
-  const double kappase = interp_scalar(path.s(), path.kappa_s(), real_end_s);
+  double xe, ye, psie, kappae, kappase;
+  path.evaluate(real_end_s, xe, ye, psie, kappae, kappase);
   const double B = std::max(blend_length, 1.0e-3);
   double previous_d = 0.0;
   double previous_psi = psie;
@@ -341,8 +405,7 @@ ReferenceEvaluation evaluate_reference_with_virtual_extension(
   double previous_kappa = kappae;
   for (std::size_t i = 0; i < n; ++i) {
     if (s_query[i] <= real_end_s + 1.0e-12) {
-      path.evaluate(s_query[i], out.x[i], out.y[i], out.psi[i], out.kappa[i]);
-      out.kappa_s[i] = interp_scalar(path.s(), path.kappa_s(), s_query[i]);
+      path.evaluate(s_query[i], out.x[i], out.y[i], out.psi[i], out.kappa[i], out.kappa_s[i]);
       out.is_virtual[i] = 0;
       continue;
     }
@@ -375,9 +438,10 @@ std::pair<double, double> offset_path_curvature(double n, double n1, double n2,
   const double A = 1.0 - kappa_ref * n;
   const double B = n1;
   const double D = std::max(A * A + B * B, 1.0e-10);
+  const double sqrt_D = std::sqrt(D);
   const double A_prime = -kappa_ref_s * n - kappa_ref * B;
   const double numerator = kappa_ref * D + A * n2 - B * A_prime;
-  return {numerator / std::pow(D, 1.5), std::sqrt(D)};
+  return {numerator / (D * sqrt_D), sqrt_D};
 }
 
 InitialSpatialBoundary initial_spatial_boundaries(
@@ -400,8 +464,9 @@ InitialSpatialBoundary initial_spatial_boundaries(
       + motion_weight * measured_curvature;
   const double B = result.n1;
   const double D = A * A + B * B;
+  const double D_to_three_halves = D * std::sqrt(D);
   const double A_prime = -fr.kappa_s * result.n0 - fr.kappa * B;
-  result.n2 = clamp_value((k_vehicle * std::pow(D, 1.5) - fr.kappa * D + B * A_prime) / A,
+  result.n2 = clamp_value((k_vehicle * D_to_three_halves - fr.kappa * D + B * A_prime) / A,
                           -0.35, 0.35);
   const double measured_kappa_l = (previous_action.motion_heading_acceleration
       - state.acceleration * k_vehicle) /
@@ -410,9 +475,26 @@ InitialSpatialBoundary initial_spatial_boundaries(
       + motion_weight * measured_kappa_l;
   result.desired_kappa_l = clamp_value(result.desired_kappa_l, -0.10, 0.10);
   const double eps = 1.0e-3;
-  const double s1 = std::min(fr.s + eps, path.s_max());
-  const double k1 = interp_scalar(path.s(), path.kappa(), s1);
-  const double ks1 = interp_scalar(path.s(), path.kappa_s(), s1);
+  double k1 = 0.0;
+  double ks1 = 0.0;
+  {
+    ScopedBlockTimer projection_timer(g_planning_block_timings.candidate_projection_ms);
+    const double s1 = std::min(fr.s + eps, path.s_max());
+    // fr.segment_index already brackets fr.s (project() guarantees
+    // path.s()[segment_index] <= fr.s <= path.s()[segment_index + 1]). s1 is
+    // only eps=1mm further, so it falls in that same bracket unless fr.s was
+    // already within eps of the segment's far endpoint -- reuse the known
+    // index directly (O(1)) instead of re-searching the array for it.
+    const auto& s_values = path.s();
+    std::size_t index = std::min(fr.segment_index, s_values.size() - 2);
+    if (s1 > s_values[index + 1]) index = std::min(index + 1, s_values.size() - 2);
+    const double dx = std::max(s_values[index + 1] - s_values[index], 1.0e-15);
+    const double alpha = clamp_value((s1 - s_values[index]) / dx, 0.0, 1.0);
+    const auto& kappa_values = path.kappa();
+    const auto& kappa_s_values = path.kappa_s();
+    k1 = (1.0 - alpha) * kappa_values[index] + alpha * kappa_values[index + 1];
+    ks1 = (1.0 - alpha) * kappa_s_values[index] + alpha * kappa_s_values[index + 1];
+  }
   auto rate_for = [&](double n3) {
     const auto [kap0, speed0] = offset_path_curvature(result.n0, result.n1, result.n2, fr.kappa, fr.kappa_s);
     const double ne = result.n0 + result.n1 * eps + 0.5 * result.n2 * eps * eps + (1.0 / 6.0) * n3 * eps * eps * eps;
@@ -474,18 +556,25 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
     const ManeuverProfileState* maneuver_profile = nullptr,
     int curvature_retry_depth = 0,
     bool hard_preview_limit = false) {
-  const double real_end_s = reference.s_max() - cfg.simulation.path_end_margin;
-  const double remaining_real = std::max(real_end_s - fr.s, 0.0);
-  const auto boundary = initial_spatial_boundaries(state, previous_action, fr, cfg, reference);
-  start_delay = std::max(start_delay, 0.0);
-  const double profile_elapsed = maneuver_profile
-      ? clamp_value(maneuver_profile->elapsed_length, 0.0,
-                    maneuver_profile->start_delay + maneuver_profile->lateral_length)
-      : 0.0;
-  const double profile_total_length = maneuver_profile
-      ? maneuver_profile->start_delay + maneuver_profile->lateral_length
-      : start_delay + lateral_length;
-  const double total_lateral_length = std::max(profile_total_length - profile_elapsed, 0.0);
+  ++g_planning_call_counts.spatial_candidate_generation_attempts;
+  double real_end_s, remaining_real;
+  InitialSpatialBoundary boundary;
+  double profile_elapsed, profile_total_length, total_lateral_length;
+  {
+    ScopedBlockTimer boundary_setup_timer(g_planning_block_timings.candidate_boundary_setup_ms);
+    real_end_s = reference.s_max() - cfg.simulation.path_end_margin;
+    remaining_real = std::max(real_end_s - fr.s, 0.0);
+    boundary = initial_spatial_boundaries(state, previous_action, fr, cfg, reference);
+    start_delay = std::max(start_delay, 0.0);
+    profile_elapsed = maneuver_profile
+        ? clamp_value(maneuver_profile->elapsed_length, 0.0,
+                      maneuver_profile->start_delay + maneuver_profile->lateral_length)
+        : 0.0;
+    profile_total_length = maneuver_profile
+        ? maneuver_profile->start_delay + maneuver_profile->lateral_length
+        : start_delay + lateral_length;
+    total_lateral_length = std::max(profile_total_length - profile_elapsed, 0.0);
+  }
 
   auto evaluate_profile = [&](const std::vector<double>& local_q) {
     if (!maneuver_profile) {
@@ -512,91 +601,112 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
         maneuver_profile->n3,
         maneuver_profile->target);
   };
-  double base_extent = std::max(preview_length * 1.35 + cfg.lateral.preview_extra,
-                                total_lateral_length + 1.0);
-  if (remaining_real <= preview_length) {
-    base_extent = std::max(base_extent, remaining_real + cfg.simulation.virtual_extension_min);
-    base_extent = std::min(base_extent, remaining_real + cfg.simulation.virtual_extension_max);
+  double base_extent, q_extent;
+  std::vector<double> q;
+  {
+    ScopedBlockTimer boundary_setup_timer(g_planning_block_timings.candidate_boundary_setup_ms);
+    base_extent = std::max(preview_length * 1.35 + cfg.lateral.preview_extra,
+                           total_lateral_length + 1.0);
+    if (remaining_real <= preview_length) {
+      base_extent = std::max(base_extent, remaining_real + cfg.simulation.virtual_extension_min);
+      base_extent = std::min(base_extent, remaining_real + cfg.simulation.virtual_extension_max);
+    }
+    q_extent = std::max(base_extent, 0.2);
+    q = make_arange(q_extent + cfg.lateral.spatial_ds, cfg.lateral.spatial_ds);
+    q.push_back(remaining_real);
+    sort_unique(q);
+    if (q.size() < 3) q = {0.0, 0.5 * std::max(q_extent, 0.2), std::max(q_extent, 0.2)};
   }
-  const double q_extent = std::max(base_extent, 0.2);
-  auto q = make_arange(q_extent + cfg.lateral.spatial_ds, cfg.lateral.spatial_ds);
-  q.push_back(remaining_real);
-  sort_unique(q);
-  if (q.size() < 3) q = {0.0, 0.5 * std::max(q_extent, 0.2), std::max(q_extent, 0.2)};
 
   ProfileResult profile = evaluate_profile(q);
   std::vector<double> s_query(q.size());
-  for (std::size_t i = 0; i < q.size(); ++i) s_query[i] = fr.s + q[i];
-  auto ref = evaluate_reference_with_virtual_extension(reference, s_query, real_end_s,
-                                                        cfg.simulation.virtual_extension_blend_length);
+  ReferenceEvaluation ref;
   std::vector<double> x(q.size()), y(q.size());
-  for (std::size_t i = 0; i < q.size(); ++i) {
-    x[i] = ref.x[i] - profile.p[i] * std::sin(ref.psi[i]);
-    y[i] = ref.y[i] + profile.p[i] * std::cos(ref.psi[i]);
+  {
+    ScopedBlockTimer curvature_cartesian_timer(g_planning_block_timings.candidate_curvature_cartesian_ms);
+    for (std::size_t i = 0; i < q.size(); ++i) s_query[i] = fr.s + q[i];
+    ref = evaluate_reference_with_virtual_extension(reference, s_query, real_end_s,
+                                                     cfg.simulation.virtual_extension_blend_length);
+    for (std::size_t i = 0; i < q.size(); ++i) {
+      x[i] = ref.x[i] - profile.p[i] * std::sin(ref.psi[i]);
+      y[i] = ref.y[i] + profile.p[i] * std::cos(ref.psi[i]);
+    }
   }
-  double target_spatial_length = hard_preview_limit
-      ? std::max(preview_length, 0.20)
-      : std::max(preview_length, std::min(total_lateral_length + 1.0, q_extent));
-  if (remaining_real <= preview_length) {
-    target_spatial_length = std::max(target_spatial_length, remaining_real + cfg.simulation.virtual_extension_min);
+  {
+    ScopedBlockTimer boundary_setup_timer(g_planning_block_timings.candidate_boundary_setup_ms);
+    double target_spatial_length = hard_preview_limit
+        ? std::max(preview_length, 0.20)
+        : std::max(preview_length, std::min(total_lateral_length + 1.0, q_extent));
+    if (remaining_real <= preview_length) {
+      target_spatial_length = std::max(target_spatial_length, remaining_real + cfg.simulation.virtual_extension_min);
+    }
+    q = truncate_q_at_path_length(q, x, y, target_spatial_length);
+    q.push_back(std::min(remaining_real, q.back()));
+    sort_unique(q);
   }
-  q = truncate_q_at_path_length(q, x, y, target_spatial_length);
-  q.push_back(std::min(remaining_real, q.back()));
-  sort_unique(q);
 
   profile = evaluate_profile(q);
-  s_query.resize(q.size());
-  for (std::size_t i = 0; i < q.size(); ++i) s_query[i] = fr.s + q[i];
-  ref = evaluate_reference_with_virtual_extension(reference, s_query, real_end_s,
-                                                   cfg.simulation.virtual_extension_blend_length);
-  x.resize(q.size()); y.resize(q.size());
-  for (std::size_t i = 0; i < q.size(); ++i) {
-    x[i] = ref.x[i] - profile.p[i] * std::sin(ref.psi[i]);
-    y[i] = ref.y[i] + profile.p[i] * std::cos(ref.psi[i]);
-  }
-  auto arc = cumulative_arc_length(x, y);
-  std::vector<std::size_t> keep;
-  keep.reserve(q.size());
-  keep.push_back(0);
-  for (std::size_t i = 1; i < q.size(); ++i) {
-    if (arc[i] - arc[keep.back()] > 1.0e-8) keep.push_back(i);
-  }
-  if (keep.size() != q.size()) {
-    auto select_double = [&keep](const std::vector<double>& values) {
-      std::vector<double> selected; selected.reserve(keep.size());
-      for (auto idx : keep) selected.push_back(values[idx]);
-      return selected;
-    };
-    auto select_byte = [&keep](const std::vector<std::uint8_t>& values) {
-      std::vector<std::uint8_t> selected; selected.reserve(keep.size());
-      for (auto idx : keep) selected.push_back(values[idx]);
-      return selected;
-    };
-    q = select_double(q); x = select_double(x); y = select_double(y);
-    profile.p = select_double(profile.p); profile.dp = select_double(profile.dp); profile.ddp = select_double(profile.ddp);
-    ref.psi = select_double(ref.psi); ref.kappa = select_double(ref.kappa); ref.kappa_s = select_double(ref.kappa_s);
-    ref.is_virtual = select_byte(ref.is_virtual);
+  std::vector<double> arc;
+  {
+    ScopedBlockTimer curvature_cartesian_timer(g_planning_block_timings.candidate_curvature_cartesian_ms);
+    s_query.resize(q.size());
+    for (std::size_t i = 0; i < q.size(); ++i) s_query[i] = fr.s + q[i];
+    ref = evaluate_reference_with_virtual_extension(reference, s_query, real_end_s,
+                                                     cfg.simulation.virtual_extension_blend_length);
+    x.resize(q.size()); y.resize(q.size());
+    for (std::size_t i = 0; i < q.size(); ++i) {
+      x[i] = ref.x[i] - profile.p[i] * std::sin(ref.psi[i]);
+      y[i] = ref.y[i] + profile.p[i] * std::cos(ref.psi[i]);
+    }
     arc = cumulative_arc_length(x, y);
+    std::vector<std::size_t> keep;
+    keep.reserve(q.size());
+    keep.push_back(0);
+    for (std::size_t i = 1; i < q.size(); ++i) {
+      if (arc[i] - arc[keep.back()] > 1.0e-8) keep.push_back(i);
+    }
+    if (keep.size() != q.size()) {
+      auto select_double = [&keep](const std::vector<double>& values) {
+        std::vector<double> selected; selected.reserve(keep.size());
+        for (auto idx : keep) selected.push_back(values[idx]);
+        return selected;
+      };
+      auto select_byte = [&keep](const std::vector<std::uint8_t>& values) {
+        std::vector<std::uint8_t> selected; selected.reserve(keep.size());
+        for (auto idx : keep) selected.push_back(values[idx]);
+        return selected;
+      };
+      q = select_double(q); x = select_double(x); y = select_double(y);
+      profile.p = select_double(profile.p); profile.dp = select_double(profile.dp); profile.ddp = select_double(profile.ddp);
+      ref.psi = select_double(ref.psi); ref.kappa = select_double(ref.kappa); ref.kappa_s = select_double(ref.kappa_s);
+      ref.is_virtual = select_byte(ref.is_virtual);
+      arc = cumulative_arc_length(x, y);
+    }
   }
   if (arc.size() < 3 || arc.back() < 0.1) return std::nullopt;
 
   std::vector<double> psi(arc.size()), kappa(arc.size());
-  for (std::size_t i = 0; i < arc.size(); ++i) {
-    const double A = 1.0 - ref.kappa[i] * profile.p[i];
-    psi[i] = ref.psi[i] + std::atan2(profile.dp[i], A);
+  std::vector<double> kappa_l;
+  {
+    ScopedBlockTimer curvature_cartesian_timer(g_planning_block_timings.candidate_curvature_cartesian_ms);
+    for (std::size_t i = 0; i < arc.size(); ++i) {
+      const double A = 1.0 - ref.kappa[i] * profile.p[i];
+      psi[i] = ref.psi[i] + std::atan2(profile.dp[i], A);
+    }
+    psi = unwrap_angles(psi);
+    const double branch_shift = 2.0 * kPi * std::round((state.chi - psi.front()) / (2.0 * kPi));
+    for (double& value : psi) value += branch_shift;
+    for (std::size_t i = 0; i < arc.size(); ++i) {
+      const double A = 1.0 - ref.kappa[i] * profile.p[i];
+      const double D = std::max(A * A + profile.dp[i] * profile.dp[i], 1.0e-10);
+      const double A_prime = -ref.kappa_s[i] * profile.p[i] - ref.kappa[i] * profile.dp[i];
+      kappa[i] = (ref.kappa[i] * D + A * profile.ddp[i] - profile.dp[i] * A_prime) /
+                 (D * std::sqrt(D));
+    }
+    kappa_l = gradient(kappa, arc, false);
   }
-  psi = unwrap_angles(psi);
-  const double branch_shift = 2.0 * kPi * std::round((state.chi - psi.front()) / (2.0 * kPi));
-  for (double& value : psi) value += branch_shift;
-  for (std::size_t i = 0; i < arc.size(); ++i) {
-    const double A = 1.0 - ref.kappa[i] * profile.p[i];
-    const double D = std::max(A * A + profile.dp[i] * profile.dp[i], 1.0e-10);
-    const double A_prime = -ref.kappa_s[i] * profile.p[i] - ref.kappa[i] * profile.dp[i];
-    kappa[i] = (ref.kappa[i] * D + A * profile.ddp[i] - profile.dp[i] * A_prime) /
-               std::pow(D, 1.5);
-  }
-  auto kappa_l = gradient(kappa, arc, false);
   if (maneuver_profile == nullptr) {
+    ScopedBlockTimer curvature_cartesian_timer(g_planning_block_timings.candidate_curvature_cartesian_ms);
     // A newly generated profile must begin exactly at the measured motion
     // state.  For a latched profile, however, overriding its front tangent and
     // curvature on every 10 Hz replan would repeatedly flatten the first
@@ -616,8 +726,12 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
   const double real_end_l = interp_scalar(q, arc, real_end_q);
   const double real_end_n = interp_scalar(q, profile.p, real_end_q);
   const double real_end_psi = interp_scalar(q, psi, real_end_q);
-  double end_x, end_y, ref_end_psi, end_kappa;
-  reference.evaluate(real_end_s, end_x, end_y, ref_end_psi, end_kappa);
+  double end_x, end_y, ref_end_psi, end_kappa, end_kappa_s;
+  {
+    ScopedBlockTimer projection_timer(g_planning_block_timings.candidate_projection_ms);
+    reference.evaluate(real_end_s, end_x, end_y, ref_end_psi, end_kappa, end_kappa_s);
+  }
+  (void)end_kappa_s;
   const double real_end_heading_error = wrap_angle(real_end_psi - ref_end_psi);
   const double virtual_extension_length = std::max(0.0, q.back() - remaining_real);
   std::vector<std::size_t> actual;
@@ -627,16 +741,21 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
     for (std::size_t i = 0; i < std::min<std::size_t>(3, q.size()); ++i) actual.push_back(i);
   }
   double max_curvature = 0.0;
-  for (auto idx : actual) max_curvature = std::max(max_curvature, std::abs(kappa[idx]));
-  if (max_curvature > cfg.constraints.curvature_max + 1.0e-9
-      && lateral_length < cfg.lateral.max_length - 1.0e-9
-      && curvature_retry_depth < 8) {
-    const double scale = std::max(1.15, 1.05 * std::sqrt(max_curvature /
-        std::max(cfg.constraints.curvature_max, 1.0e-6)));
-    return generate_spatial_path_candidate(state, previous_action, fr, n_target,
-        std::min(lateral_length * scale, cfg.lateral.max_length), preview_length,
-        cfg, reference, candidate_id, start_delay, terminal_position_only,
-        maneuver_profile, curvature_retry_depth + 1, hard_preview_limit);
+  {
+    ScopedBlockTimer feasibility_check_timer(g_planning_block_timings.feasibility_check_ms);
+    for (auto idx : actual) max_curvature = std::max(max_curvature, std::abs(kappa[idx]));
+  }
+  if (max_curvature > cfg.constraints.curvature_max + 1.0e-9) {
+    ++g_planning_call_counts.curvature_rejected_candidates;
+    if (lateral_length < cfg.lateral.max_length - 1.0e-9
+        && curvature_retry_depth < 8) {
+      const double scale = std::max(1.15, 1.05 * std::sqrt(max_curvature /
+          std::max(cfg.constraints.curvature_max, 1.0e-6)));
+      return generate_spatial_path_candidate(state, previous_action, fr, n_target,
+          std::min(lateral_length * scale, cfg.lateral.max_length), preview_length,
+          cfg, reference, candidate_id, start_delay, terminal_position_only,
+          maneuver_profile, curvature_retry_depth + 1, hard_preview_limit);
+    }
   }
   const double bound = std::max(std::abs(boundary.n0), std::abs(n_target)) + 0.4;
   double max_abs_n = 0.0;
@@ -690,13 +809,49 @@ struct PathSample {
   double x{0.0}; double y{0.0}; double psi{0.0}; double kappa{0.0}; double kappa_l{0.0};
 };
 
+// A path sample is always looked up by the same query arc-length across
+// several parallel arrays (x, y, psi, kappa, kappa_l, ...). Resolving the
+// bracketing index/blend weight once and reusing it avoids repeating the
+// same std::upper_bound() search once per array.
+struct InterpIndex {
+  std::size_t index{0};
+  double alpha{0.0};
+};
+
+InterpIndex resolve_interp_index(const std::vector<double>& x, double query) {
+  if (x.size() < 2) return InterpIndex{0, 0.0};
+  if (query <= x.front()) return InterpIndex{0, 0.0};
+  if (query >= x.back()) return InterpIndex{x.size() - 2, 1.0};
+  const std::size_t i = lower_interval(x, query);
+  const double dx = std::max(x[i + 1] - x[i], 1.0e-15);
+  return InterpIndex{i, (query - x[i]) / dx};
+}
+
+double apply_interp_index(const std::vector<double>& y, const InterpIndex& idx) {
+  if (idx.index + 1 >= y.size()) return y[idx.index];
+  return (1.0 - idx.alpha) * y[idx.index] + idx.alpha * y[idx.index + 1];
+}
+
 PathSample interpolate_path(const SpatialPathCandidate& path, double progress) {
   const double query = clamp_value(progress, 0.0, path.arc_length.back());
-  return {interp_scalar(path.arc_length, path.x, query),
-          interp_scalar(path.arc_length, path.y, query),
-          interp_scalar(path.arc_length, path.psi, query),
-          interp_scalar(path.arc_length, path.kappa, query),
-          interp_scalar(path.arc_length, path.kappa_l, query)};
+  const InterpIndex idx = resolve_interp_index(path.arc_length, query);
+  return {apply_interp_index(path.x, idx), apply_interp_index(path.y, idx),
+          apply_interp_index(path.psi, idx), apply_interp_index(path.kappa, idx),
+          apply_interp_index(path.kappa_l, idx)};
+}
+
+// Lighter-weight variant for callers (curve_speed_limit) that only need
+// curvature and its arc-length derivative, not full pose (x, y, heading) --
+// skips computing/interpolating the three unused arrays entirely.
+struct CurvatureSample {
+  double kappa{0.0};
+  double kappa_l{0.0};
+};
+
+CurvatureSample interpolate_curvature(const SpatialPathCandidate& path, double progress) {
+  const double query = clamp_value(progress, 0.0, path.arc_length.back());
+  const InterpIndex idx = resolve_interp_index(path.arc_length, query);
+  return {apply_interp_index(path.kappa, idx), apply_interp_index(path.kappa_l, idx)};
 }
 
 double interpolate_reference_progress(const SpatialPathCandidate& path, double progress) {
@@ -746,8 +901,8 @@ class TerminalFeedbackController {
         : std::min(c.jerk_max, lc.terminal_jerk_limit), 1.0e-6);
     double ramp_time = std::max((a + curve_deceleration) / jerk_limit, 0.0);
     ramp_time = std::min(ramp_time, 2.0);
-    const double ramp_distance = std::max(v * ramp_time + 0.5 * a * ramp_time * ramp_time
-        - jerk_limit * std::pow(ramp_time, 3.0) / 6.0, 0.0);
+    const double ramp_distance = std::max(
+        jerk_integrated_distance(v, a, -jerk_limit, ramp_time), 0.0);
     const double speed_after = std::max(v + a * ramp_time - 0.5 * jerk_limit * ramp_time * ramp_time, 0.0);
     return ramp_distance + speed_after * speed_after / (2.0 * curve_deceleration)
         + lc.terminal_braking_distance_buffer + cfg_.terminal.activation_margin;
@@ -789,8 +944,8 @@ class TerminalFeedbackController {
     double ramp_time = std::max((a + curve_deceleration) /
                                 std::max(jerk_limit, 1.0e-6), 0.0);
     ramp_time = std::min(ramp_time, 2.0);
-    const double ramp_distance = std::max(v * ramp_time + 0.5 * a * ramp_time * ramp_time
-        - jerk_limit * std::pow(ramp_time, 3.0) / 6.0, 0.0);
+    const double ramp_distance = std::max(
+        jerk_integrated_distance(v, a, -jerk_limit, ramp_time), 0.0);
     const double effective_error = std::max(e - lc.terminal_braking_distance_buffer - ramp_distance, 0.0);
     const double braking_speed = std::sqrt(2.0 * curve_deceleration * effective_error);
     // The requested speed is a required planner input.  The braking envelope
@@ -896,13 +1051,13 @@ TerminalRollout TerminalFeedbackController::rollout(
     double v_next = 0.0;
     if (stop_time || v_trial <= 0.0) {
       const double use = stop_time ? *stop_time : dt;
-      distance = std::max(v * use + 0.5 * a * use * use
-          + effective_jerk * std::pow(use, 3.0) / 6.0, 0.0);
+      distance = std::max(
+          jerk_integrated_distance(v, a, effective_jerk, use), 0.0);
       v_next = 0.0; a_next = 0.0;
     } else {
       v_next = clamp_value(v_trial, c.v_min, c.v_max);
-      distance = std::max(v * dt + 0.5 * a * dt * dt
-          + effective_jerk * std::pow(dt, 3.0) / 6.0, 0.0);
+      distance = std::max(
+          jerk_integrated_distance(v, a, effective_jerk, dt), 0.0);
     }
     const double s_next = s + distance;
     if (s_next > stop_target + tc.longitudinal_tolerance) {
@@ -919,6 +1074,15 @@ TerminalRollout TerminalFeedbackController::rollout(
 
 // Public utilities and basic classes follow.
 
+void reset_planning_call_counts() {
+  g_planning_call_counts = PlanningCallCounts{};
+  g_planning_block_timings = PlanningBlockTimings{};
+}
+
+PlanningCallCounts planning_call_counts() { return g_planning_call_counts; }
+
+PlanningBlockTimings planning_block_timings() { return g_planning_block_timings; }
+
 double wrap_angle(double angle) {
   double wrapped = std::fmod(angle + kPi, 2.0 * kPi);
   if (wrapped < 0.0) wrapped += 2.0 * kPi;
@@ -931,6 +1095,7 @@ double drive_mode_heading_offset(DriveMode mode) {
     case DriveMode::Reverse: return kPi;
     case DriveMode::Left: return 0.5 * kPi;
     case DriveMode::Right: return -0.5 * kPi;
+    case DriveMode::SpotTurn: return 0.0;
   }
   return 0.0;
 }
@@ -991,12 +1156,26 @@ double ReferencePath::s_max() const { return s_.back(); }
 std::size_t ReferencePath::size() const { return s_.size(); }
 
 void ReferencePath::evaluate(double query, double& x, double& y,
-                             double& psi, double& kappa) const {
+                             double& psi, double& kappa, double& kappa_s) const {
   query = clamp_value(query, s_min(), s_max());
-  x = interp_scalar(s_, x_, query);
-  y = interp_scalar(s_, y_, query);
-  psi = wrap_angle(interp_scalar(s_, psi_, query));
-  kappa = interp_scalar(s_, kappa_, query);
+  if (s_.size() == 1 || query <= s_.front()) {
+    x = x_.front(); y = y_.front(); psi = wrap_angle(psi_.front());
+    kappa = kappa_.front(); kappa_s = kappa_s_.front();
+    return;
+  }
+  if (query >= s_.back()) {
+    x = x_.back(); y = y_.back(); psi = wrap_angle(psi_.back());
+    kappa = kappa_.back(); kappa_s = kappa_s_.back();
+    return;
+  }
+  const std::size_t i = lower_interval(s_, query);
+  const double dx = std::max(s_[i + 1] - s_[i], 1.0e-15);
+  const double alpha = (query - s_[i]) / dx;
+  x = (1.0 - alpha) * x_[i] + alpha * x_[i + 1];
+  y = (1.0 - alpha) * y_[i] + alpha * y_[i + 1];
+  psi = wrap_angle((1.0 - alpha) * psi_[i] + alpha * psi_[i + 1]);
+  kappa = (1.0 - alpha) * kappa_[i] + alpha * kappa_[i + 1];
+  kappa_s = (1.0 - alpha) * kappa_s_[i] + alpha * kappa_s_[i + 1];
 }
 
 FrenetProjection ReferencePath::project(double px, double py, double heading) const {
@@ -1062,10 +1241,27 @@ Costmap2D::Costmap2D(std::vector<std::int8_t> data, int width, int height,
                      int occupied_threshold, int unknown_value,
                      bool unknown_is_occupied,
                      bool conservative_cell_correction)
+    : Costmap2D(std::move(data), width, height, resolution, origin_x, origin_y,
+                0.0, occupied_threshold, unknown_value, unknown_is_occupied,
+                conservative_cell_correction) {}
+
+Costmap2D::Costmap2D(std::vector<std::int8_t> data, int width, int height,
+                     double resolution, double origin_x, double origin_y,
+                     double origin_yaw,
+                     int occupied_threshold, int unknown_value,
+                     bool unknown_is_occupied,
+                     bool conservative_cell_correction)
     : width_(width), height_(height), resolution_(resolution),
-      origin_x_(origin_x), origin_y_(origin_y), data_(std::move(data)) {
-  if (width_ < 2 || height_ < 2 || data_.size() != static_cast<std::size_t>(width_ * height_)
-      || !(resolution_ > 0.0)) {
+      origin_x_(origin_x), origin_y_(origin_y),
+      origin_yaw_(wrap_angle(origin_yaw)),
+      cos_origin_yaw_(std::cos(origin_yaw_)),
+      sin_origin_yaw_(std::sin(origin_yaw_)), data_(std::move(data)) {
+  const auto expected_size = static_cast<std::size_t>(width_) *
+      static_cast<std::size_t>(height_);
+  if (width_ < 2 || height_ < 2 || data_.size() != expected_size ||
+      !(resolution_ > 0.0) || !std::isfinite(resolution_) ||
+      !std::isfinite(origin_x_) || !std::isfinite(origin_y_) ||
+      !std::isfinite(origin_yaw)) {
     throw std::invalid_argument("invalid costmap");
   }
   std::vector<std::uint8_t> occupied(data_.size(), 0);
@@ -1081,8 +1277,15 @@ Costmap2D::Costmap2D(std::vector<std::int8_t> data, int width, int height,
 
 double Costmap2D::distance_at_world(double x, double y) const {
   if (distance_field_.empty()) return 1.0e6;
-  const double gx = (x - origin_x_) / resolution_ - 0.5;
-  const double gy = (y - origin_y_) / resolution_ - 0.5;
+  if (!std::isfinite(x) || !std::isfinite(y)) return 0.0;
+  const double dx = x - origin_x_;
+  const double dy = y - origin_y_;
+  // OccupancyGrid cells are expressed in the grid axes at capture time.
+  // Bring an odom/world query back into those axes before indexing the EDT.
+  const double local_x = cos_origin_yaw_ * dx + sin_origin_yaw_ * dy;
+  const double local_y = -sin_origin_yaw_ * dx + cos_origin_yaw_ * dy;
+  const double gx = local_x / resolution_ - 0.5;
+  const double gy = local_y / resolution_ - 0.5;
   const int x0 = static_cast<int>(std::floor(gx));
   const int y0 = static_cast<int>(std::floor(gy));
   const int x1 = x0 + 1;
@@ -1285,8 +1488,13 @@ SpatialScreen screen_spatial_candidate(const SpatialPathCandidate& path,
       cfg.vehicle.length, cfg.vehicle.width, cfg.vehicle.footprint_margin);
   const double coarse_radius = 0.5 * cfg.vehicle.width
                              + cfg.vehicle.footprint_margin;
-  const auto ranking_clearance = path_clearance(x, y, costmap, ranking_radius);
-  const auto coarse_clearance = path_clearance(x, y, costmap, coarse_radius);
+  std::vector<double> ranking_clearance;
+  std::vector<double> coarse_clearance;
+  {
+    ScopedBlockTimer collision_check_timer(g_planning_block_timings.collision_check_ms);
+    ranking_clearance = path_clearance(x, y, costmap, ranking_radius);
+    coarse_clearance = path_clearance(x, y, costmap, coarse_radius);
+  }
   const double ranking_min = *std::min_element(ranking_clearance.begin(), ranking_clearance.end());
   const double coarse_min = *std::min_element(coarse_clearance.begin(), coarse_clearance.end());
   const bool ranking_free = std::all_of(ranking_clearance.begin(), ranking_clearance.end(),
@@ -1315,8 +1523,11 @@ SpatialScreen screen_spatial_candidate(const SpatialPathCandidate& path,
   }
   const double mean_deficit_squared = ranking_clearance.empty()
       ? 0.0 : sum_deficit_squared / static_cast<double>(ranking_clearance.size());
-  const auto terminal_goal = evaluate_terminal_goal_region(
-      path, cfg, costmap, screening_speed);
+  TerminalGoalRegionEvaluation terminal_goal;
+  {
+    ScopedBlockTimer collision_check_timer(g_planning_block_timings.collision_check_ms);
+    terminal_goal = evaluate_terminal_goal_region(path, cfg, costmap, screening_speed);
+  }
   const double terminal_soft_deficit = terminal_constraint_active
       ? std::max(0.0, soft_margin - terminal_goal.minimum_clearance)
       : 0.0;
@@ -1427,7 +1638,7 @@ double curve_speed_limit(const SpatialPathCandidate& path, double progress,
   for (int i = 0; i < 61; ++i) {
     const double alpha = static_cast<double>(i) / 60.0;
     const double sample_s = progress + alpha * (std::max(progress, s1) - progress);
-    const auto sample = interpolate_path(path, sample_s);
+    const auto sample = interpolate_curvature(path, sample_s);
     const double v_kappa = std::sqrt(cfg.constraints.a_lat_max /
                                      (std::abs(sample.kappa) + 1.0e-5));
     const double v_kappa_rate = std::cbrt(
@@ -1450,6 +1661,8 @@ TimeTrajectory generate_open_loop_trajectory(
     bool terminal_mode_active,
     double target_speed,
     bool enforce_obstacle_collision = true) {
+  ScopedBlockTimer trajectory_generation_timer(g_planning_block_timings.trajectory_generation_ms);
+  const auto initial_state_target_start = std::chrono::steady_clock::now();
   const auto& c = cfg.constraints;
   const auto& lc = cfg.longitudinal;
   const auto& cc = cfg.cost;
@@ -1467,6 +1680,9 @@ TimeTrajectory generate_open_loop_trajectory(
                                     std::numeric_limits<double>::quiet_NaN());
   trajectory.states.front() = initial_state;
   TerminalFeedbackController terminal_controller(cfg);
+  g_planning_block_timings.trajectory_initial_state_target_ms +=
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - initial_state_target_start).count();
 
   for (int k = 0; k < N; ++k) {
     const std::size_t index = static_cast<std::size_t>(k);
@@ -1490,13 +1706,19 @@ TimeTrajectory generate_open_loop_trajectory(
       trajectory.predicted_stop_error = std::abs(terminal_goal_q - q_progress);
       break;
     }
+    double jerk = 0.0;
+    double a_next = 0.0;
+    double v_next = 0.0;
+    double distance = 0.0;
+    {
+    ScopedBlockTimer longitudinal_profile_timer(
+        g_planning_block_timings.trajectory_longitudinal_profile_ms);
     const double accel_limit = emergency ? c.a_max : std::min(c.a_max, lc.cruise_acceleration);
     const double decel_limit = emergency ? std::abs(c.a_min)
         : std::min(std::abs(c.a_min), lc.service_deceleration);
     const double jerk_limit = emergency ? c.jerk_max
         : std::min(c.jerk_max, lc.comfort_jerk);
     double jerk_raw = 0.0;
-    double jerk = 0.0;
     bool braking_active_this_step = false;
     if (terminal_mode_active) {
       const double dq_dl = reference_progress_rate(path, l_progress);
@@ -1532,26 +1754,28 @@ TimeTrajectory generate_open_loop_trajectory(
         (terminal_mode_active && braking_active_this_step)
         ? std::max(a, 0.0)
         : accel_limit;
-    double a_next = clamp_value(
+    a_next = clamp_value(
         a + jerk * dt, -decel_limit, acceleration_upper);
     jerk = (a_next - a) / dt;
     const double v_trial = v + a * dt + 0.5 * jerk * dt * dt;
     const auto stop_time = positive_velocity_root(v, a, jerk, dt);
-    double distance = 0.0;
-    double v_next = 0.0;
     if (stop_time || v_trial <= 0.0) {
       const double use = stop_time ? *stop_time : dt;
-      distance = std::max(v * use + 0.5 * a * use * use
-          + jerk * std::pow(use, 3.0) / 6.0, 0.0);
+      distance = std::max(jerk_integrated_distance(v, a, jerk, use), 0.0);
       v_next = 0.0;
       a_next = 0.0;
     } else {
       v_next = clamp_value(v_trial, c.v_min, c.v_max);
-      distance = std::max(v * dt + 0.5 * a * dt * dt
-          + jerk * std::pow(dt, 3.0) / 6.0, 0.0);
+      distance = std::max(jerk_integrated_distance(v, a, jerk, dt), 0.0);
     }
-    const double l_next = l_progress + distance;
-    const double q_next = interpolate_reference_progress(path, l_next);
+    }  // end longitudinal_profile_timer scope
+    double l_next = 0.0;
+    double q_next = 0.0;
+    {
+    ScopedBlockTimer state_calculation_timer(
+        g_planning_block_timings.trajectory_state_calculation_ms);
+    l_next = l_progress + distance;
+    q_next = interpolate_reference_progress(path, l_next);
     const bool terminal_tolerance_extension = terminal_mode_active
         && q_next <= terminal_goal_q + tc.longitudinal_tolerance + 1.0e-9;
     // Near the terminal point, the current state can already lie a few
@@ -1587,6 +1811,7 @@ TimeTrajectory generate_open_loop_trajectory(
         + v_next * v_next * sample.kappa_l};
     trajectory.progress[index + 1] = l_next;
     trajectory.speed_reference[index + 1] = trajectory.speed_reference[index];
+    }  // end state_calculation_timer scope
     if (terminal_mode_active
         && v_next <= std::max(lc.stop_speed_threshold, lc.terminal_capture_speed)
         && std::abs(terminal_goal_q - q_next) <= tc.longitudinal_tolerance
@@ -1610,6 +1835,9 @@ TimeTrajectory generate_open_loop_trajectory(
   std::vector<double> reference_progress(state_count, 0.0);
   std::vector<double> trajectory_kappa(state_count, 0.0);
   std::vector<double> trajectory_kappa_l(state_count, 0.0);
+  {
+  ScopedBlockTimer state_calculation_post_loop_timer(
+      g_planning_block_timings.trajectory_state_calculation_ms);
   for (std::size_t i = 0; i < state_count; ++i) {
     reference_progress[i] = interpolate_reference_progress(path, trajectory.progress[i]);
     const auto sample = interpolate_path(path, trajectory.progress[i]);
@@ -1621,10 +1849,14 @@ TimeTrajectory generate_open_loop_trajectory(
     trajectory.lateral_jerk[i] = 2.0 * v * a * sample.kappa
         + v * v * v * sample.kappa_l;
   }
+  }  // end state_calculation_post_loop_timer scope
 
   bool speed_min_ok = true, speed_max_ok = true, acceleration_ok = true;
   bool heading_rate_ok = true, heading_accel_ok = true;
   bool lateral_accel_ok = true, lateral_jerk_ok = true, curvature_ok = true;
+  {
+  ScopedBlockTimer trajectory_feasibility_check_timer(
+      g_planning_block_timings.trajectory_feasibility_check_ms);
   const double execution_dt = std::min(std::max(lc.execution_dt, 1.0e-4), dt);
   const int substep_count = std::max(1, static_cast<int>(std::ceil(dt / execution_dt)));
   for (int k = 0; k < N; ++k) {
@@ -1638,8 +1870,8 @@ TimeTrajectory generate_open_loop_trajectory(
       double speed = std::max(state.speed + state.acceleration * tau
           + 0.5 * action.longitudinal_jerk * tau * tau, 0.0);
       double acceleration = state.acceleration + action.longitudinal_jerk * tau;
-      double distance = std::max(state.speed * tau + 0.5 * state.acceleration * tau * tau
-          + action.longitudinal_jerk * std::pow(tau, 3.0) / 6.0, 0.0);
+      double distance = std::max(jerk_integrated_distance(
+          state.speed, state.acceleration, action.longitudinal_jerk, tau), 0.0);
       double progress = std::min(trajectory.progress[static_cast<std::size_t>(k)] + distance,
                                  trajectory.progress[static_cast<std::size_t>(k + 1)]);
       if (stop_time && tau >= *stop_time - 1.0e-12) {
@@ -1681,11 +1913,13 @@ TimeTrajectory generate_open_loop_trajectory(
   trajectory.valid_dynamic = speed_min_ok && speed_max_ok && acceleration_ok && jerk_ok
       && heading_rate_ok && heading_accel_ok && lateral_accel_ok && lateral_jerk_ok
       && curvature_ok && !trajectory.endpoint_overshoot_attempt && progress_ok;
+  }  // end trajectory_feasibility_check_timer scope
 
   const double maximum_speed = std::max_element(trajectory.states.begin(), trajectory.states.end(),
       [](const PlannerState& lhs, const PlannerState& rhs) { return lhs.speed < rhs.speed; })->speed;
   const double hard_margin = effective_hard_clearance_margin(maximum_speed, cc);
   if (enforce_obstacle_collision) {
+    ScopedBlockTimer collision_check_timer(g_planning_block_timings.collision_check_ms);
     std::vector<double> state_x(state_count), state_y(state_count);
     for (std::size_t i = 0; i < state_count; ++i) {
       state_x[i] = trajectory.states[i].x;
@@ -2043,13 +2277,16 @@ std::vector<double> PathVelocityPlanner::speed_trials(double requested_speed) co
 
 TimeTrajectory PathVelocityPlanner::emergency_stop(
     const PlannerState& state, const PlannerAction& previous_action,
-    double target_speed, bool terminal_stop_required) {
-  const auto fr = path_.project(state.x, state.y, state.chi);
+    double target_speed, bool terminal_stop_required, const FrenetProjection& fr) {
   const double remaining = std::max(path_.s_max() - config_.simulation.path_end_margin - fr.s, 0.2);
   const double preview = std::min(config_.constraints.v_max * config_.longitudinal.horizon,
                                   remaining);
   auto path = generate_spatial_path_candidate(state, previous_action, fr, fr.n,
       config_.lateral.min_length, std::max(preview, 0.2), config_, path_, -1);
+  // Every branch below produces a stopping trajectory (the last-resort
+  // fallback once no cruise-safe candidate survived), so its cost belongs in
+  // the "stop" bucket regardless of terminal_mode_active.
+  ScopedBlockTimer emergency_trajectory_timer(g_planning_block_timings.trajectory_terminal_ms);
   if (!path) {
     auto tr = stationary_time_trajectory(state, config_, costmap_ ? &*costmap_ : nullptr);
     tr.valid_dynamic = false;
@@ -2077,9 +2314,9 @@ PlanResult PathVelocityPlanner::plan_at_speed(
     const PlannerState& state, const PlannerAction& previous_action,
     double target_speed, DriveMode drive_mode,
     const std::vector<int>& excluded_candidate_ids,
-    const std::vector<double>& excluded_lateral_targets) {
+    const std::vector<double>& excluded_lateral_targets,
+    const FrenetProjection& fr) {
   const auto start_time = std::chrono::steady_clock::now();
-  const auto fr = path_.project(state.x, state.y, state.chi);
   const double real_end_s = path_.s_max() - config_.simulation.path_end_margin;
   const double terminal_goal_s = std::max(real_end_s - config_.longitudinal.stop_target_offset, 0.0);
   const double remaining_to_goal = std::max(terminal_goal_s - fr.s, 0.0);
@@ -2116,10 +2353,11 @@ PlanResult PathVelocityPlanner::plan_at_speed(
       const double query_s = clamp_value(
           terminal_goal_s - half_length + 2.0 * half_length * alpha,
           path_.s_min(), real_end_s);
-      double x = 0.0, y = 0.0, psi = 0.0, kappa = 0.0;
-      path_.evaluate(query_s, x, y, psi, kappa);
+      double x = 0.0, y = 0.0, psi = 0.0, kappa = 0.0, kappa_s = 0.0;
+      path_.evaluate(query_s, x, y, psi, kappa, kappa_s);
       (void)psi;
       (void)kappa;
+      (void)kappa_s;
       minimum_clearance = std::min(
           minimum_clearance,
           costmap_->clearance_single_circle(x, y, radius));
@@ -2143,6 +2381,13 @@ PlanResult PathVelocityPlanner::plan_at_speed(
   terminal_safe_region_active_last_ = terminal_safe_region_active;
   const bool terminal_mode_active = terminal_constraint_active;
   const bool map_end_mode = terminal_constraint_active;
+  // Stopping-distance/terminal-safe-region activation decision above runs once
+  // per cycle, before any candidate is generated -- fold it into the same
+  // "initial state + objective" bucket that generate_open_loop_trajectory()
+  // uses for its own pre-loop setup below.
+  g_planning_block_timings.trajectory_initial_state_target_ms +=
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - start_time).count();
 
   if (maneuver_profile_ && maneuver_start_s_) {
     const double total_length = maneuver_profile_->start_delay
@@ -2185,6 +2430,24 @@ PlanResult PathVelocityPlanner::plan_at_speed(
   std::vector<Entry> entries;
   std::vector<Entry> all_spatial;
   int candidate_id = 0;
+  bool short_path_fallback_active = false;
+  double short_path_length = 0.0;
+  {
+  ScopedBlockTimer spatial_block_timer(terminal_safe_region_active
+      ? g_planning_block_timings.spatial_terminal_ms
+      : g_planning_block_timings.spatial_normal_ms);
+  // Phase 1: generate every spatial-path candidate across all lateral
+  // targets/length options first. Screening (Phase 2 below) only starts once
+  // this full generation pass is complete.
+  struct GeneratedCandidate {
+    SpatialPathCandidate path;
+    std::string path_mode;
+    int candidate_id{0};
+    double n_target{0.0};
+    bool active_target{false};
+  };
+  std::vector<GeneratedCandidate> generated;
+  ++g_planning_call_counts.spatial_path_generation;
   for (double n_target : config_.lateral.n_targets) {
     auto options = lateral_length_options(state, fr, n_target, config_);
     if (terminal_safe_region_active) {
@@ -2234,58 +2497,68 @@ PlanResult PathVelocityPlanner::plan_at_speed(
       const double lateral_length = std::get<1>(option);
       const double start_delay = std::get<2>(option);
       const bool terminal_position_only = std::get<3>(option);
-      auto candidate = generate_spatial_path_candidate(state, previous_action, fr,
-          n_target, lateral_length, preview_length, config_, path_, candidate_id,
-          start_delay, terminal_position_only, profile_override);
+      std::optional<SpatialPathCandidate> candidate;
+      {
+        ScopedBlockTimer candidate_generation_timer(
+            g_planning_block_timings.candidate_generation_ms);
+        candidate = generate_spatial_path_candidate(state, previous_action, fr,
+            n_target, lateral_length, preview_length, config_, path_, candidate_id,
+            start_delay, terminal_position_only, profile_override);
+      }
       const int generated_candidate_id = candidate_id;
       ++candidate_id;
       if (!candidate) continue;
-      const bool excluded_id = std::find(
-          excluded_candidate_ids.begin(), excluded_candidate_ids.end(),
-          generated_candidate_id) != excluded_candidate_ids.end();
-      const bool excluded_target = std::any_of(
-          excluded_lateral_targets.begin(), excluded_lateral_targets.end(),
-          [n_target](double value) {
-            return std::abs(n_target - value) <= 1.0e-9;
-          });
-      if (excluded_id || excluded_target) continue;
-      auto screen = screen_spatial_candidate(*candidate, state, config_,
-          costmap_ ? &*costmap_ : nullptr, target_speed,
-          terminal_safe_region_active);
-      if (adaptive_replan_active) {
-        screen.screening_cost += (clearance_scale - 1.0) * screen.obstacle_cost;
-        screen.screening_cost -= (1.0 - reference_scale)
-            * candidate->reference_offset_cost;
-        if (failed_lateral_target_) {
-          const double sigma = std::max(
-              config_.adaptive_replan.failed_target_sigma, 1.0e-3);
-          const double normalized = (n_target - *failed_lateral_target_) / sigma;
-          screen.screening_cost += config_.adaptive_replan.failed_target_weight
-              * allocation_failure_severity_
-              * std::exp(-0.5 * normalized * normalized);
-        }
-      }
-      if (active_target && !adaptive_replan_active) {
-        // A safe active maneuver is evaluated first and retained.  Alternative
-        // targets remain available as fallbacks when its temporal rollout is
-        // infeasible, while Allocation-triggered adaptive replanning disables
-        // this lock and may choose a different path.
-        screen.screening_cost -= 1.0e6;
-      }
-      Entry entry{std::move(*candidate), path_mode, screen, false};
-      all_spatial.push_back(entry);
-      if (screen.preview_collision_free) entries.push_back(std::move(entry));
+      generated.push_back(GeneratedCandidate{std::move(*candidate), path_mode,
+          generated_candidate_id, n_target, active_target});
     }
   }
 
-  bool short_path_fallback_active = false;
-  double short_path_length = 0.0;
+  // Phase 2: screen every generated candidate now that generation is done.
+  for (auto& gen : generated) {
+    const bool excluded_id = std::find(
+        excluded_candidate_ids.begin(), excluded_candidate_ids.end(),
+        gen.candidate_id) != excluded_candidate_ids.end();
+    const bool excluded_target = std::any_of(
+        excluded_lateral_targets.begin(), excluded_lateral_targets.end(),
+        [&gen](double value) {
+          return std::abs(gen.n_target - value) <= 1.0e-9;
+        });
+    if (excluded_id || excluded_target) continue;
+    auto screen = screen_spatial_candidate(gen.path, state, config_,
+        costmap_ ? &*costmap_ : nullptr, target_speed,
+        terminal_safe_region_active);
+    if (adaptive_replan_active) {
+      screen.screening_cost += (clearance_scale - 1.0) * screen.obstacle_cost;
+      screen.screening_cost -= (1.0 - reference_scale)
+          * gen.path.reference_offset_cost;
+      if (failed_lateral_target_) {
+        const double sigma = std::max(
+            config_.adaptive_replan.failed_target_sigma, 1.0e-3);
+        const double normalized = (gen.n_target - *failed_lateral_target_) / sigma;
+        screen.screening_cost += config_.adaptive_replan.failed_target_weight
+            * allocation_failure_severity_
+            * std::exp(-0.5 * normalized * normalized);
+      }
+    }
+    if (gen.active_target && !adaptive_replan_active) {
+      // A safe active maneuver is evaluated first and retained.  Alternative
+      // targets remain available as fallbacks when its temporal rollout is
+      // infeasible, while Allocation-triggered adaptive replanning disables
+      // this lock and may choose a different path.
+      screen.screening_cost -= 1.0e6;
+    }
+    Entry entry{std::move(gen.path), gen.path_mode, screen, false};
+    all_spatial.push_back(entry);
+    if (screen.preview_collision_free) entries.push_back(std::move(entry));
+  }
+
   if (entries.empty() && config_.lateral.short_path_fallback_enabled && costmap_) {
     const double minimum_stop_length = std::max(
         config_.lateral.min_length,
         required_stop_distance + config_.lateral.short_path_stop_reserve
             + config_.longitudinal.stop_target_offset);
     std::vector<Entry> short_entries;
+    ++g_planning_call_counts.spatial_path_generation;
     for (const auto& source : all_spatial) {
       if (!source.screen.curvature_valid
           || !std::isfinite(source.screen.first_coarse_collision_length)) {
@@ -2296,11 +2569,16 @@ PlanResult PathVelocityPlanner::plan_at_speed(
       const double usable = std::min(
           available, config_.lateral.short_path_max_length);
       if (usable + 1.0e-9 < minimum_stop_length) continue;
-      auto candidate = generate_spatial_path_candidate(
-          state, previous_action, fr, source.path.n_target,
-          source.path.lateral_length, usable, config_, path_, candidate_id,
-          source.path.start_delay, source.path.terminal_position_only,
-          nullptr, 0, true);
+      std::optional<SpatialPathCandidate> candidate;
+      {
+        ScopedBlockTimer candidate_generation_timer(
+            g_planning_block_timings.candidate_generation_ms);
+        candidate = generate_spatial_path_candidate(
+            state, previous_action, fr, source.path.n_target,
+            source.path.lateral_length, usable, config_, path_, candidate_id,
+            source.path.start_delay, source.path.terminal_position_only,
+            nullptr, 0, true);
+      }
       ++candidate_id;
       if (!candidate) continue;
       auto screen = screen_spatial_candidate(
@@ -2317,6 +2595,7 @@ PlanResult PathVelocityPlanner::plan_at_speed(
       short_path_fallback_active = true;
     }
   }
+  }  // end spatial_block_timer scope
 
   std::vector<std::size_t> center_indices;
   for (std::size_t i = 0; i < entries.size(); ++i) {
@@ -2343,9 +2622,11 @@ PlanResult PathVelocityPlanner::plan_at_speed(
   }
   if (lateral_target_hint_) {
     for (auto& entry : entries) {
+      const double target_error =
+          entry.path.n_target - *lateral_target_hint_;
       entry.screen.continuity_cost = continuity_scale
           * config_.lateral.target_continuity_weight
-          * std::pow(entry.path.n_target - *lateral_target_hint_, 2.0);
+          * target_error * target_error;
       entry.screen.screening_cost += entry.screen.continuity_cost;
     }
   }
@@ -2375,23 +2656,31 @@ PlanResult PathVelocityPlanner::plan_at_speed(
         cost,
         candidate_id};
   };
-  std::sort(entries.begin(), entries.end(),
-      [&](const Entry& a, const Entry& b) {
-    if (terminal_safe_region_active) {
-      return terminal_candidate_key(
-                 a.path.n_target, a.screen.terminal_goal_offset,
-                 a.screen.screening_cost, a.path.candidate_id)
-           < terminal_candidate_key(
-                 b.path.n_target, b.screen.terminal_goal_offset,
-                 b.screen.screening_cost, b.path.candidate_id);
-    }
-    return std::tuple<double, int>{a.screen.screening_cost, a.path.candidate_id}
-         < std::tuple<double, int>{b.screen.screening_cost, b.path.candidate_id};
-  });
+  {
+    ScopedBlockTimer ranking_timer(g_planning_block_timings.ranking_ms);
+    std::sort(entries.begin(), entries.end(),
+        [&](const Entry& a, const Entry& b) {
+      if (terminal_safe_region_active) {
+        return terminal_candidate_key(
+                   a.path.n_target, a.screen.terminal_goal_offset,
+                   a.screen.screening_cost, a.path.candidate_id)
+             < terminal_candidate_key(
+                   b.path.n_target, b.screen.terminal_goal_offset,
+                   b.screen.screening_cost, b.path.candidate_id);
+      }
+      return std::tuple<double, int>{a.screen.screening_cost, a.path.candidate_id}
+           < std::tuple<double, int>{b.screen.screening_cost, b.path.candidate_id};
+    });
+  }
 
   std::vector<FullCandidate> full;
   std::size_t cursor = 0;
   bool first_batch = true;
+  if (!entries.empty()) ++g_planning_call_counts.trajectory_planning;
+  {
+  ScopedBlockTimer trajectory_block_timer(terminal_mode_active
+      ? g_planning_block_timings.trajectory_terminal_ms
+      : g_planning_block_timings.trajectory_normal_ms);
   while (cursor < entries.size()) {
     const int batch_size = first_batch
         ? std::max(1, terminal_safe_region_active ? config_.lateral.terminal_shortlist_size
@@ -2418,33 +2707,37 @@ PlanResult PathVelocityPlanner::plan_at_speed(
     first_batch = false;
     if (batch_safe) break;
   }
+  }  // end trajectory_block_timer scope
 
   int selected = -1;
-  for (std::size_t i = 0; i < full.size(); ++i) {
-    if (!full[i].trajectory.safe()) continue;
-    if (selected < 0) {
-      selected = static_cast<int>(i);
-      continue;
-    }
-    const auto& current = full[static_cast<std::size_t>(selected)];
-    if (terminal_safe_region_active) {
-      const auto key = terminal_candidate_key(
-          full[i].path.n_target, full[i].screen.terminal_goal_offset,
-          full[i].total_cost, full[i].path.candidate_id);
-      const auto best_key = terminal_candidate_key(
-          current.path.n_target, current.screen.terminal_goal_offset,
-          current.total_cost, current.path.candidate_id);
-      if (key < best_key) selected = static_cast<int>(i);
-    } else {
-      const auto key = std::tuple<double, double, int>{
-          full[i].lateral_selection_cost,
-          std::abs(full[i].path.n_target),
-          full[i].path.candidate_id};
-      const auto best_key = std::tuple<double, double, int>{
-          current.lateral_selection_cost,
-          std::abs(current.path.n_target),
-          current.path.candidate_id};
-      if (key < best_key) selected = static_cast<int>(i);
+  {
+    ScopedBlockTimer ranking_timer(g_planning_block_timings.ranking_ms);
+    for (std::size_t i = 0; i < full.size(); ++i) {
+      if (!full[i].trajectory.safe()) continue;
+      if (selected < 0) {
+        selected = static_cast<int>(i);
+        continue;
+      }
+      const auto& current = full[static_cast<std::size_t>(selected)];
+      if (terminal_safe_region_active) {
+        const auto key = terminal_candidate_key(
+            full[i].path.n_target, full[i].screen.terminal_goal_offset,
+            full[i].total_cost, full[i].path.candidate_id);
+        const auto best_key = terminal_candidate_key(
+            current.path.n_target, current.screen.terminal_goal_offset,
+            current.total_cost, current.path.candidate_id);
+        if (key < best_key) selected = static_cast<int>(i);
+      } else {
+        const auto key = std::tuple<double, double, int>{
+            full[i].lateral_selection_cost,
+            std::abs(full[i].path.n_target),
+            full[i].path.candidate_id};
+        const auto best_key = std::tuple<double, double, int>{
+            current.lateral_selection_cost,
+            std::abs(current.path.n_target),
+            current.path.candidate_id};
+        if (key < best_key) selected = static_cast<int>(i);
+      }
     }
   }
 
@@ -2500,23 +2793,26 @@ PlanResult PathVelocityPlanner::plan_at_speed(
   } else {
     auto best = full.end();
     if (!full.empty()) {
-      best = std::min_element(full.begin(), full.end(),
-          [&](const FullCandidate& a, const FullCandidate& b) {
-        if (terminal_safe_region_active) {
-          return terminal_candidate_key(
-                     a.path.n_target, a.screen.terminal_goal_offset,
-                     a.total_cost, a.path.candidate_id)
-               < terminal_candidate_key(
-                     b.path.n_target, b.screen.terminal_goal_offset,
-                     b.total_cost, b.path.candidate_id);
-        }
-        return std::tuple<double, double, int>{
-                   a.lateral_selection_cost, std::abs(a.path.n_target),
-                   a.path.candidate_id}
-             < std::tuple<double, double, int>{
-                   b.lateral_selection_cost, std::abs(b.path.n_target),
-                   b.path.candidate_id};
-      });
+      {
+        ScopedBlockTimer ranking_timer(g_planning_block_timings.ranking_ms);
+        best = std::min_element(full.begin(), full.end(),
+            [&](const FullCandidate& a, const FullCandidate& b) {
+          if (terminal_safe_region_active) {
+            return terminal_candidate_key(
+                       a.path.n_target, a.screen.terminal_goal_offset,
+                       a.total_cost, a.path.candidate_id)
+                 < terminal_candidate_key(
+                       b.path.n_target, b.screen.terminal_goal_offset,
+                       b.total_cost, b.path.candidate_id);
+          }
+          return std::tuple<double, double, int>{
+                     a.lateral_selection_cost, std::abs(a.path.n_target),
+                     a.path.candidate_id}
+               < std::tuple<double, double, int>{
+                     b.lateral_selection_cost, std::abs(b.path.n_target),
+                     b.path.candidate_id};
+        });
+      }
       result.selected_path = best->path;
       result.diagnostics.selected_candidate_id = best->path.candidate_id;
       result.diagnostics.selected_path_mode = best->path_mode;
@@ -2541,11 +2837,19 @@ PlanResult PathVelocityPlanner::plan_at_speed(
     bool braking_fallback_safe = false;
     if (best != full.end()) {
       const bool local_stop = best->short_path_stop;
-      auto braking = generate_open_loop_trajectory(
+      ++g_planning_call_counts.trajectory_planning;
+      TimeTrajectory braking;
+      {
+      // This is itself a braking/stopping rollout (the cruise batch already
+      // failed), so it always belongs in the "stop" bucket, regardless of
+      // terminal_mode_active.
+      ScopedBlockTimer braking_block_timer(g_planning_block_timings.trajectory_terminal_ms);
+      braking = generate_open_loop_trajectory(
           best->path, state, previous_action, map_end_mode || local_stop, config_,
           costmap_ ? &*costmap_ : nullptr, true,
           terminal_constraint_active || local_stop,
           terminal_mode_active || local_stop, target_speed, false);
+      }  // end braking_block_timer scope
       if (braking.safe()) {
         result.trajectory = std::move(braking);
         braking_fallback_safe = true;
@@ -2556,7 +2860,8 @@ PlanResult PathVelocityPlanner::plan_at_speed(
       }
     }
     if (!braking_fallback_safe) {
-      auto braking = emergency_stop(state, previous_action, target_speed, terminal_mode_active);
+      ++g_planning_call_counts.trajectory_planning;
+      auto braking = emergency_stop(state, previous_action, target_speed, terminal_mode_active, fr);
       if (braking.safe()) {
         result.selected_path.reset();
         result.trajectory = std::move(braking);
@@ -2605,7 +2910,8 @@ PlanResult PathVelocityPlanner::plan_at_speed(
 
 PlanResult PathVelocityPlanner::plan(const PlannerState& state,
                                      const PlannerAction& previous_action,
-                                     const PlanningCommand& command) {
+                                     const PlanningCommand& command,
+                                     std::optional<FrenetProjection> known_projection) {
   const auto excluded_candidate_ids = one_shot_excluded_candidate_ids_;
   const auto excluded_lateral_targets = one_shot_excluded_lateral_targets_;
   one_shot_excluded_candidate_ids_.clear();
@@ -2625,6 +2931,14 @@ PlanResult PathVelocityPlanner::plan(const PlannerState& state,
     return result;
   }
 
+  FrenetProjection fr;
+  if (known_projection) {
+    fr = *known_projection;
+  } else {
+    ScopedBlockTimer projection_timer(g_planning_block_timings.candidate_projection_ms);
+    fr = path_.project(state.x, state.y, state.chi);
+  }
+
   // Short phases and high requested speeds may be position-feasible only at a
   // lower cruise cap.  Keep the deterministic speed backoff active in the
   // terminal region instead of falling directly to an emergency stop.
@@ -2638,7 +2952,7 @@ PlanResult PathVelocityPlanner::plan(const PlannerState& state,
     ++attempts;
     auto result = plan_at_speed(
         state, previous_action, trial, command.drive_mode,
-        excluded_candidate_ids, excluded_lateral_targets);
+        excluded_candidate_ids, excluded_lateral_targets, fr);
     feasible = result.diagnostics.number_of_safe_paths > 0
         && result.diagnostics.status.find("INFEASIBLE") == std::string::npos
         && result.diagnostics.status.find("EMERGENCY") == std::string::npos;
@@ -2964,6 +3278,8 @@ AllocationSelectionResult allocate_with_oriented_collision_search(
     const CostConfig& cost,
     std::optional<AllocatorInitialState> initial_state,
     const OrientedFootprintConfig& footprint) {
+  ++g_planning_call_counts.allocation;
+  ScopedBlockTimer allocation_block_timer(g_planning_block_timings.allocation_ms);
   const bool crab_mode = std::any_of(
       trajectory.drive_mode.begin(), trajectory.drive_mode.end(),
       [](DriveMode mode) { return mode == DriveMode::Left || mode == DriveMode::Right; });
@@ -2985,8 +3301,12 @@ AllocationSelectionResult allocate_with_oriented_collision_search(
       continue;
     }
     ++evaluated;
-    auto collision = check_oriented_allocation_collision(
-        allocation, costmap, vehicle, cost, footprint);
+    OrientedCollisionResult collision;
+    {
+      ScopedBlockTimer collision_check_timer(g_planning_block_timings.collision_check_ms);
+      collision = check_oriented_allocation_collision(
+          allocation, costmap, vehicle, cost, footprint);
+    }
     AllocationSelectionResult candidate{std::move(allocation), collision, profile, evaluated};
     if (collision.collision_free) {
       return candidate;

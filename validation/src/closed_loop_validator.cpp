@@ -384,8 +384,10 @@ Metrics run_scenario(const ScenarioData& scenario, double target_speed,
   double y = 0.0;
   double motion_heading = 0.0;
   double initial_kappa = 0.0;
-  reference.evaluate(validation_start_s, x, y, motion_heading, initial_kappa);
+  double initial_kappa_s = 0.0;
+  reference.evaluate(validation_start_s, x, y, motion_heading, initial_kappa, initial_kappa_s);
   (void)initial_kappa;
+  (void)initial_kappa_s;
   double body_yaw = wrap_angle(motion_heading - mode_offset(phase.mode));
   const double initial_speed = std::clamp(
       environment_double("SIMP_VALIDATION_INITIAL_SPEED").value_or(0.0),

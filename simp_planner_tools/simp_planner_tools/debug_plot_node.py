@@ -12,6 +12,7 @@ from typing import Optional
 
 import numpy as np
 import rclpy
+from ament_index_python.packages import get_package_share_directory
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as PathMessage
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -21,12 +22,13 @@ from std_msgs.msg import Float64, String, UInt8
 
 from .debug_allocation_metrics import compute_allocation_debug_sample
 from .debug_plot_renderer import render_debug_snapshot
+from .debug_scenario_geometry import scenario_obstacle_polygons
 from .debug_signal_history import SourceTimeAligner
 from .diagnostic_metrics import OpenPathGeometry, tracking_error_to_executed_segment
 from .path_geometry import PathProjection, project_open_path, wrap_angle
 
 
-MODE_NAMES = {0: "FORWARD", 1: "REVERSE", 2: "LEFT", 3: "RIGHT"}
+MODE_NAMES = {0: "FORWARD", 1: "REVERSE", 2: "LEFT", 3: "RIGHT", 4: "SPOT_TURN"}
 
 
 def quaternion_to_yaw(x: float, y: float, z: float, w: float) -> float:
@@ -62,6 +64,9 @@ class DebugPlotNode(Node):
         self.declare_parameter("dynamic_topic_timeout", 2.0)
 
         self.scenario_name = str(self.get_parameter("scenario").value)
+        self.costmap_vehicle_centered = (
+            self.scenario_name.strip().lower() != "track_map"
+        )
         self.frame_id = str(self.get_parameter("frame_id").value)
         self.save_period = float(self.get_parameter("save_period").value)
         self.vehicle_length = float(self.get_parameter("vehicle_length").value)
@@ -86,6 +91,11 @@ class DebugPlotNode(Node):
         )
         self.dynamic_topic_timeout = float(
             self.get_parameter("dynamic_topic_timeout").value
+        )
+
+        self.scenario_obstacle_polygons = scenario_obstacle_polygons(
+            Path(get_package_share_directory("simp_planner_tools")),
+            self.scenario_name,
         )
 
         base = Path(str(self.get_parameter("output_dir").value)).expanduser()
@@ -254,11 +264,24 @@ class DebugPlotNode(Node):
 
         self.costmap_data: Optional[np.ndarray] = None
         self.costmap_extent: Optional[tuple[float, float, float, float]] = None
+        self.costmap_origin: Optional[dict[str, float]] = None
+        self.costmap_resolution: Optional[float] = None
+        self.costmap_width: Optional[int] = None
+        self.costmap_height: Optional[int] = None
+        # Sticky: the region the planner actually ran its distance transform
+        # over (see LOCAL_COSTMAP_REDESIGN_KR.md). Only present on the richer
+        # "RUNNING" planner-status messages, not every "PENDING_PLAN_READY"
+        # tick -- kept sticky here (like costmap_origin above) so the debug
+        # plot still shows the last-known planner window instead of losing it
+        # whenever a leaner status message happens to be the latest.
+        self.costmap_crop_origin: Optional[dict[str, float]] = None
+        self.costmap_crop_resolution: Optional[float] = None
+        self.costmap_crop_width: Optional[int] = None
+        self.costmap_crop_height: Optional[int] = None
         self.target_speed: Optional[float] = None
         self.mode: Optional[int] = None
         self.requested_mode: Optional[int] = None
-        self.vehicle_transition_in_progress = False
-        self.vehicle_transition_complete = False
+        self.vehicle_status: Optional[int] = None
         self.execution_state = "STARTUP"
         self.cmd_vx = 0.0
         self.cmd_vy = 0.0
@@ -343,16 +366,29 @@ class DebugPlotNode(Node):
 
     def reference_callback(self, message: ReferencePathMessage) -> None:
         self.mark("reference")
-        self.reference_x = np.asarray(message.x, dtype=float)
-        self.reference_y = np.asarray(message.y, dtype=float)
-        self.reference_yaw = np.unwrap(np.asarray(message.yaw, dtype=float))
-        self.reference_kappa = np.asarray(message.curvature, dtype=float)
-        if len(self.reference_x) >= 2:
-            self.reference_segment_length = np.hypot(
-                np.diff(self.reference_x), np.diff(self.reference_y)
-            )
-            self.reference_s = np.r_[0.0, np.cumsum(self.reference_segment_length)]
+        x = np.asarray(message.x, dtype=float)
+        y = np.asarray(message.y, dtype=float)
+        yaw = np.unwrap(np.asarray(message.yaw, dtype=float))
+        if len(x) >= 2:
+            segment_length = np.hypot(np.diff(x), np.diff(y))
+            s = np.r_[0.0, np.cumsum(segment_length)]
+            # The publisher appends one waypoint beyond the window it wants
+            # plotted (see simp_planner_cpp's estimate_curvature_from_yaw) so
+            # curvature at the true last usable point can be estimated with a
+            # forward difference; drop that borrowed point to match what the
+            # planner actually uses.
+            kappa = np.diff(yaw) / np.maximum(np.diff(s), 1.0e-15)
+            self.reference_x = x[:-1]
+            self.reference_y = y[:-1]
+            self.reference_yaw = yaw[:-1]
+            self.reference_kappa = kappa
+            self.reference_segment_length = segment_length[:-1]
+            self.reference_s = s[:-1]
         else:
+            self.reference_x = x
+            self.reference_y = y
+            self.reference_yaw = yaw
+            self.reference_kappa = np.empty(0)
             self.reference_segment_length = np.empty(0)
             self.reference_s = np.empty(0)
         self.current_projection = None
@@ -360,9 +396,20 @@ class DebugPlotNode(Node):
     def selected_data_callback(self, message: ReferencePathMessage) -> None:
         self.mark("selected_trajectory")
         try:
-            self.selected_geometry = OpenPathGeometry.from_arrays(
-                message.x, message.y, message.yaw, message.curvature
-            )
+            x = np.asarray(message.x, dtype=float)
+            y = np.asarray(message.y, dtype=float)
+            yaw = np.unwrap(np.asarray(message.yaw, dtype=float))
+            if len(x) >= 2:
+                s = np.r_[0.0, np.cumsum(np.hypot(np.diff(x), np.diff(y)))]
+                # This topic is the planner's own dense trajectory dump, not
+                # a local reference slice, so it carries no trailing padding
+                # point; repeat the last forward difference for the final
+                # sample -- adequate for this debug-only plot.
+                forward = np.diff(yaw) / np.maximum(np.diff(s), 1.0e-15)
+                kappa = np.r_[forward, forward[-1]]
+            else:
+                kappa = np.zeros_like(x)
+            self.selected_geometry = OpenPathGeometry.from_arrays(x, y, yaw, kappa)
             self.selected_x = self.selected_geometry.x
             self.selected_y = self.selected_geometry.y
             self.selected_projection = None
@@ -405,6 +452,22 @@ class DebugPlotNode(Node):
         x0 = float(message.info.origin.position.x)
         y0 = float(message.info.origin.position.y)
         resolution = float(message.info.resolution)
+        orientation = message.info.origin.orientation
+        self.costmap_origin = {
+            "x": x0,
+            "y": y0,
+            "yaw": quaternion_to_yaw(
+                orientation.x,
+                orientation.y,
+                orientation.z,
+                orientation.w,
+            ),
+        }
+        self.costmap_resolution = resolution
+        self.costmap_width = width
+        self.costmap_height = height
+        # Retain the old axis-aligned extent for snapshots produced/consumed by
+        # older tooling. New renderers prefer costmap_origin plus grid metadata.
         self.costmap_extent = (
             x0, x0 + width * resolution, y0, y0 + height * resolution
         )
@@ -420,8 +483,7 @@ class DebugPlotNode(Node):
     def vehicle_mode_callback(self, message: DriveModeState) -> None:
         self.mark("vehicle_mode")
         self.mode = int(message.current_mode)
-        self.vehicle_transition_in_progress = bool(message.transition_in_progress)
-        self.vehicle_transition_complete = bool(message.transition_complete)
+        self.vehicle_status = int(message.status)
 
     def executed_command_callback(self, message: ExecutedCommand) -> None:
         self.mark("cmd_vel")
@@ -538,6 +600,15 @@ class DebugPlotNode(Node):
 
         execution = self.planner_section("execution")
         plan = self.planner_section("plan")
+        if "costmap_crop_width" in plan:
+            self.costmap_crop_origin = {
+                "x": plan.get("costmap_crop_origin_x"),
+                "y": plan.get("costmap_crop_origin_y"),
+                "yaw": plan.get("costmap_crop_origin_yaw"),
+            }
+            self.costmap_crop_resolution = plan.get("costmap_crop_resolution")
+            self.costmap_crop_width = plan.get("costmap_crop_width")
+            self.costmap_crop_height = plan.get("costmap_crop_height")
         timing = self.planner_section("timing")
         plan_id = int(execution.get("current_plan_id", 0) or 0)
         if plan_id <= 0 or plan_id == self.last_logged_plan_id:
@@ -722,7 +793,8 @@ class DebugPlotNode(Node):
                 tracking_source = "SELECTED_PATH_FALLBACK"
             except ValueError:
                 self.selected_projection = None
-        elif self.execution_state in {"SAFETY_STOP", "MODE_STOP", "MODE_WAIT"}:
+        elif (self.execution_state in {"SAFETY_STOP", "MODE_STOP", "MODE_WAIT"}
+              or self.execution_state.startswith("SPOT_TURN_")):
             tracking_source = self.execution_state
 
         plan = self.planner_section("plan")
@@ -824,10 +896,13 @@ class DebugPlotNode(Node):
         if self.last_seen["planner_status"] is None:
             return "NO_PLANNER_STATUS", "No planner status received."
         planner_state = str(self.planner_status.get("state", "UNKNOWN"))
-        if planner_state == "BLOCKED":
+        if planner_state in {"BLOCKED", "NO_SAFE_PLAN_SAFETY_STOP"} or planner_state.startswith("PLANNING_FAILED"):
             return "PLANNER_BLOCKED", str(
                 self.planner_status.get("block_reason", "UNKNOWN")
             )
+        spot_turn = self.planner_section("spot_turn").get("state", "INACTIVE")
+        if spot_turn not in {"INACTIVE", "SPOT_TURN_APPROACH"}:
+            return str(spot_turn), "Spot-turn wheel alignment, rotation, or clearance wait is active."
 
         plan = self.planner_section("plan")
         selected_target = float(plan.get("selected_n_target", math.nan))
@@ -859,7 +934,7 @@ class DebugPlotNode(Node):
                 f"p95={p95:.1f} ms, miss ratio={100.0 * miss_ratio:.1f}%",
             )
 
-        if self.vehicle_transition_in_progress:
+        if self.vehicle_status == DriveModeState.STATUS_ALIGNING:
             return (
                 "MODE_TRANSITION_IN_PROGRESS",
                 f"vehicle mode {self.mode} -> requested {self.requested_mode}",
@@ -897,6 +972,8 @@ class DebugPlotNode(Node):
                 "alternating_gate_corridor",
                 "curved_gate_maze",
                 "winding_obstacle_course",
+                "winding_obstacle_course_wide_gates",
+                "parking_ramp_loop",
                 "narrow_22m_stop_corridor",
                 "narrow_28m_corridor",
                 "narrow_offset_corridor",
@@ -963,16 +1040,32 @@ class DebugPlotNode(Node):
             "latest_cmd_yaw_rate": self.cmd_yaw_rate,
             "requested_drive_mode": self.requested_mode,
             "vehicle_drive_mode": self.mode,
-            "vehicle_transition_in_progress": self.vehicle_transition_in_progress,
-            "vehicle_transition_complete": self.vehicle_transition_complete,
+            "vehicle_status": self.vehicle_status,
             "planning_deadline_ms": self.planning_deadline_ms,
             "diagnosis": diagnosis,
             "detail": detail,
             "global_x": self.global_x.copy(), "global_y": self.global_y.copy(),
             "reference_x": self.reference_x.copy(), "reference_y": self.reference_y.copy(),
             "selected_x": self.selected_x.copy(), "selected_y": self.selected_y.copy(),
+            "scenario_obstacles": tuple(
+                vertices.copy() for vertices in self.scenario_obstacle_polygons
+            ),
+            "costmap_vehicle_centered": self.costmap_vehicle_centered,
             "costmap_data": None if self.costmap_data is None else self.costmap_data.copy(),
             "costmap_extent": self.costmap_extent,
+            "costmap_origin": copy.deepcopy(self.costmap_origin),
+            "costmap_resolution": self.costmap_resolution,
+            "costmap_width": self.costmap_width,
+            "costmap_height": self.costmap_height,
+            # The region the planner actually ran its distance transform
+            # over (a reference-path-slice crop of the grid above, usually
+            # smaller and off-centre) -- see LOCAL_COSTMAP_REDESIGN_KR.md.
+            # Sticky (see planner_status_callback): None until the first
+            # "RUNNING"-state status message carries crop metadata.
+            "costmap_crop_origin": copy.deepcopy(self.costmap_crop_origin),
+            "costmap_crop_resolution": self.costmap_crop_resolution,
+            "costmap_crop_width": self.costmap_crop_width,
+            "costmap_crop_height": self.costmap_crop_height,
             "current_state": copy.deepcopy(self.current_state),
             "current_projection": self.projection_payload(self.current_projection),
             "selected_projection": self.projection_payload(self.selected_projection),

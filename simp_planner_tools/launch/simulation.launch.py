@@ -1,12 +1,18 @@
 import math
+import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 from simp_planner_tools.scenario_definition import load_scenario_definition
+
+# Relative to this package's own installed share directory (see setup.py),
+# not an absolute path tied to any one machine/user.
+_HDMAP_DIR = os.path.join(get_package_share_directory("simp_planner_tools"), "HDMap")
 
 
 def _resolved_nodes(context):
@@ -29,6 +35,14 @@ def _resolved_nodes(context):
     requested_costmap_resolution = float(
         LaunchConfiguration("costmap_resolution").perform(context)
     )
+    costmap_size_m = float(
+        LaunchConfiguration("costmap_size_m").perform(context)
+    )
+    costmap_publish_hz = float(
+        LaunchConfiguration("costmap_publish_hz").perform(context)
+    )
+    if not math.isfinite(costmap_publish_hz) or costmap_publish_hz <= 0.0:
+        raise ValueError("costmap_publish_hz must be finite and positive")
     footprint_translation_step = float(
         LaunchConfiguration("oriented_footprint_translation_step_m").perform(context)
     )
@@ -85,6 +99,8 @@ def _resolved_nodes(context):
                     "target_speed": target_speed,
                     "path_update_distance": path_update_distance,
                     "costmap_resolution": costmap_resolution,
+                    "costmap_size_m": costmap_size_m,
+                    "costmap_publish_hz": costmap_publish_hz,
                 }
             ],
         ),
@@ -96,6 +112,7 @@ def _resolved_nodes(context):
             parameters=[
                 {
                     "command_frequency_hz": command_frequency_hz,
+                    "costmap_update_period_sec": 1.0 / costmap_publish_hz,
                     "oriented_footprint_circle_count": footprint_circle_count,
                     "oriented_footprint_translation_step_m": footprint_translation_step,
                     "oriented_footprint_yaw_step_deg": footprint_yaw_step,
@@ -114,6 +131,55 @@ def _resolved_nodes(context):
                     "output_dir": debug_output_dir,
                 }
             ],
+        ),
+        Node(
+            package="simp_planner_tools",
+            executable="vehicle_visualizer_node",
+            name="vehicle_visualizer_node",
+            output="screen",
+            parameters=[
+                {
+                    "vehicle_length": float(
+                        LaunchConfiguration("vehicle_length").perform(context)
+                    ),
+                    "vehicle_width": float(
+                        LaunchConfiguration("vehicle_width").perform(context)
+                    ),
+                }
+            ],
+        ),
+        Node(
+            package="simp_planner_tools",
+            executable="hdmap_lane_visualizer_node",
+            name="hdmap_lane_visualizer_node",
+            output="screen",
+            parameters=[
+                {
+                    "shapefile_path": os.path.join(
+                        _HDMAP_DIR, "HDMAP", "B2_SURFACELINEMARK.shp"
+                    ),
+                    # HD map 기반이 아닌 시나리오는 이 파일이 없는 게 정상이다
+                    # -- 노드가 경고만 남기고 조용히 비활성화된다.
+                    "origin_file": os.path.join(
+                        _HDMAP_DIR, "output", f"{scenario_name}_origin.txt"
+                    ),
+                }
+            ],
+        ),
+        Node(
+            package="rviz2",
+            executable="rviz2",
+            name="rviz2",
+            output="screen",
+            arguments=[
+                "-d",
+                os.path.join(
+                    get_package_share_directory("simp_planner_tools"),
+                    "rviz",
+                    "simp_planner.rviz",
+                ),
+            ],
+            condition=IfCondition(LaunchConfiguration("use_rviz")),
         ),
     ]
 
@@ -143,6 +209,14 @@ def generate_launch_description() -> LaunchDescription:
                 description="Negative value uses the scenario-recommended costmap resolution.",
             ),
             DeclareLaunchArgument(
+                "costmap_size_m", default_value="90.0",
+                description="Vehicle-centred square costmap side length in metres.",
+            ),
+            DeclareLaunchArgument(
+                "costmap_publish_hz", default_value="5.0",
+                description="Vehicle-frame costmap publication rate.",
+            ),
+            DeclareLaunchArgument(
                 "oriented_footprint_translation_step_m", default_value="0.20"
             ),
             DeclareLaunchArgument("oriented_footprint_yaw_step_deg", default_value="2.0"),
@@ -150,6 +224,18 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "debug_output_dir",
                 default_value="/home/sum/Desktop/simp_planner/simp_planner_debug",
+            ),
+            DeclareLaunchArgument(
+                "vehicle_length", default_value="3.0",
+                description="RViz vehicle footprint marker length (m).",
+            ),
+            DeclareLaunchArgument(
+                "vehicle_width", default_value="2.0",
+                description="RViz vehicle footprint marker width (m).",
+            ),
+            DeclareLaunchArgument(
+                "use_rviz", default_value="false",
+                description="Auto-launch rviz2 with the bundled simp_planner.rviz config.",
             ),
             OpaqueFunction(function=_resolved_nodes),
         ]

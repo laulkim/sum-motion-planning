@@ -195,6 +195,14 @@ def _project_open_candidates(
     segment_length: np.ndarray,
     candidate_indices: np.ndarray,
 ) -> PathProjection:
+    # Coincident spot-turn points have no translational segment to project
+    # onto. Keep the neighboring driving segments and their original indices.
+    usable = segment_length[candidate_indices] > 1.0e-6
+    candidate_indices = candidate_indices[usable]
+    if not len(candidate_indices):
+        candidate_indices = np.flatnonzero(segment_length > 1.0e-6)
+    if not len(candidate_indices):
+        raise ValueError("Open path has no nonzero driving segments")
     next_indices = candidate_indices + 1
     ax = x[candidate_indices]
     ay = y[candidate_indices]
