@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import math
+import json
 
 import rclpy
 from geometry_msgs.msg import Point, PoseStamped
@@ -26,9 +27,10 @@ from nav_msgs.msg import Path as PathMessage
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from simp_planner_msgs.msg import DriveModeState
+from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 
-MODE_NAMES = {0: "FORWARD", 1: "REVERSE", 2: "LEFT", 3: "RIGHT"}
+MODE_NAMES = {0: "FORWARD", 1: "REVERSE", 2: "LEFT", 3: "RIGHT", 4: "SPOT_TURN"}
 STATUS_NAMES = {
     DriveModeState.STATUS_ALIGNING: "ALIGNING",
     DriveModeState.STATUS_READY: "READY",
@@ -97,11 +99,19 @@ class VehicleVisualizerNode(Node):
         self.traveled_path = PathMessage()
         self.last_recorded_xy: tuple[float, float] | None = None
         self.vehicle_mode_state: DriveModeState | None = None
+        self.spot_turn_state = "INACTIVE"
 
         self.create_subscription(Odometry, "/odom", self.odom_callback, 50)
         self.create_subscription(
             DriveModeState, "/vehicle/drive_mode_state", self.mode_state_callback, static_qos
         )
+        self.create_subscription(String, "/planner/status", self.planner_status_callback, static_qos)
+
+    def planner_status_callback(self, message: String) -> None:
+        try:
+            self.spot_turn_state = str(json.loads(message.data).get("spot_turn", {}).get("state", "INACTIVE"))
+        except (ValueError, AttributeError):
+            self.spot_turn_state = "UNKNOWN"
 
     def mode_state_callback(self, message: DriveModeState) -> None:
         self.vehicle_mode_state = message
@@ -115,6 +125,9 @@ class VehicleVisualizerNode(Node):
             lines.append(f"vehicle current: {mode_name(state.current_mode)}")
             lines.append(f"vehicle requested: {mode_name(state.requested_mode)}")
             lines.append(f"status: {status_name(state.status)}")
+        spot_turn = getattr(self, "spot_turn_state", "INACTIVE")
+        if spot_turn != "INACTIVE":
+            lines.append(f"maneuver: {spot_turn}")
         return "\n".join(lines)
 
     def odom_callback(self, message: Odometry) -> None:

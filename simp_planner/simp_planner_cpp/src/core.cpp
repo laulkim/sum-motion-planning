@@ -1095,6 +1095,7 @@ double drive_mode_heading_offset(DriveMode mode) {
     case DriveMode::Reverse: return kPi;
     case DriveMode::Left: return 0.5 * kPi;
     case DriveMode::Right: return -0.5 * kPi;
+    case DriveMode::SpotTurn: return 0.0;
   }
   return 0.0;
 }

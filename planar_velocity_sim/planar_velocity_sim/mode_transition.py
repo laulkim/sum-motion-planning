@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 
 
-VALID_DRIVE_MODES = (0, 1, 2, 3)
+VALID_DRIVE_MODES = (0, 1, 2, 3, 4)
 
 
 class VehicleModeStatus(IntEnum):
@@ -42,7 +42,7 @@ class DriveModeTransitionModel:
         stop_speed_threshold: float = 0.03,
     ) -> None:
         if initial_mode not in VALID_DRIVE_MODES:
-            raise ValueError("initial_mode must be in [0, 3]")
+            raise ValueError("initial_mode must be in [0, 4]")
         if transition_duration_sec < 0.0:
             raise ValueError("transition_duration_sec must be non-negative")
         if stop_speed_threshold < 0.0:
@@ -61,7 +61,7 @@ class DriveModeTransitionModel:
     def command(self, requested_mode: int, measured_speed: float, now_sec: float) -> bool:
         requested_mode = int(requested_mode)
         if requested_mode not in VALID_DRIVE_MODES:
-            raise ValueError("requested_mode must be in [0, 3]")
+            raise ValueError("requested_mode must be in [0, 4]")
         if measured_speed > self.stop_speed_threshold:
             return False
         if self.status == VehicleModeStatus.ALIGNING and requested_mode == self.requested_mode:

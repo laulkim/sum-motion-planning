@@ -209,12 +209,34 @@ def _straight_segment(
     return ScenarioPath.from_arrays(x, y, yaw, kappa, mode_array)
 
 
+def _curved_segment(
+    x0: float, y0: float, heading0: float, curvature: float, length: float, mode: int,
+    *, ds: float = 0.2,
+) -> ScenarioPath:
+    count = max(4, int(math.ceil(length / ds)) + 1)
+    s_values = np.linspace(0.0, length, count)
+    yaw = heading0 + curvature * s_values
+    x = np.empty(count)
+    y = np.empty(count)
+    x[0], y[0] = x0, y0
+    for i in range(1, count):
+        d = s_values[i] - s_values[i - 1]
+        mean_yaw = 0.5 * (yaw[i - 1] + yaw[i])
+        x[i] = x[i - 1] + d * math.cos(mean_yaw)
+        y[i] = y[i - 1] + d * math.sin(mean_yaw)
+    kappa = np.full(count, curvature)
+    mode_array = np.full(count, mode, dtype=np.uint8)
+    return ScenarioPath.from_arrays(x, y, yaw, kappa, mode_array)
+
+
 def build_spot_turn_crab_course_phases(
     *,
     forward_leg_length: float = 36.0,
     crab_leg_length: float = 24.0,
     stub_length: float = 0.6,
     turn_degrees: tuple[float, float, float] = (40.0, -60.0, 70.0),
+    curvature_after_turn1: float = 0.018,
+    curvature_final_leg: float = -0.015,
     forward_speed: float = 1.5,
     crab_speed: float = 1.0,
     ds: float = 0.2,
@@ -237,8 +259,9 @@ def build_spot_turn_crab_course_phases(
     seg_a = _straight_segment(x, y, heading, forward_leg_length, mode=0, ds=ds)
     x, y = float(seg_a.x[-1]), float(seg_a.y[-1])
     heading += turns[0]
-    seg_b = _straight_segment(x, y, heading, forward_leg_length, mode=0, ds=ds)
+    seg_b = _curved_segment(x, y, heading, curvature_after_turn1, forward_leg_length, mode=0, ds=ds)
     forward1 = ScenarioPath.join_with_turns([seg_a, seg_b])
+    heading = float(seg_b.yaw[-1])
     x, y = float(forward1.x[-1]), float(forward1.y[-1])
 
     crab1 = _straight_segment(x, y, heading + 0.5 * math.pi, crab_leg_length, mode=2, ds=ds)
@@ -264,7 +287,7 @@ def build_spot_turn_crab_course_phases(
     crab3 = _straight_segment(x, y, heading + 0.5 * math.pi, crab_leg_length, mode=2, ds=ds)
     x, y = float(crab3.x[-1]), float(crab3.y[-1])
 
-    forward4 = _straight_segment(x, y, heading, forward_leg_length, mode=0, ds=ds)
+    forward4 = _curved_segment(x, y, heading, curvature_final_leg, forward_leg_length, mode=0, ds=ds)
 
     def _phase(name: str, path: ScenarioPath, cruise_speed: float, has_next: bool) -> "ScenarioPhase":
         return ScenarioPhase(

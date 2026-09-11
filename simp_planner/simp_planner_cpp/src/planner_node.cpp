@@ -74,38 +74,6 @@ geometry_msgs::msg::Quaternion yaw_to_quaternion(double yaw) {
   return q;
 }
 
-std::vector<double> cumulative_arc_length(const std::vector<double>& x,
-                                          const std::vector<double>& y) {
-  std::vector<double> s(x.size(), 0.0);
-  for (std::size_t i = 1; i < x.size(); ++i) {
-    const double ds = std::hypot(x[i] - x[i - 1], y[i] - y[i - 1]);
-    if (ds <= 1.0e-4) throw std::invalid_argument("reference path contains duplicate points");
-    s[i] = s[i - 1] + ds;
-  }
-  return s;
-}
-
-// The reference path no longer carries an authored curvature array, so it is
-// estimated here from (unwrapped) yaw and arc length via a forward
-// difference. The publisher always appends one waypoint beyond the window it
-// actually wants planned -- a real next point when one exists, otherwise a
-// synthetic point extended straight along the last heading (whose forward
-// difference is exactly zero, matching the fact that motion, and therefore
-// curvature demand, stops at that point). That guarantee lets this function
-// stay unconditional: it returns one fewer sample than it was given, and the
-// caller drops the trailing (borrowed) x/y/yaw/s sample to match.
-std::vector<double> estimate_curvature_from_yaw(const std::vector<double>& psi,
-                                                const std::vector<double>& s) {
-  if (psi.size() != s.size() || psi.size() < 2) {
-    throw std::invalid_argument("curvature estimation requires equal arrays of length >= 2");
-  }
-  std::vector<double> kappa(psi.size() - 1, 0.0);
-  for (std::size_t i = 0; i + 1 < psi.size(); ++i) {
-    kappa[i] = (psi[i + 1] - psi[i]) / std::max(s[i + 1] - s[i], 1.0e-15);
-  }
-  return kappa;
-}
-
 struct ExecutablePlan {
   PlanResult result;
   AllocationResult allocation;
@@ -159,6 +127,7 @@ struct InputSnapshot {
   DriveMode drive_mode{DriveMode::Forward};
   DriveMode reference_mode{DriveMode::Forward};
   bool mode_ready{false};
+  bool spot_turn_active{false};
   std::uint64_t mode_revision{0};
   std::uint64_t input_revision{0};
   std::uint64_t path_revision{0};
@@ -189,6 +158,7 @@ struct ModeStatusSnapshot {
   int reference_mode{-1};
   bool ready{false};
   int vehicle_status{-1};  // DriveModeState::STATUS_ALIGNING(0)/STATUS_READY(1), -1 = 피드백 없음
+  std::string spot_turn_state{"INACTIVE"};
 };
 
 }  // namespace
@@ -216,6 +186,21 @@ class PlannerNodeCpp final : public rclcpp::Node {
         get_parameter("planning_handover_max_lead_sec").as_double();
     mode_change_stop_speed_ = declare_parameter<double>("mode_change_stop_speed_mps", 0.03);
     mode_command_period_sec_ = declare_parameter<double>("mode_command_period_sec", 0.25);
+    spot_turn_config_.kappa_threshold = declare_parameter<double>("spot_turn_kappa_threshold", 1000.0);
+    spot_turn_config_.arrival_tolerance_m = declare_parameter<double>("spot_turn_arrival_tolerance_m", 0.20);
+    spot_turn_config_.safety_margin = declare_parameter<double>("spot_turn_safety_margin", 0.0);
+    spot_turn_config_.yaw_rate_max = declare_parameter<double>("spot_turn_yaw_rate_max", 0.3);
+    spot_turn_config_.yaw_rate_accel_max = declare_parameter<double>("spot_turn_yaw_rate_accel_max", 0.3);
+    spot_turn_config_.yaw_tolerance_rad = declare_parameter<double>("spot_turn_yaw_tolerance_rad", 0.02);
+    spot_turn_config_.yaw_rate_tolerance = declare_parameter<double>("spot_turn_yaw_rate_tolerance", 0.02);
+    if (!std::isfinite(spot_turn_config_.kappa_threshold) ||
+        spot_turn_config_.kappa_threshold <= config_.constraints.curvature_max ||
+        !std::isfinite(spot_turn_config_.arrival_tolerance_m) ||
+        spot_turn_config_.arrival_tolerance_m <= 0.0 ||
+        !std::isfinite(spot_turn_config_.safety_margin) || spot_turn_config_.safety_margin < 0.0) {
+      throw std::invalid_argument("invalid spot turn detection/arrival/clearance settings");
+    }
+    maneuver_ = SpotTurnManeuver(spot_turn_config_);
     if (!(trajectory_knot_dt_ > 0.0) || !(command_frequency_hz_ > 0.0) ||
         !(scheduler_frequency_hz_ > 0.0) || !(costmap_update_period_sec_ > 0.0) ||
         !std::isfinite(costmap_update_period_sec_)) {
@@ -323,7 +308,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
     if (!requested || !current) return std::nullopt;
     return InputSnapshot{current_state_, current_body_yaw_, current_state_time_ns_,
                          reference_path_, costmap_, target_speed_, *requested, *current,
-                         reference_mode_, mode_supervisor_.ready(), mode_revision_,
+                         reference_mode_, mode_supervisor_.ready(),
+                         maneuver_.state() != SpotTurnManeuverState::Inactive, mode_revision_,
                          input_revision_, path_revision_, structural_revision_,
                          command_revision_, path_frame_};
   }
@@ -366,6 +352,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
     const double body_vx = msg->twist.twist.linear.x;
     const double body_vy = msg->twist.twist.linear.y;
     const double speed = std::hypot(body_vx, body_vy);
+    if (!std::isfinite(body_yaw) || !std::isfinite(speed) ||
+        !std::isfinite(msg->pose.pose.position.x) || !std::isfinite(msg->pose.pose.position.y) ||
+        !std::isfinite(msg->twist.twist.angular.z)) return;
     std::optional<BodyCommand> last;
     {
       std::lock_guard<std::mutex> lock(execution_mutex_);
@@ -395,6 +384,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       current_state_ = {msg->pose.pose.position.x, msg->pose.pose.position.y,
                         chi, speed, acceleration, heading_rate};
       current_body_yaw_ = body_yaw;
+      current_body_yaw_rate_ = msg->twist.twist.angular.z;
       current_state_time_ns_ = rclcpp::Time(msg->header.stamp).nanoseconds();
       if (current_state_time_ns_ <= 0) current_state_time_ns_ = now_ns();
       odom_frame_ = msg->header.frame_id;
@@ -493,7 +483,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
       std::vector<std::int8_t> data, int width, int height, double resolution,
       double origin_x, double origin_y, double origin_yaw,
       const ReferencePath& path, const PlannerState& state,
-      double costmap_update_period_sec, const EnvConfig& config) {
+      double costmap_update_period_sec, const EnvConfig& config,
+      double rotation_safety_margin) {
     CostmapCropResult full{std::move(data), width, height, origin_x, origin_y};
 
     const double half_length = 0.5 * config.vehicle.length;
@@ -547,6 +538,19 @@ class PlannerNodeCpp final : public rclcpp::Node {
     local_x_max += longitudinal_margin;
     local_y_min -= lateral_margin;
     local_y_max += lateral_margin;
+    // Rotation checks query the real vehicle position, which can differ from
+    // the reference projection after a stop. Keep its whole rotation circle
+    // in the crop, including a cell for bilinear distance interpolation.
+    const double vehicle_dx = state.x - origin_x;
+    const double vehicle_dy = state.y - origin_y;
+    const double vehicle_local_x = c * vehicle_dx + s_yaw * vehicle_dy;
+    const double vehicle_local_y = -s_yaw * vehicle_dx + c * vehicle_dy;
+    const double rotation_radius = circumscribed_radius(
+        config.vehicle.length, config.vehicle.width, footprint_margin) + rotation_safety_margin + resolution;
+    local_x_min = std::min(local_x_min, vehicle_local_x - rotation_radius);
+    local_x_max = std::max(local_x_max, vehicle_local_x + rotation_radius);
+    local_y_min = std::min(local_y_min, vehicle_local_y - rotation_radius);
+    local_y_max = std::max(local_y_max, vehicle_local_y + rotation_radius);
 
     const int col_start = std::clamp(
         static_cast<int>(std::floor(local_x_min / resolution)), 0, width);
@@ -587,7 +591,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
   void path_callback(const ReferencePathMsg::SharedPtr msg) {
     try {
       // Publishers append one waypoint beyond the window they want planned
-      // (see estimate_curvature_from_yaw), so at least 5 points are required
+      // (see SpotTurnReferenceBuffer), so at least 5 points are required
       // for a usable 4-point reference path after that trailing point is
       // dropped.
       if (msg->x.size() < 5 || msg->x.size() != msg->y.size() ||
@@ -600,23 +604,33 @@ class PlannerNodeCpp final : public rclcpp::Node {
         throw std::invalid_argument("each local reference must contain one valid drive mode");
       }
       const auto reference_mode = static_cast<DriveMode>(msg->mode.front());
-      const auto arc_length = cumulative_arc_length(msg->x, msg->y);
-      const auto kappa = estimate_curvature_from_yaw(unwrap_angles(msg->yaw), arc_length);
-      const auto used = kappa.size();
-      auto path = std::make_shared<ReferencePath>(
-          std::vector<double>(arc_length.begin(), arc_length.begin() + used),
-          std::vector<double>(msg->x.begin(), msg->x.begin() + used),
-          std::vector<double>(msg->y.begin(), msg->y.begin() + used),
-          std::vector<double>(msg->yaw.begin(), msg->yaw.begin() + used),
-          kappa);
       bool identical = false;
       bool hard_change = false;
       {
         std::lock_guard<std::mutex> lock(input_mutex_);
-        identical = reference_path_ && reference_mode == reference_mode_ &&
+        const auto frame = msg->header.frame_id.empty() ? "map" : msg->header.frame_id;
+        if (received_odom_ && !odom_frame_.empty() && frame != odom_frame_) {
+          throw std::invalid_argument("reference path frame does not match odometry");
+        }
+        if (maneuver_.state() != SpotTurnManeuverState::Inactive) {
+          if (reference_mode != reference_mode_ || frame != path_frame_) deferred_reference_ = msg;
+          return;
+        }
+        std::shared_ptr<ReferencePath> path;
+        if (frame != path_frame_) {
+          SpotTurnReferenceBuffer fresh;
+          path = fresh.update(msg->x, msg->y, msg->yaw, reference_mode, spot_turn_config_.kappa_threshold);
+          reference_buffer_ = std::move(fresh);
+        } else {
+          path = reference_buffer_.update(
+              msg->x, msg->y, msg->yaw, reference_mode, spot_turn_config_.kappa_threshold);
+        }
+        if (!path) return;
+        const bool split_for_turn = reference_buffer_.pending();
+        identical = !split_for_turn && reference_path_ && reference_mode == reference_mode_ &&
                     same_reference_path(*reference_path_, *path);
         if (!identical) {
-          hard_change = !is_soft_reference_continuation_locked(*path, reference_mode);
+          hard_change = split_for_turn || !is_soft_reference_continuation_locked(*path, reference_mode);
           reference_path_ = std::move(path);
           reference_mode_ = reference_mode;
           path_frame_ = msg->header.frame_id.empty() ? "map" : msg->header.frame_id;
@@ -629,6 +643,10 @@ class PlannerNodeCpp final : public rclcpp::Node {
       // A rolling local window is a soft update: keep the already validated
       // pending/active plan.  A route or mode discontinuity remains hard.
       if (hard_change) invalidate_motion_plan();
+      if (hard_change) {
+        std::lock_guard<std::mutex> lock(terminal_hold_mutex_);
+        terminal_hold_.reset();
+      }
       request_replan(hard_change ? "REFERENCE_PATH_HARD" : "REFERENCE_PATH_SOFT",
                      hard_change);
     } catch (const std::exception& error) {
@@ -651,6 +669,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       std::shared_ptr<const ReferencePath> path_for_crop;
       PlannerState state_for_crop{};
       bool have_path_and_state = false;
+      std::uint64_t crop_path_revision = 0;
       std::int64_t last_capture_time_ns = 0;
       {
         std::lock_guard<std::mutex> lock(input_mutex_);
@@ -664,7 +683,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
           throw std::invalid_argument(
               "OccupancyGrid frame does not match reference-path frame");
         }
-        if (received_costmap_ && fingerprint == costmap_fingerprint_) return;
+        if (received_costmap_ && fingerprint == costmap_fingerprint_ &&
+            costmap_crop_path_revision_ == path_revision_) return;
+        crop_path_revision = path_revision_;
         last_capture_time_ns = last_costmap_capture_time_ns_;
         if (capture_time_ns > 0 && last_capture_time_ns > 0 &&
             capture_time_ns < last_capture_time_ns) {
@@ -708,7 +729,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
         auto crop = crop_costmap_to_reference_path_window(
             std::move(data), width, height, msg->info.resolution,
             map_origin_x, map_origin_y, origin_yaw, *path_for_crop,
-            state_for_crop, motion_buffer_sec, config_);
+            state_for_crop, motion_buffer_sec, config_, spot_turn_config_.safety_margin);
         data = std::move(crop.data);
         map_width = crop.width;
         map_height = crop.height;
@@ -764,6 +785,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
         costmap_ = std::move(map);
         costmap_frame_ = msg->header.frame_id;
         costmap_fingerprint_ = fingerprint;
+        costmap_crop_path_revision_ = crop_path_revision;
         if (capture_time_ns > last_costmap_capture_time_ns_) {
           last_costmap_capture_time_ns_ = capture_time_ns;
         }
@@ -816,8 +838,10 @@ class PlannerNodeCpp final : public rclcpp::Node {
     bool changed;
     {
       std::lock_guard<std::mutex> lock(input_mutex_);
-      changed = mode_supervisor_.set_requested_mode(
-          static_cast<DriveMode>(msg->data));
+      const auto mode = static_cast<DriveMode>(msg->data);
+      changed = maneuver_.state() == SpotTurnManeuverState::Inactive
+          ? mode_supervisor_.set_requested_mode(mode)
+          : maneuver_.set_external_requested_mode(mode, mode_supervisor_);
       received_requested_mode_ = true;
       if (changed) ++command_revision_;
     }
@@ -827,8 +851,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
   }
 
   void vehicle_mode_callback(const DriveModeStateMsg::SharedPtr msg) {
-    if (msg->current_mode > static_cast<std::uint8_t>(DriveMode::Right) ||
-        msg->requested_mode > static_cast<std::uint8_t>(DriveMode::Right)) {
+    if (msg->current_mode > static_cast<std::uint8_t>(DriveMode::SpotTurn) ||
+        msg->requested_mode > static_cast<std::uint8_t>(DriveMode::SpotTurn) ||
+        msg->status > static_cast<std::uint8_t>(VehicleModeStatus::Ready)) {
       RCLCPP_ERROR(get_logger(), "invalid vehicle drive-mode feedback");
       return;
     }
@@ -919,6 +944,10 @@ class PlannerNodeCpp final : public rclcpp::Node {
     const auto input = snapshot();
     if (!input) {
       publish_status("WAITING_FOR_INPUTS", 0.0, -1);
+      return;
+    }
+    if (input->spot_turn_active) {
+      publish_status(mode_status_snapshot().spot_turn_state, 0.0, -1);
       return;
     }
     if (!input->mode_ready) {
@@ -1242,11 +1271,71 @@ class PlannerNodeCpp final : public rclcpp::Node {
     DriveModeControlState mode_state;
     bool mode_ready;
     double measured_speed;
+    bool resumed_after_turn = false;
+    bool waiting_clearance = false;
+    std::optional<BodyCommand> rotating_command;
+    ReferencePathMsg::SharedPtr deferred;
     {
       std::lock_guard<std::mutex> lock(input_mutex_);
       measured_speed = current_state_.speed;
       mode_ready = mode_supervisor_.ready();
       mode_state = mode_supervisor_.state(measured_speed, mode_change_stop_speed_);
+      if (maneuver_.on_mode_ready(mode_supervisor_)) {
+        reference_path_ = reference_buffer_.complete_turn();
+        ++path_revision_;
+        ++command_revision_;
+        resumed_after_turn = true;
+        deferred = std::move(deferred_reference_);
+      }
+      spot_turn_waiting_clearance_ = false;
+      if (mode_ready && maneuver_.state() == SpotTurnManeuverState::Inactive &&
+          mode_supervisor_.current_mode() == reference_mode_ && received_costmap_ &&
+          measured_speed <= mode_change_stop_speed_ &&
+          reference_buffer_.arrived(current_state_, spot_turn_config_.arrival_tolerance_m)) {
+        if (spot_turn_feasible(*costmap_, current_state_, config_.vehicle, spot_turn_config_.safety_margin)) {
+          maneuver_.trigger(reference_buffer_.target_body_yaw(), *mode_supervisor_.requested_mode());
+          mode_supervisor_.set_requested_mode(DriveMode::SpotTurn);
+          ++command_revision_;
+          mode_ready = false;
+          mode_state = mode_supervisor_.state(measured_speed, mode_change_stop_speed_);
+        } else {
+          spot_turn_waiting_clearance_ = true;
+        }
+      }
+      waiting_clearance = spot_turn_waiting_clearance_;
+      if (mode_ready) {
+        const auto previous_request = mode_supervisor_.requested_mode();
+        rotating_command = maneuver_.sample(
+            command_dt_, current_body_yaw_, current_body_yaw_rate_, mode_supervisor_);
+        if (mode_supervisor_.requested_mode() != previous_request) ++command_revision_;
+        if (rotating_command) {
+          rotating_command->segment_start_x = rotating_command->segment_end_x = current_state_.x;
+          rotating_command->segment_start_y = rotating_command->segment_end_y = current_state_.y;
+          rotating_command->segment_start_heading = current_body_yaw_;
+          rotating_command->segment_end_heading =
+              wrap_angle(current_body_yaw_ + rotating_command->yaw_rate * command_dt_);
+        }
+      }
+    }
+    if (resumed_after_turn) {
+      invalidate_motion_plan();
+      {
+        std::lock_guard<std::mutex> lock(terminal_hold_mutex_);
+        terminal_hold_.reset();
+      }
+      if (deferred) path_callback(deferred);
+      request_replan("SPOT_TURN_COMPLETED", true);
+    }
+    if (rotating_command || waiting_clearance) {
+      const auto command = rotating_command.value_or(zero_command());
+      invalidate_motion_plan();
+      {
+        std::lock_guard<std::mutex> lock(execution_mutex_);
+        last_command_ = command;
+      }
+      publish_execution_state_if_changed(rotating_command ? "SPOT_TURN_ROTATING" : "SPOT_TURN_WAITING_CLEARANCE");
+      publish_command(command, 0, stamp_ns);
+      return;
     }
 
     if (!mode_ready) {
@@ -1477,6 +1566,10 @@ class PlannerNodeCpp final : public rclcpp::Node {
     }
     status.reference_mode = received_path_ ? static_cast<int>(reference_mode_) : -1;
     status.ready = mode_supervisor_.ready();
+    status.spot_turn_state = maneuver_.state_name();
+    if (maneuver_.state() == SpotTurnManeuverState::Inactive && reference_buffer_.pending()) {
+      status.spot_turn_state = spot_turn_waiting_clearance_ ? "SPOT_TURN_WAITING_CLEARANCE" : "SPOT_TURN_APPROACH";
+    }
     if (mode_supervisor_.current_mode()) {
       status.vehicle_status = static_cast<int>(mode_supervisor_.vehicle_status());
     }
@@ -1527,6 +1620,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
            << ",\"reference_mode\":" << mode_status.reference_mode
            << ",\"ready\":" << (mode_status.ready ? "true" : "false")
            << ",\"vehicle_status\":" << mode_status.vehicle_status << "}"
+           << ",\"spot_turn\":{\"state\":\"" << mode_status.spot_turn_state << "\"}"
            << ",\"execution\":{"
            << "\"current_plan_id\":" << plan.plan_id
            << ",\"state\":\"" << current_execution_state() << "\"}"
@@ -1651,6 +1745,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
            << ",\"reference_mode\":" << mode_status.reference_mode
            << ",\"ready\":" << (mode_status.ready ? "true" : "false")
            << ",\"vehicle_status\":" << mode_status.vehicle_status << "}"
+           << ",\"spot_turn\":{\"state\":\"" << mode_status.spot_turn_state << "\"}"
            << ",\"execution\":{\"current_plan_id\":"
            << current_plan_id()
            << ",\"state\":\"" << current_execution_state() << "\"}"
@@ -1684,11 +1779,17 @@ class PlannerNodeCpp final : public rclcpp::Node {
   std::uint64_t planner_path_revision_{std::numeric_limits<std::uint64_t>::max()};
   std::uint64_t planner_mode_revision_{std::numeric_limits<std::uint64_t>::max()};
   DriveModeSupervisor mode_supervisor_;
+  SpotTurnConfig spot_turn_config_;
+  SpotTurnReferenceBuffer reference_buffer_;
+  SpotTurnManeuver maneuver_;
+  ReferencePathMsg::SharedPtr deferred_reference_;
+  bool spot_turn_waiting_clearance_{false};
 
   std::shared_ptr<const ReferencePath> reference_path_;
   std::shared_ptr<const Costmap2D> costmap_;
   PlannerState current_state_;
   double current_body_yaw_{0.0};
+  double current_body_yaw_rate_{0.0};
   std::int64_t current_state_time_ns_{0};
   double target_speed_{0.0};
   DriveMode reference_mode_{DriveMode::Forward};
@@ -1708,6 +1809,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
   std::uint64_t command_revision_{0};
   std::uint64_t mode_revision_{0};
   std::uint64_t costmap_fingerprint_{0};
+  std::uint64_t costmap_crop_path_revision_{0};
   std::int64_t last_costmap_capture_time_ns_{0};
   double last_costmap_build_ms_{0.0};
   std::uint64_t costmap_rebuild_count_{0};

@@ -41,6 +41,7 @@ class ScenarioPath:
     map_yaw: np.ndarray
     heading_semantics: str
     closed_loop: bool = False
+    skip_continuity_at: frozenset[int] = frozenset()
 
     @classmethod
     def from_arrays(
@@ -102,6 +103,12 @@ class ScenarioPath:
         # 구간(실제 주행 구간)에는 그대로 적용한다.
         continuity_mask = np.ones(len(segment_length), dtype=bool)
         for index in skip_continuity_at:
+            if closed_loop or index < 0 or index >= len(segment_length):
+                raise ValueError("Invalid spot-turn seam index")
+            if segment_length[index] > 1.0e-6 or abs(yaw_step[index]) <= 1.0e-9:
+                raise ValueError("Spot-turn seams require coincident positions and a heading change")
+            if mode[index] != mode[index + 1]:
+                raise ValueError("A spot-turn seam cannot change drive mode")
             continuity_mask[index] = False
 
         if np.any(segment_length[continuity_mask] <= 1.0e-4):
@@ -135,6 +142,7 @@ class ScenarioPath:
             map_yaw=map_yaw.copy(),
             heading_semantics=str(heading_semantics),
             closed_loop=bool(closed_loop),
+            skip_continuity_at=frozenset(skip_continuity_at),
         )
 
     @classmethod
@@ -154,9 +162,11 @@ class ScenarioPath:
 
         seam_indices = set()
         offset = 0
-        for segment in segments[:-1]:
+        for number, segment in enumerate(segments):
+            seam_indices.update(offset + index for index in segment.skip_continuity_at)
             offset += len(segment.x)
-            seam_indices.add(offset - 1)
+            if number + 1 < len(segments):
+                seam_indices.add(offset - 1)
 
         return cls.from_arrays(
             np.concatenate([segment.x for segment in segments]),
@@ -258,6 +268,13 @@ class ScenarioPath:
         delta = float(wrap_angle(self.map_yaw[next_index] - self.map_yaw[index]))
         return float(wrap_angle(self.map_yaw[index] + projection.t * delta))
 
+    def _slice_seams(self, indices) -> frozenset[int]:
+        indices = list(indices)
+        return frozenset(
+            local for local, (first, second) in enumerate(zip(indices, indices[1:]))
+            if first in self.skip_continuity_at and second == first + 1
+        )
+
     def local_slice(
         self,
         projection_s: float,
@@ -315,6 +332,14 @@ class ScenarioPath:
         stop = min(
             len(self.x), int(np.searchsorted(self.s, end_s, side="left") + 1)
         )
+        # A seam at the rolling-window edge still needs three usable points
+        # on either side for the C++ ReferencePath constructor. Borrow enough
+        # real points here before appending the curvature-sampling point.
+        for seam in sorted(self.skip_continuity_at):
+            if start <= seam < start + 2:
+                start = max(0, seam - 2)
+            if start <= seam < stop:
+                stop = min(len(self.x), max(stop, seam + 4))
         if stop - start < 4:
             if start == 0:
                 stop = min(len(self.x), 4)
@@ -337,6 +362,7 @@ class ScenarioPath:
                 map_yaw=self.map_yaw[pad_idx],
                 heading_semantics=self.heading_semantics,
                 closed_loop=False,
+                skip_continuity_at=self._slice_seams(pad_idx),
             )
 
         # The window already reaches the real end of this path -- there is no
@@ -358,6 +384,7 @@ class ScenarioPath:
             map_yaw=np.r_[self.map_yaw[idx], float(self.map_yaw[last])],
             heading_semantics=self.heading_semantics,
             closed_loop=False,
+            skip_continuity_at=self._slice_seams(idx),
         )
 
 
@@ -374,6 +401,16 @@ class ScenarioPath:
         end_s = float(np.clip(end_s, 0.0, self.total_length))
         if end_s >= self.total_length - 1.0e-9:
             return self
+        exact = int(np.searchsorted(self.s, end_s, side="left"))
+        if exact < len(self.s) and abs(float(self.s[exact]) - end_s) <= 1.0e-9:
+            if exact + 1 < 4:
+                raise ValueError("Terminal clipping leaves fewer than four path points")
+            idx = slice(0, exact + 1)
+            return ScenarioPath.from_arrays(
+                self.x[idx], self.y[idx], self.yaw[idx], self.kappa[idx], self.mode[idx],
+                map_yaw=self.map_yaw[idx], heading_semantics=self.heading_semantics,
+                skip_continuity_at=self._slice_seams(range(exact + 1)),
+            )
         upper = int(np.searchsorted(self.s, end_s, side="right"))
         upper = max(1, min(upper, len(self.s) - 1))
         lower = upper - 1
@@ -401,6 +438,7 @@ class ScenarioPath:
                 self.x[idx], self.y[idx], self.yaw[idx], self.kappa[idx], self.mode[idx],
                 map_yaw=self.map_yaw[idx], heading_semantics=self.heading_semantics,
                 closed_loop=False,
+                skip_continuity_at=self._slice_seams(range(lower + 1)),
             )
 
         return ScenarioPath.from_arrays(
@@ -412,6 +450,7 @@ class ScenarioPath:
             map_yaw=np.r_[self.map_yaw[:upper], map_yaw_end],
             heading_semantics=self.heading_semantics,
             closed_loop=False,
+            skip_continuity_at=self._slice_seams(range(upper)),
         )
 
     def translated(self, dx: float, dy: float) -> "ScenarioPath":

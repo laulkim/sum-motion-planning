@@ -25,3 +25,16 @@ def test_same_mode_command_completes_immediately():
     model = DriveModeTransitionModel(initial_mode=1)
     assert model.command(1, measured_speed=0.0, now_sec=0.0)
     assert model.feedback().status == VehicleModeStatus.READY
+
+
+def test_spot_turn_aligns_then_applies_rotation_and_returns_to_forward():
+    model = DriveModeTransitionModel(initial_mode=0, transition_duration_sec=2.0)
+    assert not model.command(4, measured_speed=0.2, now_sec=0.0)
+    assert model.command(4, measured_speed=0.0, now_sec=0.0)
+    assert model.applied_velocity(0.0, 0.0, 0.3) == (0.0, 0.0, 0.0)
+    assert model.update(2.0)
+    assert model.feedback().current_mode == 4
+    assert model.applied_velocity(0.0, 0.0, 0.3) == (0.0, 0.0, 0.3)
+    assert model.command(0, measured_speed=0.0, now_sec=3.0)
+    assert model.update(5.0)
+    assert model.applied_velocity(1.5, 0.0, 0.0) == (1.5, 0.0, 0.0)

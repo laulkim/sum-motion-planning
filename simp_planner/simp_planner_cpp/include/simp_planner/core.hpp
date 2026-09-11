@@ -12,7 +12,9 @@ namespace simp_planner {
 
 constexpr double kPi = 3.141592653589793238462643383279502884;
 
-enum class DriveMode : std::uint8_t { Forward = 0, Reverse = 1, Left = 2, Right = 3 };
+enum class DriveMode : std::uint8_t {
+  Forward = 0, Reverse = 1, Left = 2, Right = 3, SpotTurn = 4
+};
 
 double drive_mode_heading_offset(DriveMode mode);
 double motion_heading_from_body_yaw(double body_yaw, DriveMode mode);

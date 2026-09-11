@@ -15,4 +15,7 @@ ros2 launch simp_planner_tools simulation.launch.py \
   target_speed:=4.2 costmap_resolution:=0.1
 
 
-(제자리턴 시나리오)
+(제자리턴 시나리오 — 7개 phase, 제자리턴 3회)
+ros2 launch simp_planner_tools simulation.launch.py \
+  scenario:=spot_turn_course use_rviz:=true \
+  target_speed:=4.2 costmap_resolution:=0.1

@@ -70,6 +70,10 @@ if(BUILD_TESTING)
     -Wall -Wextra -Wpedantic
   )
   add_test(NAME simp_planner_core_tests COMMAND test_simp_planner_core)
+  add_executable(test_spot_turn test/test_spot_turn.cpp)
+  target_link_libraries(test_spot_turn simp_planner_core)
+  target_compile_options(test_spot_turn PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME spot_turn_tests COMMAND test_spot_turn)
 endif()
 
 install(TARGETS

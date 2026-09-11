@@ -1,0 +1,86 @@
+{
+  "pass": true,
+  "phase_indices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "turns": [
+    {
+      "phase": 0,
+      "x": 35.93260957867429,
+      "y": 0.0,
+      "corner_distance": 0.06739042132571171
+    },
+    {
+      "phase": 2,
+      "x": 31.260395975305745,
+      "y": 36.02366877799132,
+      "corner_distance": 0.11641752499629462
+    },
+    {
+      "phase": 4,
+      "x": 59.05470396981554,
+      "y": 69.71967767357923,
+      "corner_distance": 0.1148808296024626
+    }
+  ],
+  "maximum_speed": 4.3208254493035145,
+  "elapsed_seconds": 151.3902479870012,
+  "scenario": {
+    "scenario": "spot_turn_course",
+    "state": "COMPLETE",
+    "phase_index": 6,
+    "phase_count": 7,
+    "phase_name": "forward_4_plain",
+    "requested_drive_mode": 0,
+    "target_speed": 0.0,
+    "measured_speed": 0.0,
+    "remaining_to_terminal": 0.0773985315995489,
+    "signed_stop_error": 0.0773985315995489,
+    "switch_s": null,
+    "stop_request_distance": 3.0,
+    "phase_switch_count": 6,
+    "path_publish_count": 248,
+    "obstacle_count": 0,
+    "heading_semantics": "MOTION_DIRECTION",
+    "reference_map_yaw": 1.026825603971158,
+    "reference_motion_yaw": 1.026825603971158
+  },
+  "planner": {
+    "backend": "CPP_NATIVE",
+    "allocation_profile": "LATERAL_PRIORITY",
+    "state": "TERMINAL_ACTIVE_PLAN_FINISHING",
+    "block_reason": "TERMINAL_ACTIVE_PLAN_FINISHING",
+    "mode_control": {
+      "requested_mode": 0,
+      "actual_mode": 0,
+      "vehicle_requested_mode": 0,
+      "reference_mode": 0,
+      "ready": true,
+      "vehicle_status": 1
+    },
+    "spot_turn": {
+      "state": "INACTIVE"
+    },
+    "execution": {
+      "current_plan_id": 841,
+      "state": "TERMINAL_HOLD"
+    },
+    "plan": {
+      "selected_candidate_id": 841,
+      "total_compute_time_ms": 0.0
+    },
+    "timing": {
+      "deadline_ms": 100.0,
+      "handover_lead_sec": 0.12
+    },
+    "terminal_hold": {
+      "latched": true
+    }
+  }
+}

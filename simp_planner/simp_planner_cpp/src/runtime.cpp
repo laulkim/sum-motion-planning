@@ -341,6 +341,222 @@ BodyCommand JerkLimitedSafetyStop::sample_and_advance(double dt) {
   return result;
 }
 
+namespace {
+
+std::vector<double> cumulative_arc_length(const std::vector<double>& x,
+                                         const std::vector<double>& y) {
+  std::vector<double> s(x.size(), 0.0);
+  for (std::size_t i = 1; i < x.size(); ++i) {
+    s[i] = s[i - 1] + std::hypot(x[i] - x[i - 1], y[i] - y[i - 1]);
+  }
+  return s;
+}
+
+// Same forward difference used for normal references. At a coincident turn
+// seam it also supplies the large curvature used to split the raw input.
+std::vector<double> estimate_curvature_from_yaw(const std::vector<double>& psi,
+                                               const std::vector<double>& s) {
+  std::vector<double> kappa(psi.size() - 1, 0.0);
+  for (std::size_t i = 0; i < kappa.size(); ++i) {
+    kappa[i] = (psi[i + 1] - psi[i]) / std::max(s[i + 1] - s[i], 1.0e-15);
+  }
+  return kappa;
+}
+
+}  // namespace
+
+std::shared_ptr<ReferencePath> SpotTurnReferenceBuffer::update(
+    const std::vector<double>& x, const std::vector<double>& y,
+    const std::vector<double>& yaw, DriveMode mode, double kappa_threshold) {
+  if (x.size() < 4 || x.size() != y.size() || x.size() != yaw.size()) {
+    throw std::invalid_argument("reference arrays require at least three points plus padding");
+  }
+  if (!std::isfinite(kappa_threshold) || kappa_threshold <= 0.0) {
+    throw std::invalid_argument("invalid spot turn curvature threshold");
+  }
+  for (std::size_t i = 0; i < x.size(); ++i) {
+    if (!std::isfinite(x[i]) || !std::isfinite(y[i]) || !std::isfinite(yaw[i])) {
+      throw std::invalid_argument("reference path contains non-finite values");
+    }
+  }
+  const bool same_mode = mode_ && *mode_ == mode;
+  if (same_mode && pending()) return nullptr;  // Finish this absolute-coordinate snapshot.
+  const auto s = cumulative_arc_length(x, y);
+  const auto psi = unwrap_angles(yaw);
+  const auto kappa = estimate_curvature_from_yaw(psi, s);
+  const auto used = kappa.size();
+  std::vector<std::size_t> seams;
+  std::size_t begin = 0;
+  for (std::size_t i = 0; i < used; ++i) {
+    const double ds = s[i + 1] - s[i];
+    if (std::abs(kappa[i]) > kappa_threshold) {
+      if (ds > 1.0e-6 || std::abs(psi[i + 1] - psi[i]) <= 1.0e-9) {
+        throw std::invalid_argument("spot turn seam must have coincident positions");
+      }
+      seams.push_back(i);
+      if (same_mode) {
+        for (const auto& corner : completed_) {
+          if (std::hypot(x[i] - corner.x, y[i] - corner.y) <= 1.0e-4 &&
+              std::abs(wrap_angle(psi[i] - corner.before)) <= 1.0e-6 &&
+              std::abs(wrap_angle(psi[i + 1] - corner.after)) <= 1.0e-6) {
+            begin = i + 1;
+          }
+        }
+      }
+    } else if (ds <= 1.0e-4) {
+      throw std::invalid_argument("duplicate reference point without a turn");
+    }
+  }
+  // Build everything before committing: an invalid short remainder must not
+  // leave a pending maneuver that would block later valid references.
+  std::deque<std::shared_ptr<ReferencePath>> paths;
+  const auto append = [&](std::size_t first, std::size_t end, bool turn_end) {
+    if (end - first < 3) {
+      throw std::invalid_argument("each driving segment needs at least three usable points");
+    }
+    const auto f = static_cast<std::ptrdiff_t>(first);
+    const auto e = static_cast<std::ptrdiff_t>(end);
+    std::vector<double> segment_kappa(kappa.begin() + f, kappa.begin() + e);
+    if (turn_end) segment_kappa.back() = 0.0;  // No driving across the removed seam.
+    paths.push_back(std::make_shared<ReferencePath>(
+        std::vector<double>(s.begin() + f, s.begin() + e),
+        std::vector<double>(x.begin() + f, x.begin() + e),
+        std::vector<double>(y.begin() + f, y.begin() + e),
+        std::vector<double>(psi.begin() + f, psi.begin() + e), segment_kappa));
+  };
+  for (const auto seam : seams) {
+    if (seam < begin) continue;
+    append(begin, seam + 1, true);
+    begin = seam + 1;
+  }
+  append(begin, used, false);
+  paths_ = std::move(paths);
+  if (!same_mode) completed_.clear();
+  mode_ = mode;
+  return paths_.front();
+}
+
+double SpotTurnReferenceBuffer::target_body_yaw() const {
+  if (!pending()) throw std::logic_error("no pending spot turn");
+  return wrap_angle(paths_[1]->psi().front() - drive_mode_heading_offset(*mode_));
+}
+
+bool SpotTurnReferenceBuffer::arrived(const PlannerState& state, double tolerance) const {
+  if (!pending()) return false;
+  const auto& path = *paths_.front();
+  const auto projection = path.project(state.x, state.y, state.chi);
+  return path.s_max() - projection.s <= tolerance &&
+         std::hypot(state.x - path.x().back(), state.y - path.y().back()) <= tolerance;
+}
+
+std::shared_ptr<ReferencePath> SpotTurnReferenceBuffer::complete_turn() {
+  if (!pending()) throw std::logic_error("no spot turn remainder");
+  const auto& head = *paths_.front();
+  completed_.push_back({head.x().back(), head.y().back(), head.psi().back(),
+                        paths_[1]->psi().front()});
+  paths_.pop_front();
+  return paths_.front();
+}
+
+void SpotTurnReferenceBuffer::reset() {
+  paths_.clear();
+  completed_.clear();
+  mode_.reset();
+}
+
+bool spot_turn_feasible(const Costmap2D& costmap, const PlannerState& state,
+                        const VehicleConfig& vehicle, double safety_margin) {
+  const double radius = circumscribed_radius(vehicle.length, vehicle.width,
+                                              vehicle.footprint_margin) + safety_margin;
+  return costmap.clearance_single_circle(state.x, state.y, radius) > 0.0;
+}
+
+YawRotationProfile::YawRotationProfile(const SpotTurnConfig& config) : config_(config) {
+  if (!std::isfinite(config.yaw_rate_max) || config.yaw_rate_max <= 0.0 ||
+      !std::isfinite(config.yaw_rate_accel_max) || config.yaw_rate_accel_max <= 0.0 ||
+      !std::isfinite(config.yaw_tolerance_rad) || config.yaw_tolerance_rad <= 0.0 ||
+      !std::isfinite(config.yaw_rate_tolerance) || config.yaw_rate_tolerance <= 0.0) {
+    throw std::invalid_argument("spot turn rotation limits must be finite and positive");
+  }
+}
+
+void YawRotationProfile::engage(double target_yaw) {
+  if (!std::isfinite(target_yaw)) throw std::invalid_argument("invalid target yaw");
+  target_yaw_ = wrap_angle(target_yaw);
+  rate_ = 0.0;
+  done_ = false;
+}
+
+BodyCommand YawRotationProfile::sample(double dt, double measured_yaw,
+                                      double measured_yaw_rate) {
+  if (!std::isfinite(dt) || dt <= 0.0 || !std::isfinite(measured_yaw) ||
+      !std::isfinite(measured_yaw_rate)) throw std::invalid_argument("invalid rotation feedback");
+  const double error = wrap_angle(target_yaw_ - measured_yaw);
+  const double old_rate = rate_;
+  const double feasible_rate = std::sqrt(2.0 * config_.yaw_rate_accel_max * std::abs(error));
+  const double desired = std::abs(error) <= config_.yaw_tolerance_rad ? 0.0 :
+      std::copysign(std::min(config_.yaw_rate_max, feasible_rate), error);
+  const double delta = config_.yaw_rate_accel_max * dt;
+  rate_ += std::clamp(desired - rate_, -delta, delta);
+  done_ = std::abs(error) <= config_.yaw_tolerance_rad &&
+          std::abs(rate_) <= 1.0e-9 &&
+          std::abs(measured_yaw_rate) <= config_.yaw_rate_tolerance;
+  BodyCommand command{};
+  command.yaw_rate = rate_;
+  command.yaw_acceleration = (rate_ - old_rate) / dt;
+  command.planned_heading_acceleration = command.yaw_acceleration;
+  command.motion_heading = measured_yaw;
+  command.motion_heading_rate = rate_;
+  return command;
+}
+
+SpotTurnManeuver::SpotTurnManeuver(const SpotTurnConfig& config) : rotation_(config) {}
+
+void SpotTurnManeuver::trigger(double target_body_yaw, DriveMode external_mode) {
+  if (state_ != SpotTurnManeuverState::Inactive) throw std::logic_error("spot turn already active");
+  target_yaw_ = target_body_yaw;
+  external_mode_ = external_mode;
+  returning_ = false;
+  state_ = SpotTurnManeuverState::AligningWheels;
+}
+
+bool SpotTurnManeuver::on_mode_ready(const DriveModeSupervisor& supervisor) {
+  if (!supervisor.ready() || state_ != SpotTurnManeuverState::AligningWheels) return false;
+  if (!returning_ && supervisor.requested_mode() == DriveMode::SpotTurn) {
+    rotation_.engage(target_yaw_);
+    state_ = SpotTurnManeuverState::Rotating;
+  } else if (returning_ && supervisor.requested_mode() == external_mode_) {
+    state_ = SpotTurnManeuverState::Inactive;
+    return true;
+  }
+  return false;
+}
+
+std::optional<BodyCommand> SpotTurnManeuver::sample(
+    double dt, double measured_yaw, double measured_yaw_rate, DriveModeSupervisor& supervisor) {
+  if (state_ != SpotTurnManeuverState::Rotating) return std::nullopt;
+  const auto command = rotation_.sample(dt, measured_yaw, measured_yaw_rate);
+  if (rotation_.done()) {
+    supervisor.set_requested_mode(external_mode_);
+    returning_ = true;
+    state_ = SpotTurnManeuverState::AligningWheels;
+  }
+  return command;
+}
+
+bool SpotTurnManeuver::set_external_requested_mode(DriveMode mode, DriveModeSupervisor& supervisor) {
+  external_mode_ = mode;
+  // A request arriving during RETURN alignment must retarget the actual
+  // supervisor as well, otherwise its ready edge would never finish us.
+  return returning_ && supervisor.set_requested_mode(mode);
+}
+
+const char* SpotTurnManeuver::state_name() const {
+  if (state_ == SpotTurnManeuverState::Inactive) return "INACTIVE";
+  if (state_ == SpotTurnManeuverState::Rotating) return "SPOT_TURN_ROTATING";
+  return returning_ ? "SPOT_TURN_ALIGNING_REGULAR" : "SPOT_TURN_ALIGNING_WHEELS";
+}
+
 LatestOnlyPlanningScheduler::LatestOnlyPlanningScheduler(
     double max_planning_frequency_hz, double maximum_plan_age_sec,
     double input_coalescing_sec)

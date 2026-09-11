@@ -28,7 +28,7 @@ from .diagnostic_metrics import OpenPathGeometry, tracking_error_to_executed_seg
 from .path_geometry import PathProjection, project_open_path, wrap_angle
 
 
-MODE_NAMES = {0: "FORWARD", 1: "REVERSE", 2: "LEFT", 3: "RIGHT"}
+MODE_NAMES = {0: "FORWARD", 1: "REVERSE", 2: "LEFT", 3: "RIGHT", 4: "SPOT_TURN"}
 
 
 def quaternion_to_yaw(x: float, y: float, z: float, w: float) -> float:
@@ -793,7 +793,8 @@ class DebugPlotNode(Node):
                 tracking_source = "SELECTED_PATH_FALLBACK"
             except ValueError:
                 self.selected_projection = None
-        elif self.execution_state in {"SAFETY_STOP", "MODE_STOP", "MODE_WAIT"}:
+        elif (self.execution_state in {"SAFETY_STOP", "MODE_STOP", "MODE_WAIT"}
+              or self.execution_state.startswith("SPOT_TURN_")):
             tracking_source = self.execution_state
 
         plan = self.planner_section("plan")
@@ -895,10 +896,13 @@ class DebugPlotNode(Node):
         if self.last_seen["planner_status"] is None:
             return "NO_PLANNER_STATUS", "No planner status received."
         planner_state = str(self.planner_status.get("state", "UNKNOWN"))
-        if planner_state == "BLOCKED":
+        if planner_state in {"BLOCKED", "NO_SAFE_PLAN_SAFETY_STOP"} or planner_state.startswith("PLANNING_FAILED"):
             return "PLANNER_BLOCKED", str(
                 self.planner_status.get("block_reason", "UNKNOWN")
             )
+        spot_turn = self.planner_section("spot_turn").get("state", "INACTIVE")
+        if spot_turn not in {"INACTIVE", "SPOT_TURN_APPROACH"}:
+            return str(spot_turn), "Spot-turn wheel alignment, rotation, or clearance wait is active."
 
         plan = self.planner_section("plan")
         selected_target = float(plan.get("selected_n_target", math.nan))
