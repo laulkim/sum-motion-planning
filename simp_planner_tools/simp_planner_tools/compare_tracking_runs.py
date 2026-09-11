@@ -27,8 +27,8 @@ def _rows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(file))
 
 
-def load_tracking_errors(directory: Path) -> dict[str, np.ndarray]:
-    odom = _rows(directory / "odom_history.csv")
+def load_tracking_errors(directory: Path, pose_file: str = "odom_history.csv") -> dict[str, np.ndarray]:
+    odom = _rows(directory / pose_file)
     commands = _rows(directory / "command_history.csv")
     required = {"source_stamp_ns", "reference_valid", "reference_x", "reference_y",
                 "reference_chi_rad", "reference_body_yaw_rad"}
@@ -174,5 +174,92 @@ def compare_tracking_runs(
                             ("noisy P ON", "noisy_target_feedback.png")):
         render_tracking_run(runs[label], f"{scenario}: {label}",
                             None if output_directory is None else output_directory / filename)
+    if all((directory / "ground_truth_history.csv").is_file()
+           for directory in (noisy_off_directory, noisy_on_directory)):
+        render_noisy_evaluation(noisy_off_directory, noisy_on_directory, output_directory, scenario)
+    else:
+        print("Ground-truth evaluation skipped: record new runs with ground_truth_history.csv.")
     # The comparison caller shows all figures with one plt.show().
     return result
+
+
+def render_noisy_evaluation(off_directory: Path, on_directory: Path,
+                            output_directory: Path | None, scenario: str) -> dict:
+    """Compare each closed-loop run against its own reference, never against ideal."""
+    runs = {}
+    for label, directory in (("P OFF", off_directory), ("P ON", on_directory)):
+        estimate = load_tracking_errors(directory)
+        truth = load_tracking_errors(directory, "ground_truth_history.csv")
+        estimation_error = {}
+        for key, _, _ in ERRORS:
+            values = truth[key] - estimate[key]  # (ref-truth) - (ref-estimate)
+            if key == "heading_deg":
+                values = (values + 180.0) % 360.0 - 180.0
+            estimation_error[key] = values
+        runs[label] = (estimate, truth, estimation_error)
+    start = max(values[0]["time"][0] for values in runs.values())
+    end = min(values[0]["time"][-1] for values in runs.values())
+    if end <= start:
+        raise ValueError("Noisy runs have no common elapsed-time range")
+    trajectory, xy_axes = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
+    trajectory.suptitle(f"{scenario}: noisy P OFF/ON — separate replanned targets")
+    for axis, pose_index, title in zip(xy_axes, (0, 1), ("Estimated position", "Ground-truth position")):
+        for (label, values), color in zip(runs.items(), ("tab:blue", "tab:orange")):
+            pose = values[pose_index]
+            axis.plot(pose["reference_x"], pose["reference_y"], "--", color=color,
+                      label=f"{label} own target", alpha=.65)
+            axis.plot(pose["odom_x"], pose["odom_y"], color=color, label=label)
+        axis.set(title=title, xlabel="Map X [m]", ylabel="Map Y [m]")
+        axis.axis("equal")
+        axis.grid(True, alpha=.3)
+        axis.legend()
+    errors, axes = plt.subplots(3, 3, figsize=(16, 11), sharex=True, constrained_layout=True)
+    summary, bars = plt.subplots(3, 3, figsize=(16, 11), constrained_layout=True)
+    groups = ("Target - estimate", "Target - truth", "Estimate - truth")
+    errors.suptitle(f"{scenario}: noisy P OFF/ON (each run's own target)")
+    summary.suptitle(f"{scenario}: noisy P OFF/ON error statistics")
+    metrics = {"reference": "Each run's own replanned target; not a fixed-reference experiment",
+               "position_error_frame": "reference motion heading",
+               "range_sec": [float(start), float(end)], "runs": {}}
+    for index, (label, values) in enumerate(runs.items()):
+        time = values[0]["time"]
+        keep = (time >= start) & (time <= end)
+        metrics["runs"][label] = {}
+        for col, group in enumerate(groups):
+            metrics["runs"][label][group] = {}
+            for row, (key, title, unit) in enumerate(ERRORS):
+                data = values[col][key].copy()
+                # Matched valid samples across the three error definitions.
+                valid = keep & np.isfinite(values[0][key]) & np.isfinite(values[1][key])
+                data[~valid] = np.nan
+                finite = data[valid]
+                stats = {"sample_count": int(finite.size),
+                         "rmse": float(np.sqrt(np.mean(finite**2))) if finite.size else None,
+                         "max_abs": float(np.max(np.abs(finite))) if finite.size else None}
+                metrics["runs"][label][group][key] = stats
+                axis = axes[row, col]
+                axis.plot(time, data, label=label)
+                axis.set(title=f"{group}: {title}", ylabel=unit)
+                bar = bars[row, col]
+                heights = [stats[name] if stats[name] is not None else np.nan for name in ("rmse", "max_abs")]
+                rects = bar.bar(np.arange(2) + (index - .5) * .35, heights, width=.35, label=label)
+                bar.bar_label(rects, fmt="%.3g", fontsize=8)
+                bar.set(title=f"{group}: {title}", ylabel=unit, xticks=[0, 1], xticklabels=["RMSE", "Max |error|"])
+    for axis in axes.flat:
+        axis.axhline(0, color="black", linewidth=.6)
+        axis.grid(True, alpha=.3)
+        axis.legend()
+    for axis in axes[-1]:
+        axis.set_xlabel("time from each run's first command [s]")
+    for axis in bars.flat:
+        axis.grid(True, axis="y", alpha=.3)
+        axis.legend()
+    if output_directory is not None:
+        output_directory.mkdir(parents=True, exist_ok=True)
+        for figure, filename in ((trajectory, "noisy_trajectories.png"),
+                                 (errors, "noisy_state_errors.png"),
+                                 (summary, "noisy_state_error_metrics.png")):
+            figure.savefig(output_directory / filename, dpi=160)
+        with (output_directory / "noisy_state_metrics.json").open("w", encoding="utf-8") as file:
+            json.dump(metrics, file, indent=2, ensure_ascii=False)
+    return metrics

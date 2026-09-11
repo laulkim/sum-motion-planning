@@ -25,6 +25,7 @@ def _resolved_nodes(context):
     )
     kinematics_model = LaunchConfiguration("kinematics_model").perform(context)
     tracking_parameters = {
+        "allocation_enabled": LaunchConfiguration("allocation_enabled").perform(context).lower() == "true",
         "tracking_enabled": LaunchConfiguration("tracking_enabled").perform(context).lower() == "true",
         **{
             name: float(LaunchConfiguration(name).perform(context))
@@ -144,10 +145,11 @@ def generate_launch_description() -> LaunchDescription:
                 description="Vehicle-side drive-mode transition duration.",
             ),
             DeclareLaunchArgument("command_frequency_hz", default_value="100.0"),
+            DeclareLaunchArgument("allocation_enabled", default_value="false", choices=["true", "false"]),
             DeclareLaunchArgument("tracking_enabled", default_value="true", choices=["true", "false"]),
-            DeclareLaunchArgument("tracking_longitudinal_kp", default_value="2.0"),
-            DeclareLaunchArgument("tracking_lateral_kp", default_value="1.5"),
-            DeclareLaunchArgument("tracking_heading_kp", default_value="1.5"),
+            DeclareLaunchArgument("tracking_longitudinal_kp", default_value="2.5"),
+            DeclareLaunchArgument("tracking_lateral_kp", default_value="2.0"),
+            DeclareLaunchArgument("tracking_heading_kp", default_value="2.0"),
             DeclareLaunchArgument(
                 "kinematics_model",
                 default_value="ideal",

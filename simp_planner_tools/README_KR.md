@@ -22,6 +22,17 @@ terminal_safe_region
 
 ## ideal / noisy P OFF / noisy P ON 비교
 
+`--show` 실행 시 ground truth 로그가 있으면 다음 그림도 함께 표시하고 저장한다.
+
+- `noisy_trajectories.png`: P OFF/ON의 각 목표와 추정/실제 XY 궤적.
+- `noisy_state_errors.png`: 목표−추정, 목표−실제, 추정−실제의 종·횡·차체 헤딩 오차.
+- `noisy_state_error_metrics.png`: 위 오차의 RMSE·최대 절댓값. 수치는 `noisy_state_metrics.json`에도 저장.
+
+각 실행 안에서 원본 timestamp로 정렬하고, 위치 오차는 목표 이동 방향 좌표계로 표시한다.
+목표가 유효하고 두 pose가 모두 있는 공통 경과시간 구간의 샘플로 통계를 계산한다.
+재계획 방식은 변경하지 않으므로 OFF/ON의 목표는 서로 다를 수 있다.
+이 결과는 동일 고정 목표에 대한 제어기 단독 실험이 아닌 전체 폐루프 비교이다.
+
 ```bash
 ros2 run simp_planner_tools run_simulation_comparison \
   --scenario stadium --target-speed 4.0 --duration 100 --show

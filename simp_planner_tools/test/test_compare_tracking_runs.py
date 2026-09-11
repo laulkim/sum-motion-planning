@@ -77,21 +77,30 @@ def test_heading_interpolates_across_pi_then_wraps_error(tmp_path):
 
 def test_show_opens_old_and_new_figures_together(tmp_path, monkeypatch):
     for name, offset in (("ideal", 0.), ("off", .2), ("on", .05)):
-        make_run(tmp_path / name, offset)
+        odom, _ = make_run(tmp_path / name, offset)
+        truth = [dict(row, y=row["y"] - .4, body_yaw=row["body_yaw"] - .02) for row in odom]
+        write_csv(tmp_path / name / "ground_truth_history.csv", truth)
     shown = []
     monkeypatch.setattr(plt, "show", lambda: shown.append(len(plt.get_fignums())))
     output = tmp_path / "output"
     compare_runs(tmp_path / "ideal", tmp_path / "on", output,
                  show=True, noisy_off_directory=tmp_path / "off")
-    assert shown == [6]
+    assert shown == [9]
     for name in ("ideal_noisy_overlay.png", "ideal_noisy_errors.png",
                  "tracking_errors.png", "tracking_error_metrics.png", "tracking_metrics.json",
-                 "ideal_target_feedback.png", "noisy_target_feedback.png"):
+                 "ideal_target_feedback.png", "noisy_target_feedback.png",
+                 "noisy_trajectories.png", "noisy_state_errors.png", "noisy_state_error_metrics.png"):
         assert (output / name).is_file()
     import json
     metrics = json.loads((output / "tracking_metrics.json").read_text())
     assert metrics["runs"]["noisy P OFF"]["longitudinal_m"]["rmse"] == pytest.approx(.3)
     assert metrics["runs"]["noisy P ON"]["longitudinal_m"]["rmse"] == pytest.approx(.15)
+    metrics = json.loads((output / "noisy_state_metrics.json").read_text())
+    for label, expected in (("P OFF", .7), ("P ON", .55)):
+        run = metrics["runs"][label]
+        assert run["Target - truth"]["longitudinal_m"]["rmse"] == pytest.approx(expected)
+        assert run["Estimate - truth"]["longitudinal_m"]["rmse"] == pytest.approx(.4)
+        assert run["Estimate - truth"]["heading_deg"]["rmse"] == pytest.approx(math.degrees(.02))
 
 
 def test_old_two_run_comparison_still_has_two_windows(tmp_path, monkeypatch):

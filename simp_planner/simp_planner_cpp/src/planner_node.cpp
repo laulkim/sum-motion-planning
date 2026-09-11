@@ -140,6 +140,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
     command_dt_ = 1.0 / command_frequency_hz_;
     config_.longitudinal.dt = trajectory_knot_dt_;
     config_.longitudinal.execution_dt = command_dt_;
+    allocation_enabled_ = declare_parameter<bool>("allocation_enabled", true);
     tracking_config_.enabled = declare_parameter<bool>("tracking_enabled", true);
     tracking_config_.longitudinal_kp = declare_parameter<double>("tracking_longitudinal_kp", 0.8);
     tracking_config_.lateral_kp = declare_parameter<double>("tracking_lateral_kp", 0.6);
@@ -657,7 +658,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       if (!infeasible) {
         auto allocation_selection = allocate_with_oriented_collision_search(
             attempt_result.motion, *input->costmap, config_.vehicle, config_.cost,
-            handover.allocator_state, footprint_config);
+            handover.allocator_state, footprint_config, allocation_enabled_);
         std::vector<int> excluded_candidate_ids;
         std::vector<double> excluded_lateral_targets;
         const int maximum_path_replans = std::max(
@@ -682,7 +683,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
           auto replanned_allocation = allocate_with_oriented_collision_search(
               replanned_result.motion, *input->costmap,
               config_.vehicle, config_.cost,
-              handover.allocator_state, footprint_config);
+              handover.allocator_state, footprint_config, allocation_enabled_);
           attempt_result = std::move(replanned_result);
           allocation_selection = std::move(replanned_allocation);
         }
@@ -1256,6 +1257,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
   TerminalHoldLatch terminal_hold_;
   EnvConfig config_;
   TrackingConfig tracking_config_;
+  bool allocation_enabled_{true};
   std::unique_ptr<PathVelocityPlanner> planner_;
   std::uint64_t planner_structural_revision_{std::numeric_limits<std::uint64_t>::max()};
   std::uint64_t planner_path_revision_{std::numeric_limits<std::uint64_t>::max()};

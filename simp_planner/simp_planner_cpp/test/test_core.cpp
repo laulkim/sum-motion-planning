@@ -794,6 +794,17 @@ void test_tracking_zero_error_preserves_allocated_curve() {
   }
   const auto allocation = allocate_trajectory(trajectory);
   const std::vector<PlannerAction> actions(40);
+  AllocationLimits fixed_limits;
+  fixed_limits.enabled = false;
+  const auto fixed = allocate_trajectory(trajectory, fixed_limits,
+      AllocatorInitialState{0.2, 0.1, 0.1, 0.0});
+  for (int i = 0; i <= 400; ++i) {
+    const auto command = sample_body_command(fixed, actions, i * 0.01);
+    require(command.beta == 0.0 && command.beta_rate == 0.0 &&
+            command.vy == 0.0 && command.vx == 2.0 &&
+            std::abs(command.yaw_rate - 0.2) < 1.0e-12,
+            "allocation OFF must preserve forward fixed-beta commands");
+  }
   for (bool zero_gains : {false, true}) {
     TrackingConfig config;
     if (zero_gains) config.longitudinal_kp = config.lateral_kp = config.heading_kp = 0.0;

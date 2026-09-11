@@ -448,6 +448,7 @@ struct OrientedCollisionResult {
 };
 
 struct AllocationLimits {
+  bool enabled{true};
   // Lateral-priority allocation: preserve motion direction while allowing the
   // body heading to lag, so beta and body-frame vy carry more of the maneuver.
   std::array<double, 4> beta_max_deviation{{45.0 * kPi / 180.0,
@@ -522,7 +523,8 @@ AllocationSelectionResult allocate_with_oriented_collision_search(
     const VehicleConfig& vehicle,
     const CostConfig& cost,
     std::optional<AllocatorInitialState> initial_state = std::nullopt,
-    const OrientedFootprintConfig& footprint = OrientedFootprintConfig{});
+    const OrientedFootprintConfig& footprint = OrientedFootprintConfig{},
+    bool allocation_enabled = true);
 
 class PathVelocityPlanner {
  public:

@@ -2734,6 +2734,7 @@ AllocationResult allocate_trajectory(
   for (std::size_t i = 1; i < n; ++i) {
     if (trajectory.drive_mode[i] != trajectory.drive_mode[i - 1]) mode_change_indices.push_back(i);
   }
+  if (limits.enabled) {
   for (std::size_t k = 0; k + 1 < n; ++k) {
     const double dt = trajectory.t[k + 1] - trajectory.t[k];
     const auto mode = trajectory.drive_mode[k];
@@ -2807,6 +2808,23 @@ AllocationResult allocate_trajectory(
   result.yaw_acceleration.back() = result.yaw_acceleration[n - 2];
   result.yaw_jerk.back() = result.yaw_jerk[n - 2];
   result.beta_desired.back() = result.beta_desired[n - 2];
+  }
+  if (!limits.enabled) {
+    // Fixed mode heading: no lateral/yaw redistribution. The resulting
+    // trajectory is also used for handover prediction and collision checks.
+    result.beta = result.beta_center;
+    result.beta_desired = result.beta_center;
+    for (std::size_t i = 0; i < n; ++i) {
+      result.beta_rate[i] = 0.0;
+      result.beta_acceleration[i] = 0.0;
+      result.yaw_rate[i] = trajectory.motion_heading_rate[i];
+      result.yaw_acceleration[i] = trajectory.motion_heading_acceleration[i];
+      result.yaw_jerk[i] = i == 0 ? 0.0 :
+          (result.yaw_acceleration[i] - result.yaw_acceleration[i - 1]) /
+          (trajectory.t[i] - trajectory.t[i - 1]);
+      result.fallback_used[i] = 0;
+    }
+  }
   for (std::size_t i = 0; i < n; ++i) {
     result.psi[i] = chi[i] - result.beta[i];
     const double cos_beta = std::cos(result.beta[i]);
@@ -2963,7 +2981,15 @@ AllocationSelectionResult allocate_with_oriented_collision_search(
     const VehicleConfig& vehicle,
     const CostConfig& cost,
     std::optional<AllocatorInitialState> initial_state,
-    const OrientedFootprintConfig& footprint) {
+    const OrientedFootprintConfig& footprint,
+    bool allocation_enabled) {
+  if (!allocation_enabled) {
+    AllocationLimits limits;
+    limits.enabled = false;
+    auto allocation = allocate_trajectory(trajectory, limits, initial_state);
+    auto collision = check_oriented_allocation_collision(allocation, costmap, vehicle, cost, footprint);
+    return {std::move(allocation), collision, AllocationProfile::MinimumVy, 1};
+  }
   const bool crab_mode = std::any_of(
       trajectory.drive_mode.begin(), trajectory.drive_mode.end(),
       [](DriveMode mode) { return mode == DriveMode::Left || mode == DriveMode::Right; });
