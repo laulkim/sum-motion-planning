@@ -35,6 +35,7 @@ def main() -> int:
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
     from simp_planner_msgs.msg import DriveModeState
     from std_msgs.msg import String
+    from simp_planner_tools.models import DriveMode, MODE_BETA_CENTER
     from simp_planner_tools.scenario_definition import load_scenario_definition
 
     definition = load_scenario_definition(Path(get_package_share_directory("simp_planner_tools")), "spot_turn_course")
@@ -75,9 +76,22 @@ def main() -> int:
         path = definition.phases[phase].path
         position = latest["odom"].pose.pose.position
         corners = list(path.skip_continuity_at)
-        distance = min((math.hypot(position.x - path.x[i], position.y - path.y[i])
-                        for i in corners), default=math.inf)
-        target_yaw = float(path.yaw[corners[0] + 1]) if corners else 0.0
+        if corners:
+            # Interior corner: the seam sits inside this phase's own array
+            # (a heading jump that does not change drive mode).
+            distance = min(math.hypot(position.x - path.x[i], position.y - path.y[i])
+                           for i in corners)
+            turn_index = corners[0] + 1
+        else:
+            # Boundary corner: drive mode changed at the phase switch, so the
+            # turn happens where the *previous* phase ended, and this phase's
+            # own first point carries the post-turn heading.
+            previous = definition.phases[phase - 1].path
+            distance = math.hypot(position.x - previous.x[-1], position.y - previous.y[-1])
+            turn_index = 0
+        mode = DriveMode(int(path.mode[turn_index]))
+        body_yaw = float(path.yaw[turn_index]) - MODE_BETA_CENTER[mode]
+        target_yaw = float((body_yaw + math.pi) % (2 * math.pi) - math.pi)
         summary["turns"].append({"phase": phase, "x": position.x, "y": position.y,
                                  "corner_distance": distance, "target_body_yaw": target_yaw})
         print(f"turn {len(summary['turns'])}: phase {phase}, corner distance {distance:.3f} m", flush=True)

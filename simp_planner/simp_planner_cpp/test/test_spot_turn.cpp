@@ -27,6 +27,26 @@ struct Input {
     y.push_back(y.back() + 0.2 * std::sin(yaw.back()));
     yaw.push_back(yaw.back());
   }
+  // A smoothly curving continuation (constant curvature) appended after
+  // whatever is already in the array, so per-point curvature stays far
+  // below any corner threshold even though the total heading change can be
+  // large. Unlike leg(), this does not push its own starting point again --
+  // it continues directly from x.back()/y.back(), so it never creates the
+  // zero-distance duplicate that marks an in-place corner.
+  void arc(double curvature, double length) {
+    const int steps = std::max(2, static_cast<int>(std::round(length / 0.2)));
+    const double ds = length / steps;
+    double heading = yaw.back();
+    double cx = x.back(), cy = y.back();
+    for (int i = 1; i <= steps; ++i) {
+      heading += curvature * ds;
+      cx += ds * std::cos(heading);
+      cy += ds * std::sin(heading);
+      x.push_back(cx);
+      y.push_back(cy);
+      yaw.push_back(heading);
+    }
+  }
 };
 
 void test_build_reference_path_drops_padding_and_matches_curvature() {
@@ -75,6 +95,47 @@ void test_heading_jump_between_legs_is_detected_per_mode() {
       spot_turn_target_body_yaw(before_path->psi().back(), DriveMode::Forward);
   require(std::abs(wrap_angle(gentle_target - straight_body_yaw)) <= 0.349066,
           "a 5 degree step was incorrectly flagged as a spot turn");
+}
+
+void test_split_reference_path_at_interior_corner() {
+  EnvConfig config;
+  Input combined;
+  combined.leg(0, 0, 0, 36);
+  // In-place corner: the next leg continues from the exact same point on a
+  // new heading, same as a real authored course encodes a sharp turn.
+  combined.leg(combined.x.back(), combined.y.back(), 40 * kPi / 180, 36);
+  combined.pad();
+  auto split = split_reference_path_at_corner(combined.x, combined.y, combined.yaw,
+                                               config.constraints.curvature_max);
+  require(static_cast<bool>(split.before) && static_cast<bool>(split.after),
+          "interior corner was not detected");
+  require(std::abs(split.before->x().back() - 36.0) < 1.0e-6,
+          "before segment does not end at the corner");
+  require(split.before->kappa().back() == 0.0, "corner spike leaked into the before segment");
+  require(std::abs(split.before->psi().back()) < 1.0e-9, "before segment kept the wrong heading");
+  require(std::abs(split.after->x().front() - 36.0) < 1.0e-6,
+          "after segment does not start at the corner");
+  require(std::abs(wrap_angle(split.after->psi().front() - 40 * kPi / 180)) < 1.0e-9,
+          "after segment did not pick up the new heading");
+
+  Input straight;
+  straight.leg(0, 0, 0, 8);
+  straight.pad();
+  auto no_corner = split_reference_path_at_corner(straight.x, straight.y, straight.yaw,
+                                                   config.constraints.curvature_max);
+  require(static_cast<bool>(no_corner.before) && !no_corner.after,
+          "a straight leg was incorrectly split");
+
+  // A smooth curve the vehicle can actually steer through (per-point
+  // curvature well under curvature_max) must not be mistaken for a corner,
+  // even though it adds up to a large total heading change.
+  Input gentle;
+  gentle.leg(0, 0, 0, 8);
+  gentle.arc(0.05, 18.0);
+  gentle.pad();
+  auto gentle_split = split_reference_path_at_corner(gentle.x, gentle.y, gentle.yaw,
+                                                      config.constraints.curvature_max);
+  require(!gentle_split.after, "a smooth curve under the curvature limit was incorrectly flagged");
 }
 
 void test_invalid_reference_arrays_are_rejected() {
@@ -136,6 +197,7 @@ int main() {
   try {
     test_build_reference_path_drops_padding_and_matches_curvature();
     test_heading_jump_between_legs_is_detected_per_mode();
+    test_split_reference_path_at_interior_corner();
     test_invalid_reference_arrays_are_rejected();
     test_rotation_uses_feedback_and_accepts_new_return_mode();
     test_clearance_gate();

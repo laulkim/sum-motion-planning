@@ -260,16 +260,19 @@ def build_spot_turn_crab_course_phases(
     crab_speed: float = 1.0,
     ds: float = 0.2,
 ) -> tuple["ScenarioPhase", ...]:
-    """일반주행 -> 제자리턴 -> 주행 -> 크랩 -> 제자리턴 -> 주행 -> 크랩 ->
-    제자리턴 -> 주행 -> 크랩 -> 그냥주행, 8-phase 코스.
+    """일반주행(중간에 제자리턴 내장) -> 크랩 -> 제자리턴 -> 주행 -> 크랩 ->
+    제자리턴 -> 주행 -> 크랩 -> 그냥주행, 7-phase 코스.
 
-    각 다리(leg)는 완전히 독립된 phase다 -- 코너 앞뒤를 하나의 경로 배열로
-    이어붙이지 않는다. phase 분할은 이제 모드가 바뀔 때뿐 아니라 다리(제자리턴
-    포함)마다 일어나고, 그 다리에 들어서기 전에 제자리턴이 필요한지는 전부
-    플래너(C++)가 새로 받은 phase의 시작 헤딩과 차량의 실제 현재 헤딩을 비교해서
-    스스로 판단한다. 크랩(LEFT) 구간은 몸체 헤딩을 바꾸지 않으므로(옆으로만
-    이동), 크랩 바로 다음 phase의 시작 헤딩은 항상 그 크랩 진입 직전 헤딩
-    기준으로 다음 제자리턴 각도만큼 돌아간 값이다.
+    phase는 모드가 바뀔 때만 나뉜다 (forward/crab 다리마다 하나씩, 총 7개).
+    세 제자리턴 중 -60도/70도는 crab -> forward 모드 전환과 겹치므로 phase
+    경계 자체가 코너이고, 플래너(C++)는 그 경계에서 새 phase의 시작 헤딩과
+    차량의 실측 헤딩을 비교해 판단한다. 반면 첫 제자리턴(40도)은 모드가
+    바뀌지 않는 순수 헤딩 코너라 forward_1 phase 배열 "내부"에 곡률
+    스파이크로 심겨 있다 -- 이어붙이는 지점의 좌표는 그대로 두고 헤딩만
+    바꾸므로(_concat_segments), 그 지점의 순간곡률이 curvature_max를 훨씬
+    넘는다. 플래너의 split_reference_path_at_corner()가 배열을 받을 때마다
+    이 곡률 스파이크를 스스로 찾아 끊어 처리하므로, 시나리오 쪽에서 이
+    코너의 위치를 따로 표시하거나 넘겨줄 필요가 없다.
     """
     turns = [math.radians(value) for value in turn_degrees]
     heading = 0.0
@@ -281,6 +284,7 @@ def build_spot_turn_crab_course_phases(
     forward1b = _curved_segment(x, y, heading, curvature_after_turn1, forward_leg_length, mode=0, ds=ds)
     heading = float(forward1b.yaw[-1])
     x, y = float(forward1b.x[-1]), float(forward1b.y[-1])
+    forward1 = _concat_segments((forward1a, forward1b))
 
     crab1 = _straight_segment(x, y, heading + 0.5 * math.pi, crab_leg_length, mode=2, ds=ds)
     x, y = float(crab1.x[-1]), float(crab1.y[-1])
@@ -310,8 +314,7 @@ def build_spot_turn_crab_course_phases(
         )
 
     return (
-        _phase("forward_1a", forward1a, forward_speed, True),
-        _phase("forward_1b_after_turn", forward1b, forward_speed, True),
+        _phase("forward_1", forward1, forward_speed, True),
         _phase("crab_1", crab1, crab_speed, True),
         _phase("forward_2_after_turn", forward2, forward_speed, True),
         _phase("crab_2", crab2, crab_speed, True),

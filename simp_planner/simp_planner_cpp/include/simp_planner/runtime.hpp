@@ -174,6 +174,23 @@ std::shared_ptr<ReferencePath> build_reference_path(
     const std::vector<double>& x, const std::vector<double>& y,
     const std::vector<double>& yaw);
 
+struct ReferencePathSplit {
+  std::shared_ptr<ReferencePath> before;
+  std::shared_ptr<ReferencePath> after;  // null when the array has no interior corner.
+};
+
+// Scans the interior of the array for a point whose forward-difference
+// curvature exceeds `curvature_max` -- a heading change sharper than
+// steering can ever track, so no comparison against the vehicle's actual
+// heading is needed: it unconditionally needs a spot turn. When found, the
+// path is split there: `before` ends at the corner (its own last point);
+// `after` restarts on the far side with its own s = 0. Returns `after ==
+// nullptr` when no interior corner exists, with `before` covering the whole
+// array (same result as build_reference_path()).
+ReferencePathSplit split_reference_path_at_corner(
+    const std::vector<double>& x, const std::vector<double>& y,
+    const std::vector<double>& yaw, double curvature_max);
+
 // The body yaw a vehicle in `mode` must hold to drive a reference path whose
 // first point's motion heading is `path_start_psi`.
 double spot_turn_target_body_yaw(double path_start_psi, DriveMode mode);

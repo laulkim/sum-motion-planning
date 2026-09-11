@@ -614,19 +614,43 @@ class PlannerNodeCpp final : public rclcpp::Node {
           if (reference_mode != reference_mode_ || frame != path_frame_) deferred_reference_ = msg;
           return;
         }
-        auto path = build_reference_path(msg->x, msg->y, msg->yaw);
-        // 급코너(제자리턴) 자동 판별 (1절): 배열 내부에서 이음매를 스캔하는
-        // 게 아니라, 이 새 경로가 요구하는 시작 차체각과 차량의 실측 현재
-        // 차체각을 전역좌표에서 바로 비교한다. phase는 이제 다리(leg)마다
-        // 나뉘므로, 코너는 항상 phase 경계(=새 메시지 도착 시점)에 있다.
-        const double target_body_yaw = spot_turn_target_body_yaw(path->psi().front(), reference_mode);
-        const bool needs_spot_turn =
+        // 급코너(제자리턴) 자동 판별 (1절), 두 갈래:
+        //  1) 배열 "경계"에서: 이 메시지의 시작 차체각을 차량의 실측 현재
+        //     차체각과 전역좌표에서 바로 비교한다 (모드 전환 등으로 실제
+        //     정차 위치가 조금씩 어긋날 수 있어 실측값과 비교한다).
+        //  2) 배열 "내부"에서: split_reference_path_at_corner()가 곡률을
+        //     차량의 조향 한계(curvature_max)와 비교해 이미 끊어 놓는다 --
+        //     조향으로는 절대 따라갈 수 없는 곡률이므로 실측 비교 없이도
+        //     무조건 제자리턴이 필요하다고 확정할 수 있다.
+        auto split = split_reference_path_at_corner(msg->x, msg->y, msg->yaw,
+                                                     config_.constraints.curvature_max);
+        if (split.after) {
+          // 롤링 창은 차량 위치 기준 뒤로도 몇 m를 담으므로(예:
+          // path_back_length), 방금 회전을 마친 코너가 그 뒤쪽 여유분에 한
+          // 동안 다시 들어올 수 있다. 차량의 실측 헤딩이 이미 이 코너의
+          // 회전 후 목표각과 거의 같다면 -- 이미 그 코너를 돌고 지나온
+          // 것이므로 새로 예약하지 않고 이 메시지를 그냥 절단 없이 쓴다.
+          const double after_target =
+              spot_turn_target_body_yaw(split.after->psi().front(), reference_mode);
+          if (std::abs(wrap_angle(after_target - current_body_yaw_)) <=
+              spot_turn_config_.heading_jump_threshold_rad) {
+            split.before = build_reference_path(msg->x, msg->y, msg->yaw);
+            split.after.reset();
+          }
+        }
+        const double target_body_yaw =
+            spot_turn_target_body_yaw(split.before->psi().front(), reference_mode);
+        const bool needs_boundary_spot_turn =
             std::abs(wrap_angle(target_body_yaw - current_body_yaw_)) >
             spot_turn_config_.heading_jump_threshold_rad;
-        if (needs_spot_turn) {
+        if (needs_boundary_spot_turn && split.after) {
+          throw std::invalid_argument(
+              "reference path needs a spot turn at both its own start and an interior corner");
+        }
+        if (needs_boundary_spot_turn) {
           pending_spot_turn_target_yaw_ = target_body_yaw;
           pending_spot_turn_mode_ = reference_mode;
-          pending_post_turn_path_ = std::move(path);
+          pending_post_turn_path_ = std::move(split.before);
           path_frame_ = frame;
           received_path_ = true;
           // reference_path_/reference_mode_는 일부러 안 건드린다 --
@@ -639,15 +663,25 @@ class PlannerNodeCpp final : public rclcpp::Node {
           // 둔다.
         } else {
           identical = reference_path_ && reference_mode == reference_mode_ &&
-                      same_reference_path(*reference_path_, *path);
+                      same_reference_path(*reference_path_, *split.before);
           if (!identical) {
-            hard_change = !is_soft_reference_continuation_locked(*path, reference_mode);
-            reference_path_ = std::move(path);
+            hard_change = !is_soft_reference_continuation_locked(*split.before, reference_mode);
+            reference_path_ = std::move(split.before);
             reference_mode_ = reference_mode;
             path_frame_ = frame;
             received_path_ = true;
             ++path_revision_;
             if (hard_change) ++command_revision_;
+          }
+          if (split.after) {
+            // 내부 코너: curvature_max를 넘어 이미 확정됐으므로 실측 비교
+            // 없이 바로 예약한다. 방금 설치한 before 구간을 다 몰아 정지하면
+            // (모드는 그대로이므로) command_callback()의 트리거가 바로
+            // 제자리턴을 건다.
+            pending_spot_turn_target_yaw_ =
+                spot_turn_target_body_yaw(split.after->psi().front(), reference_mode);
+            pending_spot_turn_mode_ = reference_mode;
+            pending_post_turn_path_ = std::move(split.after);
           }
         }
       }
@@ -1303,9 +1337,19 @@ class PlannerNodeCpp final : public rclcpp::Node {
         deferred = std::move(deferred_reference_);
       }
       spot_turn_waiting_clearance_ = false;
+      // terminal_hold_latched()도 반드시 같이 봐야 한다: measured_speed <=
+      // mode_change_stop_speed_ 만으로는 "코너까지 다 몰고 도착해 멈췄다"와
+      // "아직 그 자리(예: 코스 시작점)에서 출발도 안 했다"를 구분할 수 없다.
+      // 내부 코너(split_reference_path_at_corner)는 메시지가 도착하자마자
+      // pending_spot_turn_target_yaw_를 예약하므로, 차량이 실제로 그
+      // before 구간을 끝까지 몰아 terminal_hold가 걸릴 때까지는 기다려야
+      // 한다. 경계 코너는 이전 phase가 이미 도착해 있어야 새 메시지가
+      // 오므로 이 조건이 항상 먼저 참이 되어 있어 기존 동작에는 영향이
+      // 없다.
       if (mode_ready && maneuver_.state() == SpotTurnManeuverState::Inactive &&
           mode_supervisor_.current_mode() == reference_mode_ && received_costmap_ &&
-          measured_speed <= mode_change_stop_speed_ && pending_spot_turn_target_yaw_) {
+          measured_speed <= mode_change_stop_speed_ && terminal_hold_latched() &&
+          pending_spot_turn_target_yaw_) {
         if (spot_turn_feasible(*costmap_, current_state_, config_.vehicle, spot_turn_config_.safety_margin)) {
           maneuver_.trigger(*pending_spot_turn_target_yaw_, *pending_spot_turn_mode_);
           mode_supervisor_.set_requested_mode(DriveMode::SpotTurn);

@@ -387,6 +387,37 @@ std::shared_ptr<ReferencePath> build_reference_path(
       std::vector<double>(psi.begin(), psi.begin() + static_cast<std::ptrdiff_t>(used)), kappa);
 }
 
+ReferencePathSplit split_reference_path_at_corner(
+    const std::vector<double>& x, const std::vector<double>& y,
+    const std::vector<double>& yaw, double curvature_max) {
+  if (x.size() < 4 || x.size() != y.size() || x.size() != yaw.size()) {
+    throw std::invalid_argument("reference arrays require at least three points plus padding");
+  }
+  const auto s = cumulative_arc_length(x, y);
+  const auto psi = unwrap_angles(yaw);
+  const auto kappa = estimate_curvature_from_yaw(psi, s);
+  // kappa.back() belongs to the publisher's own padding point (see
+  // build_reference_path) and is never a real interior corner.
+  for (std::size_t i = 0; i + 1 < kappa.size(); ++i) {
+    if (std::abs(kappa[i]) <= curvature_max) continue;
+    std::vector<double> before_x(x.begin(), x.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+    std::vector<double> before_y(y.begin(), y.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+    std::vector<double> before_yaw(yaw.begin(), yaw.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+    // build_reference_path always drops its own last point as a
+    // curvature-sampling pad; duplicate the corner point itself so the
+    // segment ending there gets a real (zero) curvature, not the spike.
+    before_x.push_back(x[i]);
+    before_y.push_back(y[i]);
+    before_yaw.push_back(yaw[i]);
+    std::vector<double> after_x(x.begin() + static_cast<std::ptrdiff_t>(i) + 1, x.end());
+    std::vector<double> after_y(y.begin() + static_cast<std::ptrdiff_t>(i) + 1, y.end());
+    std::vector<double> after_yaw(yaw.begin() + static_cast<std::ptrdiff_t>(i) + 1, yaw.end());
+    return {build_reference_path(before_x, before_y, before_yaw),
+            build_reference_path(after_x, after_y, after_yaw)};
+  }
+  return {build_reference_path(x, y, yaw), nullptr};
+}
+
 double spot_turn_target_body_yaw(double path_start_psi, DriveMode mode) {
   return wrap_angle(path_start_psi - drive_mode_heading_offset(mode));
 }
