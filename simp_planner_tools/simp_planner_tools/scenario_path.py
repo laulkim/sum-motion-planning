@@ -4,6 +4,7 @@ import csv
 import math
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -56,6 +57,7 @@ class ScenarioPath:
         tangent_tolerance_deg: float = 5.0,
         curvature_limit: float = 0.2,
         yaw_step_limit_deg: float = 15.0,
+        skip_continuity_at: frozenset[int] = frozenset(),
     ) -> "ScenarioPath":
         x = np.asarray(x, dtype=float)
         y = np.asarray(y, dtype=float)
@@ -94,9 +96,17 @@ class ScenarioPath:
             yaw_step = np.diff(yaw)
             s = np.r_[0.0, np.cumsum(segment_length)]
 
-        if np.any(segment_length <= 1.0e-4):
+        # skip_continuity_at 자리(제자리턴 이음매)는 차량이 그 자리에서 헤딩만
+        # 바꾸는 지점이라 두 점 사이 거리/헤딩변화/접선 일치를 요구하는 아래
+        # 세 검사의 전제(연속 주행) 자체가 성립하지 않는다 -- 그 자리만 빼고 나머지
+        # 구간(실제 주행 구간)에는 그대로 적용한다.
+        continuity_mask = np.ones(len(segment_length), dtype=bool)
+        for index in skip_continuity_at:
+            continuity_mask[index] = False
+
+        if np.any(segment_length[continuity_mask] <= 1.0e-4):
             raise ValueError("Scenario path contains a zero-length segment")
-        if np.max(np.abs(yaw_step)) > math.radians(yaw_step_limit_deg):
+        if np.any(continuity_mask) and np.max(np.abs(yaw_step[continuity_mask])) > math.radians(yaw_step_limit_deg):
             raise ValueError("Scenario path contains a heading discontinuity")
 
         if closed_loop:
@@ -106,10 +116,10 @@ class ScenarioPath:
         tangent_error = np.asarray(
             wrap_angle(chord_yaw - motion_tangent_yaw), dtype=float
         )
-        if np.max(np.abs(tangent_error)) > math.radians(tangent_tolerance_deg):
+        if np.any(continuity_mask) and np.max(np.abs(tangent_error[continuity_mask])) > math.radians(tangent_tolerance_deg):
             raise ValueError(
                 "Scenario path motion yaw is inconsistent with x-y geometry: "
-                f"{math.degrees(float(np.max(np.abs(tangent_error)))):.2f} deg"
+                f"{math.degrees(float(np.max(np.abs(tangent_error[continuity_mask])))):.2f} deg"
             )
 
         total_length = float(np.sum(segment_length))
@@ -125,6 +135,39 @@ class ScenarioPath:
             map_yaw=map_yaw.copy(),
             heading_semantics=str(heading_semantics),
             closed_loop=bool(closed_loop),
+        )
+
+    @classmethod
+    def join_with_turns(cls, segments: Sequence["ScenarioPath"]) -> "ScenarioPath":
+        """Concatenate already-validated drivable segments into one path.
+
+        Each segment has already passed from_arrays' own continuity checks.
+        The junction between two consecutive segments is a spot-turn corner
+        -- the vehicle stays in place while its heading jumps -- so the
+        curvature/yaw-step/tangent checks that guard against broken authored
+        geometry do not apply there and are skipped only at those junctions.
+        """
+        if len(segments) < 1:
+            raise ValueError("join_with_turns requires at least one segment")
+        if any(segment.closed_loop for segment in segments):
+            raise ValueError("Closed-loop segments cannot be joined with spot turns")
+
+        seam_indices = set()
+        offset = 0
+        for segment in segments[:-1]:
+            offset += len(segment.x)
+            seam_indices.add(offset - 1)
+
+        return cls.from_arrays(
+            np.concatenate([segment.x for segment in segments]),
+            np.concatenate([segment.y for segment in segments]),
+            np.concatenate([segment.yaw for segment in segments]),
+            np.concatenate([segment.kappa for segment in segments]),
+            np.concatenate([segment.mode for segment in segments]),
+            map_yaw=np.concatenate([segment.map_yaw for segment in segments]),
+            heading_semantics=segments[0].heading_semantics,
+            closed_loop=False,
+            skip_continuity_at=frozenset(seam_indices),
         )
 
     @classmethod

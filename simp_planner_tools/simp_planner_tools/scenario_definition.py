@@ -196,6 +196,95 @@ def build_ramp_loop_path(
     return ScenarioPath.from_arrays(x, y, yaw, kappa, mode, closed_loop=False)
 
 
+def _straight_segment(
+    x0: float, y0: float, heading: float, length: float, mode: int, *, ds: float = 0.2
+) -> ScenarioPath:
+    count = max(4, int(math.ceil(length / ds)) + 1)
+    s = np.linspace(0.0, length, count)
+    x = x0 + s * math.cos(heading)
+    y = y0 + s * math.sin(heading)
+    yaw = np.full(count, heading)
+    kappa = np.zeros(count)
+    mode_array = np.full(count, mode, dtype=np.uint8)
+    return ScenarioPath.from_arrays(x, y, yaw, kappa, mode_array)
+
+
+def build_spot_turn_crab_course_phases(
+    *,
+    forward_leg_length: float = 36.0,
+    crab_leg_length: float = 24.0,
+    stub_length: float = 0.6,
+    turn_degrees: tuple[float, float, float] = (40.0, -60.0, 70.0),
+    forward_speed: float = 1.5,
+    crab_speed: float = 1.0,
+    ds: float = 0.2,
+) -> tuple["ScenarioPhase", ...]:
+    """일반주행 -> 제자리턴+주행 -> 크랩 -> 제자리턴+주행 -> 크랩 ->
+    제자리턴+주행 -> 크랩 -> 그냥주행, 7-phase 코스.
+
+    제자리턴 코너는 phase 분할이 아니라 각 FORWARD phase 자신의 경로 배열
+    안에서 ScenarioPath.join_with_turns()로 이어붙인 이음매로 표현된다
+    (phase는 모드가 바뀔 때만 나뉜다). 크랩(LEFT) 구간 바로 다음에 오는
+    FORWARD phase는, 크랩이 끝난 자리에서 옛 헤딩으로 아주 짧게(stub_length)
+    서 있다가 그 자리에서 제자리턴하는 모양이 되도록, 그 stub을 이음매 앞
+    구간으로 쓴다. 크랩은 몸체 헤딩을 바꾸지 않으므로(옆으로만 이동), 다음
+    제자리턴은 항상 크랩 진입 직전의 헤딩에서 시작한다.
+    """
+    turns = [math.radians(value) for value in turn_degrees]
+    heading = 0.0
+    x, y = 0.0, 0.0
+
+    seg_a = _straight_segment(x, y, heading, forward_leg_length, mode=0, ds=ds)
+    x, y = float(seg_a.x[-1]), float(seg_a.y[-1])
+    heading += turns[0]
+    seg_b = _straight_segment(x, y, heading, forward_leg_length, mode=0, ds=ds)
+    forward1 = ScenarioPath.join_with_turns([seg_a, seg_b])
+    x, y = float(forward1.x[-1]), float(forward1.y[-1])
+
+    crab1 = _straight_segment(x, y, heading + 0.5 * math.pi, crab_leg_length, mode=2, ds=ds)
+    x, y = float(crab1.x[-1]), float(crab1.y[-1])
+
+    stub_b = _straight_segment(x, y, heading, stub_length, mode=0, ds=ds)
+    x, y = float(stub_b.x[-1]), float(stub_b.y[-1])
+    heading += turns[1]
+    seg_c = _straight_segment(x, y, heading, forward_leg_length, mode=0, ds=ds)
+    forward2 = ScenarioPath.join_with_turns([stub_b, seg_c])
+    x, y = float(forward2.x[-1]), float(forward2.y[-1])
+
+    crab2 = _straight_segment(x, y, heading + 0.5 * math.pi, crab_leg_length, mode=2, ds=ds)
+    x, y = float(crab2.x[-1]), float(crab2.y[-1])
+
+    stub_c = _straight_segment(x, y, heading, stub_length, mode=0, ds=ds)
+    x, y = float(stub_c.x[-1]), float(stub_c.y[-1])
+    heading += turns[2]
+    seg_d = _straight_segment(x, y, heading, forward_leg_length, mode=0, ds=ds)
+    forward3 = ScenarioPath.join_with_turns([stub_c, seg_d])
+    x, y = float(forward3.x[-1]), float(forward3.y[-1])
+
+    crab3 = _straight_segment(x, y, heading + 0.5 * math.pi, crab_leg_length, mode=2, ds=ds)
+    x, y = float(crab3.x[-1]), float(crab3.y[-1])
+
+    forward4 = _straight_segment(x, y, heading, forward_leg_length, mode=0, ds=ds)
+
+    def _phase(name: str, path: ScenarioPath, cruise_speed: float, has_next: bool) -> "ScenarioPhase":
+        return ScenarioPhase(
+            name=name,
+            path=path,
+            cruise_speed=cruise_speed,
+            switch_s=path.total_length if has_next else None,
+        )
+
+    return (
+        _phase("forward_1_with_turn", forward1, forward_speed, True),
+        _phase("crab_1", crab1, crab_speed, True),
+        _phase("forward_2_with_turn", forward2, forward_speed, True),
+        _phase("crab_2", crab2, crab_speed, True),
+        _phase("forward_3_with_turn", forward3, forward_speed, True),
+        _phase("crab_3", crab3, crab_speed, True),
+        _phase("forward_4_plain", forward4, forward_speed, False),
+    )
+
+
 def wall_segments_along_path(
     path: ScenarioPath,
     s_start: float,
@@ -275,6 +364,15 @@ def load_scenario_definition(
         return ScenarioDefinition(
             name=name,
             phases=(forward, crab),
+            terminal_margin=3.0,
+        )
+
+
+    if name == "spot_turn_course":
+        phases = build_spot_turn_crab_course_phases()
+        return ScenarioDefinition(
+            name=name,
+            phases=phases,
             terminal_margin=3.0,
         )
 
@@ -866,7 +964,7 @@ def load_scenario_definition(
         )
 
     supported = (
-        "stadium, crab_switch, reverse_switch, hdmap_crab1_switch, fmtc_demo, hdmap_lap_switch, s_curve, "
+        "stadium, crab_switch, spot_turn_course, reverse_switch, hdmap_crab1_switch, fmtc_demo, hdmap_lap_switch, s_curve, "
         "straight_long, obstacle_avoidance, terminal_safe_region, s_curve_obstacles, "
         "alternating_gate_corridor, curved_gate_maze, winding_obstacle_course, "
         "winding_obstacle_course_wide_gates, parking_ramp_loop, "

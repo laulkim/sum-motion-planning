@@ -13,3 +13,6 @@ ros2 launch simp_planner_tools simulation.launch.py \
 ros2 launch simp_planner_tools simulation.launch.py \
   scenario:=fmtc_demo use_rviz:=true \
   target_speed:=4.2 costmap_resolution:=0.1
+
+
+(제자리턴 시나리오)
