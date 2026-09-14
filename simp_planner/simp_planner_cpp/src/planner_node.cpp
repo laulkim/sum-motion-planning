@@ -346,6 +346,15 @@ class PlannerNodeCpp final : public rclcpp::Node {
   }
 
   void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+    {
+      // Odometry seeds current_state_ exactly once. After that, state
+      // updates come from predict_handover_state in planning_callback
+      // instead of continued odometry callbacks. The subscription is left
+      // open so a future policy can decide when odom should be consulted
+      // again; for now every message after the first is a no-op.
+      std::lock_guard<std::mutex> lock(input_mutex_);
+      if (received_odom_) return;
+    }
     const auto& q = msg->pose.pose.orientation;
     const double body_yaw = quaternion_to_yaw(q.x, q.y, q.z, q.w);
     const double body_vx = msg->twist.twist.linear.x;
@@ -1043,6 +1052,20 @@ class PlannerNodeCpp final : public rclcpp::Node {
           std::min(config_.constraints.jerk_max, config_.longitudinal.comfort_jerk));
       const double handover_prediction_ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - handover_start).count();
+
+      {
+        // Odom only seeds the very first cycle (see odom_callback). From
+        // here on, current_state_ tracks this handover prediction instead
+        // of live odometry, so the next planning cycle's snapshot is
+        // anchored to where the active plan says the vehicle will be.
+        std::lock_guard<std::mutex> lock(input_mutex_);
+        current_state_ = handover.state;
+        current_body_yaw_ = handover.body_yaw;
+        if (handover.expected_command) {
+          current_body_yaw_rate_ = handover.expected_command->yaw_rate;
+        }
+        current_state_time_ns_ = scheduled_start;
+      }
 
       std::optional<FrenetProjection> handover_projection;
       if (active) {
