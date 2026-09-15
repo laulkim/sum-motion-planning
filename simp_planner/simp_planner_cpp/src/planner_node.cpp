@@ -1396,6 +1396,18 @@ class PlannerNodeCpp final : public rclcpp::Node {
           rotating_command->segment_start_heading = current_body_yaw_;
           rotating_command->segment_end_heading =
               wrap_angle(current_body_yaw_ + rotating_command->yaw_rate * command_dt_);
+          // Spot-turn-local handover: planning_callback() returns immediately
+          // while input->spot_turn_active is true, so predict_handover_state()
+          // never runs during a turn, and odom_callback() only seeds state
+          // once for the whole run (see both call sites). Without this,
+          // measured_yaw handed to YawRotationProfile::sample() next tick
+          // would stay frozen at the pre-turn heading forever, error would
+          // never shrink, and done() could never become true. Advance by
+          // exactly what we just commanded (Vx=Vy=0, pure yaw_rate) so the
+          // next sample() call sees progress.
+          current_body_yaw_ = rotating_command->segment_end_heading;
+          current_body_yaw_rate_ = rotating_command->yaw_rate;
+          current_state_time_ns_ = stamp_ns;
         }
       }
     }
