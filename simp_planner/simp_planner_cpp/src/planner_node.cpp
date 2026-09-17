@@ -596,13 +596,16 @@ class PlannerNodeCpp final : public rclcpp::Node {
       publish_status("REFERENCE_OR_REQUEST_MODE_MISMATCH", 0.0, -1);
       return;
     }
-    bool has_plan;
+    std::shared_ptr<const ExecutablePlan> active;
     {
       std::lock_guard<std::mutex> lock(execution_mutex_);
-      has_plan = static_cast<bool>(active_plan_) || static_cast<bool>(pending_plan_);
-      if (pending_plan_ && now_ns() < pending_plan_->start_ns) return;
+      // A scheduled start does not mean command_callback has activated the plan.
+      // Wait for activation (or invalidation) before selecting the handover base.
+      if (pending_plan_) return;
+      active = active_plan_;
     }
-    const auto token = scheduler_.begin_if_due(now_ns(), has_plan, false);
+    const auto token = scheduler_.begin_if_due(
+        now_ns(), static_cast<bool>(active), false);
     if (!token) return;
 
     try {
@@ -612,11 +615,6 @@ class PlannerNodeCpp final : public rclcpp::Node {
           now_ns() + static_cast<std::int64_t>(
               std::llround(handover_timing_.recommended_lead_sec() * 1.0e9)),
           command_dt_);
-      std::shared_ptr<const ExecutablePlan> active;
-      {
-        std::lock_guard<std::mutex> lock(execution_mutex_);
-        active = active_plan_;
-      }
       const auto handover = predict_handover_state(
           input->state, input->body_yaw, input->state_time_ns, scheduled_start,
           active ? std::optional<std::int64_t>(active->start_ns) : std::nullopt,
