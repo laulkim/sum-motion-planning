@@ -40,6 +40,7 @@ class ScenarioPath:
     map_yaw: np.ndarray
     heading_semantics: str
     closed_loop: bool = False
+    skip_continuity_at: frozenset[int] = frozenset()
 
     @classmethod
     def from_arrays(
@@ -56,6 +57,7 @@ class ScenarioPath:
         tangent_tolerance_deg: float = 5.0,
         curvature_limit: float = 0.2,
         yaw_step_limit_deg: float = 15.0,
+        spot_turn_kappa_threshold: float = 1000.0,
     ) -> "ScenarioPath":
         x = np.asarray(x, dtype=float)
         y = np.asarray(y, dtype=float)
@@ -86,6 +88,7 @@ class ScenarioPath:
             chord_yaw = np.arctan2(next_y - y, next_x - x)
             yaw_step = np.asarray(wrap_angle(np.roll(yaw, -1) - yaw), dtype=float)
             s = np.r_[0.0, np.cumsum(segment_length[:-1])]
+            is_seam = np.zeros(len(segment_length), dtype=bool)
         else:
             dx = np.diff(x)
             dy = np.diff(y)
@@ -94,9 +97,28 @@ class ScenarioPath:
             yaw_step = np.diff(yaw)
             s = np.r_[0.0, np.cumsum(segment_length)]
 
-        if np.any(segment_length <= 1.0e-4):
+            # 제자리턴 이음매 자동 탐지: C++ 플래너(estimate_curvature_from_yaw)와
+            # 똑같은 방식으로 순간 곡률(헤딩변화/거리)을 다시 계산한다. 그 값이
+            # 비정상적으로 크면(사실상 같은 위치에서 헤딩만 꺾인 지점) 이음매로
+            # 보고 아래 세 연속성 검사에서만 제외한다 -- 호출자가 이음매 위치를
+            # 미리 알려줄 필요가 없고, 슬라이스/클립된 부분 배열에 대해서도 같은
+            # 방식으로 다시 계산하면 그대로 재탐지된다.
+            instantaneous_kappa = yaw_step / np.maximum(segment_length, 1.0e-15)
+            is_seam = np.abs(instantaneous_kappa) > spot_turn_kappa_threshold
+            if np.any(is_seam):
+                bad = is_seam & ((segment_length > 1.0e-6) | (np.abs(yaw_step) <= 1.0e-9))
+                if np.any(bad):
+                    raise ValueError(
+                        "Spot-turn seam requires coincident positions and a heading change"
+                    )
+                if np.any(mode[:-1][is_seam] != mode[1:][is_seam]):
+                    raise ValueError("A spot-turn seam cannot change drive mode")
+
+        continuity_mask = ~is_seam
+
+        if np.any(segment_length[continuity_mask] <= 1.0e-4):
             raise ValueError("Scenario path contains a zero-length segment")
-        if np.max(np.abs(yaw_step)) > math.radians(yaw_step_limit_deg):
+        if np.any(continuity_mask) and np.max(np.abs(yaw_step[continuity_mask])) > math.radians(yaw_step_limit_deg):
             raise ValueError("Scenario path contains a heading discontinuity")
 
         if closed_loop:
@@ -106,10 +128,10 @@ class ScenarioPath:
         tangent_error = np.asarray(
             wrap_angle(chord_yaw - motion_tangent_yaw), dtype=float
         )
-        if np.max(np.abs(tangent_error)) > math.radians(tangent_tolerance_deg):
+        if np.any(continuity_mask) and np.max(np.abs(tangent_error[continuity_mask])) > math.radians(tangent_tolerance_deg):
             raise ValueError(
                 "Scenario path motion yaw is inconsistent with x-y geometry: "
-                f"{math.degrees(float(np.max(np.abs(tangent_error)))):.2f} deg"
+                f"{math.degrees(float(np.max(np.abs(tangent_error[continuity_mask])))):.2f} deg"
             )
 
         total_length = float(np.sum(segment_length))
@@ -125,6 +147,7 @@ class ScenarioPath:
             map_yaw=map_yaw.copy(),
             heading_semantics=str(heading_semantics),
             closed_loop=bool(closed_loop),
+            skip_continuity_at=frozenset(np.flatnonzero(is_seam).tolist()),
         )
 
     @classmethod
@@ -245,32 +268,82 @@ class ScenarioPath:
                 indices.append(current)
                 if accumulated >= required and len(indices) >= 4:
                     break
+            # One extra waypoint beyond the nominal ahead-length window
+            # (always available on a closed loop) so the consumer can
+            # estimate curvature at the true last usable point via a forward
+            # difference, then drop it before planning.
+            indices.append((current + 1) % len(self.x))
             idx = np.asarray(indices, dtype=int)
-        else:
-            start_s = max(0.0, float(projection_s) - float(back_length))
-            end_s = min(
-                self.total_length, float(projection_s) + float(ahead_length)
+            return ScenarioPath.from_arrays(
+                self.x[idx],
+                self.y[idx],
+                self.yaw[idx],
+                self.kappa[idx],
+                self.mode[idx],
+                map_yaw=self.map_yaw[idx],
+                heading_semantics=self.heading_semantics,
+                closed_loop=False,
             )
-            start = max(
-                0, int(np.searchsorted(self.s, start_s, side="right") - 1)
-            )
-            stop = min(
-                len(self.x), int(np.searchsorted(self.s, end_s, side="left") + 1)
-            )
-            if stop - start < 4:
-                if start == 0:
-                    stop = min(len(self.x), 4)
-                else:
-                    start = max(0, stop - 4)
-            idx = np.arange(start, stop, dtype=int)
 
+        start_s = max(0.0, float(projection_s) - float(back_length))
+        end_s = min(
+            self.total_length, float(projection_s) + float(ahead_length)
+        )
+        start = max(
+            0, int(np.searchsorted(self.s, start_s, side="right") - 1)
+        )
+        stop = min(
+            len(self.x), int(np.searchsorted(self.s, end_s, side="left") + 1)
+        )
+        # A seam at the rolling-window edge still needs three usable points
+        # on either side for the C++ ReferencePath constructor. Borrow enough
+        # real points here before appending the curvature-sampling point.
+        for seam in sorted(self.skip_continuity_at):
+            if start <= seam < start + 2:
+                start = max(0, seam - 2)
+            if start <= seam < stop:
+                stop = min(len(self.x), max(stop, seam + 4))
+        if stop - start < 4:
+            if start == 0:
+                stop = min(len(self.x), 4)
+            else:
+                start = max(0, stop - 4)
+        idx = np.arange(start, stop, dtype=int)
+
+        if stop < len(self.x):
+            # A real next waypoint exists just beyond the nominal window --
+            # include it so the consumer can estimate curvature at the true
+            # last usable point via a forward difference, then drop it
+            # before planning.
+            pad_idx = np.r_[idx, stop]
+            return ScenarioPath.from_arrays(
+                self.x[pad_idx],
+                self.y[pad_idx],
+                self.yaw[pad_idx],
+                self.kappa[pad_idx],
+                self.mode[pad_idx],
+                map_yaw=self.map_yaw[pad_idx],
+                heading_semantics=self.heading_semantics,
+                closed_loop=False,
+            )
+
+        # The window already reaches the real end of this path -- there is no
+        # next waypoint to borrow. Append a synthetic point that continues
+        # straight along the last heading; a forward difference against it
+        # naturally yields curvature 0 there, matching the fact that motion
+        # (and therefore curvature demand) stops at this point.
+        last = int(idx[-1])
+        step = float(self.segment_length[last - 1]) if last > 0 else 0.1
+        pad_yaw = float(self.yaw[last])
+        pad_x = float(self.x[last] + step * math.cos(pad_yaw))
+        pad_y = float(self.y[last] + step * math.sin(pad_yaw))
         return ScenarioPath.from_arrays(
-            self.x[idx],
-            self.y[idx],
-            self.yaw[idx],
-            self.kappa[idx],
-            self.mode[idx],
-            map_yaw=self.map_yaw[idx],
+            np.r_[self.x[idx], pad_x],
+            np.r_[self.y[idx], pad_y],
+            np.r_[self.yaw[idx], pad_yaw],
+            np.r_[self.kappa[idx], 0.0],
+            np.r_[self.mode[idx], self.mode[last]],
+            map_yaw=np.r_[self.map_yaw[idx], float(self.map_yaw[last])],
             heading_semantics=self.heading_semantics,
             closed_loop=False,
         )
@@ -289,6 +362,15 @@ class ScenarioPath:
         end_s = float(np.clip(end_s, 0.0, self.total_length))
         if end_s >= self.total_length - 1.0e-9:
             return self
+        exact = int(np.searchsorted(self.s, end_s, side="left"))
+        if exact < len(self.s) and abs(float(self.s[exact]) - end_s) <= 1.0e-9:
+            if exact + 1 < 4:
+                raise ValueError("Terminal clipping leaves fewer than four path points")
+            idx = slice(0, exact + 1)
+            return ScenarioPath.from_arrays(
+                self.x[idx], self.y[idx], self.yaw[idx], self.kappa[idx], self.mode[idx],
+                map_yaw=self.map_yaw[idx], heading_semantics=self.heading_semantics,
+            )
         upper = int(np.searchsorted(self.s, end_s, side="right"))
         upper = max(1, min(upper, len(self.s) - 1))
         lower = upper - 1

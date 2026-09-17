@@ -132,6 +132,229 @@ def gate_on_path(
     )
     return gate, lower, upper
 
+
+def _ramp_loop_kappa(
+    s: float,
+    ramp_length: float,
+    transition_length: float,
+    kappa_circle: float,
+    sweep_length: float,
+) -> float:
+    s1 = ramp_length
+    s2 = s1 + transition_length
+    s3 = s2 + sweep_length
+    s4 = s3 + transition_length
+    if s <= s1:
+        return 0.0
+    if s <= s2:
+        return kappa_circle * (s - s1) / transition_length
+    if s <= s3:
+        return kappa_circle
+    if s <= s4:
+        return kappa_circle * (1.0 - (s - s3) / transition_length)
+    return 0.0
+
+
+def build_ramp_loop_path(
+    *,
+    ramp_length: float,
+    transition_length: float,
+    circle_radius: float,
+    sweep_deg: float,
+    ds: float = 0.2,
+) -> ScenarioPath:
+    """Straight entry ramp -> clothoid-in -> constant-curvature circular
+    sweep -> clothoid-out -> straight exit ramp, the shape of a parking-
+    garage ramp that loops around before continuing on.  Curvature is
+    integrated with a trapezoidal rule at a fixed arc-length step, which
+    keeps consecutive yaw steps well inside ScenarioPath.from_arrays'
+    tolerances even through the tightest part of the sweep.
+    """
+    kappa_circle = 1.0 / float(circle_radius)
+    sweep_length = math.radians(float(sweep_deg)) * float(circle_radius)
+    total_length = 2.0 * float(ramp_length) + 2.0 * float(transition_length) + sweep_length
+    count = int(math.ceil(total_length / ds)) + 1
+    s_values = np.linspace(0.0, total_length, count)
+    kappa = np.array(
+        [
+            _ramp_loop_kappa(
+                float(s), ramp_length, transition_length, kappa_circle, sweep_length
+            )
+            for s in s_values
+        ]
+    )
+    yaw = np.zeros(count)
+    x = np.zeros(count)
+    y = np.zeros(count)
+    for i in range(1, count):
+        d = s_values[i] - s_values[i - 1]
+        yaw[i] = yaw[i - 1] + 0.5 * (kappa[i - 1] + kappa[i]) * d
+        mean_yaw = 0.5 * (yaw[i - 1] + yaw[i])
+        x[i] = x[i - 1] + d * math.cos(mean_yaw)
+        y[i] = y[i - 1] + d * math.sin(mean_yaw)
+    mode = np.zeros(count, dtype=np.uint8)
+    return ScenarioPath.from_arrays(x, y, yaw, kappa, mode, closed_loop=False)
+
+
+def _straight_segment(
+    x0: float, y0: float, heading: float, length: float, mode: int, *, ds: float = 0.2
+) -> ScenarioPath:
+    count = max(4, int(math.ceil(length / ds)) + 1)
+    s = np.linspace(0.0, length, count)
+    x = x0 + s * math.cos(heading)
+    y = y0 + s * math.sin(heading)
+    yaw = np.full(count, heading)
+    kappa = np.zeros(count)
+    mode_array = np.full(count, mode, dtype=np.uint8)
+    return ScenarioPath.from_arrays(x, y, yaw, kappa, mode_array)
+
+
+def _curved_segment(
+    x0: float, y0: float, heading0: float, curvature: float, length: float, mode: int,
+    *, ds: float = 0.2,
+) -> ScenarioPath:
+    count = max(4, int(math.ceil(length / ds)) + 1)
+    s_values = np.linspace(0.0, length, count)
+    yaw = heading0 + curvature * s_values
+    x = np.empty(count)
+    y = np.empty(count)
+    x[0], y[0] = x0, y0
+    for i in range(1, count):
+        d = s_values[i] - s_values[i - 1]
+        mean_yaw = 0.5 * (yaw[i - 1] + yaw[i])
+        x[i] = x[i - 1] + d * math.cos(mean_yaw)
+        y[i] = y[i - 1] + d * math.sin(mean_yaw)
+    kappa = np.full(count, curvature)
+    mode_array = np.full(count, mode, dtype=np.uint8)
+    return ScenarioPath.from_arrays(x, y, yaw, kappa, mode_array)
+
+
+def _concat_segments(segments: tuple[ScenarioPath, ...]) -> ScenarioPath:
+    """Concatenate driving segments into one path.
+
+    A spot-turn corner between two segments is simply the raw x/y/yaw
+    concatenation -- ScenarioPath.from_arrays() recomputes curvature from
+    (x, y, yaw) itself and recognizes a corner wherever that recomputed
+    curvature is abnormally large, so no caller-side bookkeeping of where
+    the corner sits is needed.
+    """
+    return ScenarioPath.from_arrays(
+        np.concatenate([segment.x for segment in segments]),
+        np.concatenate([segment.y for segment in segments]),
+        np.concatenate([segment.yaw for segment in segments]),
+        np.concatenate([segment.kappa for segment in segments]),
+        np.concatenate([segment.mode for segment in segments]),
+        map_yaw=np.concatenate([segment.map_yaw for segment in segments]),
+        heading_semantics=segments[0].heading_semantics,
+    )
+
+
+def build_spot_turn_crab_course_phases(
+    *,
+    forward_leg_length: float = 36.0,
+    crab_leg_length: float = 24.0,
+    turn_degrees: tuple[float, float, float] = (40.0, -60.0, 70.0),
+    curvature_after_turn1: float = 0.018,
+    curvature_final_leg: float = -0.015,
+    forward_speed: float = 1.5,
+    crab_speed: float = 1.0,
+    ds: float = 0.2,
+) -> tuple["ScenarioPhase", ...]:
+    """일반주행(중간에 제자리턴 내장) -> 크랩 -> 제자리턴 -> 주행 -> 크랩 ->
+    제자리턴 -> 주행 -> 크랩 -> 그냥주행, 7-phase 코스.
+
+    phase는 모드가 바뀔 때만 나뉜다 (forward/crab 다리마다 하나씩, 총 7개).
+    세 제자리턴 중 -60도/70도는 crab -> forward 모드 전환과 겹치므로 phase
+    경계 자체가 코너이고, 플래너(C++)는 그 경계에서 새 phase의 시작 헤딩과
+    차량의 실측 헤딩을 비교해 판단한다. 반면 첫 제자리턴(40도)은 모드가
+    바뀌지 않는 순수 헤딩 코너라 forward_1 phase 배열 "내부"에 곡률
+    스파이크로 심겨 있다 -- 이어붙이는 지점의 좌표는 그대로 두고 헤딩만
+    바꾸므로(_concat_segments), 그 지점의 순간곡률이 curvature_max를 훨씬
+    넘는다. 플래너의 split_reference_path_at_corner()가 배열을 받을 때마다
+    이 곡률 스파이크를 스스로 찾아 끊어 처리하므로, 시나리오 쪽에서 이
+    코너의 위치를 따로 표시하거나 넘겨줄 필요가 없다.
+    """
+    turns = [math.radians(value) for value in turn_degrees]
+    heading = 0.0
+    x, y = 0.0, 0.0
+
+    forward1a = _straight_segment(x, y, heading, forward_leg_length, mode=0, ds=ds)
+    x, y = float(forward1a.x[-1]), float(forward1a.y[-1])
+    heading += turns[0]
+    forward1b = _curved_segment(x, y, heading, curvature_after_turn1, forward_leg_length, mode=0, ds=ds)
+    heading = float(forward1b.yaw[-1])
+    x, y = float(forward1b.x[-1]), float(forward1b.y[-1])
+    forward1 = _concat_segments((forward1a, forward1b))
+
+    crab1 = _straight_segment(x, y, heading + 0.5 * math.pi, crab_leg_length, mode=2, ds=ds)
+    x, y = float(crab1.x[-1]), float(crab1.y[-1])
+
+    heading += turns[1]
+    forward2 = _straight_segment(x, y, heading, forward_leg_length, mode=0, ds=ds)
+    x, y = float(forward2.x[-1]), float(forward2.y[-1])
+
+    crab2 = _straight_segment(x, y, heading + 0.5 * math.pi, crab_leg_length, mode=2, ds=ds)
+    x, y = float(crab2.x[-1]), float(crab2.y[-1])
+
+    heading += turns[2]
+    forward3 = _straight_segment(x, y, heading, forward_leg_length, mode=0, ds=ds)
+    x, y = float(forward3.x[-1]), float(forward3.y[-1])
+
+    crab3 = _straight_segment(x, y, heading + 0.5 * math.pi, crab_leg_length, mode=2, ds=ds)
+    x, y = float(crab3.x[-1]), float(crab3.y[-1])
+
+    forward4 = _curved_segment(x, y, heading, curvature_final_leg, forward_leg_length, mode=0, ds=ds)
+
+    def _phase(name: str, path: ScenarioPath, cruise_speed: float, has_next: bool) -> "ScenarioPhase":
+        return ScenarioPhase(
+            name=name,
+            path=path,
+            cruise_speed=cruise_speed,
+            switch_s=path.total_length if has_next else None,
+        )
+
+    return (
+        _phase("forward_1", forward1, forward_speed, True),
+        _phase("crab_1", crab1, crab_speed, True),
+        _phase("forward_2_after_turn", forward2, forward_speed, True),
+        _phase("crab_2", crab2, crab_speed, True),
+        _phase("forward_3_after_turn", forward3, forward_speed, True),
+        _phase("crab_3", crab3, crab_speed, True),
+        _phase("forward_4_plain", forward4, forward_speed, False),
+    )
+
+
+def wall_segments_along_path(
+    path: ScenarioPath,
+    s_start: float,
+    s_end: float,
+    *,
+    lateral_offset: float,
+    segment_length: float = 1.6,
+    spacing: float = 1.2,
+    thickness: float = 0.25,
+) -> list[ScenarioObstacle]:
+    """Approximate a continuous wall alongside a (possibly curved) path
+    segment as a sequence of short, overlapping rectangles.  Each segment
+    picks up the local path tangent from obstacle_on_path, so the wall
+    follows the curve instead of cutting a chord across it; the overlap
+    between consecutive segments (segment_length > spacing) keeps the
+    rasterized costmap from leaking a gap between them.
+    """
+    segments: list[ScenarioObstacle] = []
+    s = float(s_start)
+    end = float(s_end)
+    while s <= end + 1.0e-6:
+        segments.append(
+            obstacle_on_path(
+                path, s, lateral_offset=lateral_offset,
+                length=segment_length, width=thickness,
+            )
+        )
+        s += spacing
+    return segments
+
+
 def load_scenario_definition(
     share_directory: Path | str,
     scenario_name: str,
@@ -184,6 +407,15 @@ def load_scenario_definition(
         )
 
 
+    if name == "spot_turn_course":
+        phases = build_spot_turn_crab_course_phases()
+        return ScenarioDefinition(
+            name=name,
+            phases=phases,
+            terminal_margin=3.0,
+        )
+
+
     if name == "reverse_switch":
         forward = ScenarioPhase(
             name="regular_forward_stop",
@@ -210,11 +442,140 @@ def load_scenario_definition(
             terminal_margin=3.0,
         )
 
+    if name == "hdmap_crab1_switch":
+        # HDMap/build_scenario_maps.py 로 생성한, 실제 HD map(큰트랙 + 크랩1)
+        # 기반 3-phase 시나리오: 전진(Forward) -> 크랩 이탈(Left) -> 정지 후
+        # 같은 경로를 되짚어 복귀(Right). switch_s=50.0은
+        # HDMap/output/switch_stations.txt 의 크랩1 S_switch를
+        # hdmap_crab1_forward.csv 자신의 로컬 원점 기준으로 다시 잰 값이다.
+        forward = ScenarioPhase(
+            name="hdmap_forward",
+            path=ScenarioPath.load_csv(
+                _map_path(share_directory, "hdmap_crab1_forward.csv"),
+                closed_loop=False,
+            ),
+            cruise_speed=1.5,
+            switch_s=50.0,
+        )
+        left = ScenarioPhase(
+            name="hdmap_crab1_left",
+            path=ScenarioPath.load_csv(
+                _map_path(share_directory, "hdmap_crab1_left.csv"),
+                closed_loop=False,
+            ),
+            cruise_speed=1.0,
+        )
+        right_return = ScenarioPhase(
+            name="hdmap_crab1_right_return",
+            path=ScenarioPath.load_csv(
+                _map_path(share_directory, "hdmap_crab1_right_return.csv"),
+                closed_loop=False,
+            ),
+            cruise_speed=1.0,
+        )
+        return ScenarioDefinition(
+            name=name,
+            phases=(forward, left, right_return),
+            terminal_margin=3.0,
+        )
+
+    if name == "fmtc_demo":
+        # HDMap/build_ref_ver1_path.py + HDMap/build_fmtc_demo_scenario.py 로
+        # 생성한, ref_ver1.txt 기반 3-phase 시나리오: 레귤러1(Forward) ->
+        # 크랩2(Left) -> 레귤러3(Forward). 레귤러1/크랩2는 각각 자신의 곡선에
+        # 다음 세그먼트 시작점을 수직 투영해 얻은 S_switch에서 정확히 잘려
+        # 있으므로, switch_s는 곧 그 phase csv 자신의 총 길이다
+        # (HDMap/build_fmtc_demo_scenario.py 콘솔 출력 그대로).
+        regular1 = ScenarioPhase(
+            name="fmtc_demo_regular1",
+            path=ScenarioPath.load_csv(
+                _map_path(share_directory, "fmtc_demo_regular1.csv"),
+                closed_loop=False,
+            ),
+            cruise_speed=1.5,
+            switch_s=94.81,
+        )
+        crab2 = ScenarioPhase(
+            name="fmtc_demo_crab2",
+            path=ScenarioPath.load_csv(
+                _map_path(share_directory, "fmtc_demo_crab2.csv"),
+                closed_loop=False,
+            ),
+            cruise_speed=1.0,
+            switch_s=152.53,
+        )
+        regular3 = ScenarioPhase(
+            name="fmtc_demo_regular3",
+            path=ScenarioPath.load_csv(
+                _map_path(share_directory, "fmtc_demo_regular3.csv"),
+                closed_loop=False,
+            ),
+            cruise_speed=1.5,
+        )
+        return ScenarioDefinition(
+            name=name,
+            phases=(regular1, crab2, regular3),
+            terminal_margin=3.0,
+        )
+
+    if name == "hdmap_lap_switch":
+        # HDMap/build_lap_scenario_maps.py 로 생성. 큰트랙을 따라가며 크랩
+        # 1/2/3 switch를 순서대로 만나는 10-phase 연속 랩:
+        # forward0 -> crab1_left -> crab1_right_return ->
+        # forward1 -> crab2_left -> crab2_right_return ->
+        # forward2 -> crab3_left -> crab3_right_return ->
+        # forward3 (크랩3 switch ~ 큰트랙 끝, 마지막 phase). switch_s 값은
+        # build_lap_scenario_maps.py 콘솔 출력 그대로다. 전 phase가 큰트랙
+        # 자신의 시작점을 공통 원점으로 평행이동되어 있어 authored 상태로
+        # 이미 서로 이어진다.
+        def _lap_phase(csv_name, phase_name, cruise_speed, switch_s=None):
+            return ScenarioPhase(
+                name=phase_name,
+                path=ScenarioPath.load_csv(
+                    _map_path(share_directory, f"{csv_name}.csv"),
+                    closed_loop=False,
+                ),
+                cruise_speed=cruise_speed,
+                switch_s=switch_s,
+            )
+
+        phases = (
+            _lap_phase("hdmap_lap_forward0", "hdmap_lap_forward0", 1.5, switch_s=279.19),
+            _lap_phase("hdmap_lap_crab1_left", "hdmap_lap_crab1_left", 1.0),
+            _lap_phase("hdmap_lap_crab1_right_return", "hdmap_lap_crab1_right_return", 1.0),
+            _lap_phase("hdmap_lap_forward1", "hdmap_lap_forward1", 1.5, switch_s=183.79),
+            _lap_phase("hdmap_lap_crab2_left", "hdmap_lap_crab2_left", 1.0),
+            _lap_phase("hdmap_lap_crab2_right_return", "hdmap_lap_crab2_right_return", 1.0),
+            _lap_phase("hdmap_lap_forward2", "hdmap_lap_forward2", 1.5, switch_s=226.77),
+            _lap_phase("hdmap_lap_crab3_left", "hdmap_lap_crab3_left", 1.0),
+            _lap_phase("hdmap_lap_crab3_right_return", "hdmap_lap_crab3_right_return", 1.0),
+            _lap_phase("hdmap_lap_forward3", "hdmap_lap_forward3", 1.5),
+        )
+        return ScenarioDefinition(
+            name=name,
+            phases=phases,
+            terminal_margin=3.0,
+        )
+
     if name == "s_curve":
         phase = ScenarioPhase(
             name="s_curve_forward",
             path=ScenarioPath.load_csv(
                 _map_path(share_directory, "s_curve.csv"),
+                closed_loop=False,
+            ),
+            cruise_speed=2.0,
+        )
+        return ScenarioDefinition(name=name, phases=(phase,))
+
+    if name == "straight_long":
+        # A pure 1 km straight reference path with no obstacles or gates,
+        # for sustained high-speed cruise/tracking checks without any
+        # avoidance maneuver in the way.
+        phase = ScenarioPhase(
+            name="straight_long_cruise",
+            path=ScenarioPath.load_csv(
+                _map_path(share_directory, "straight_long.csv"),
                 closed_loop=False,
             ),
             cruise_speed=2.0,
@@ -539,10 +900,114 @@ def load_scenario_definition(
             terminal_margin=3.0,
         )
 
+    if name == "winding_obstacle_course_wide_gates":
+        # Same reference path, gate positions, and standalone obstacles as
+        # "winding_obstacle_course". Only the gate barrier walls are made
+        # thicker along the path direction (obstacle_length x3.5) so each
+        # wall reaches further to the sides of the corridor as the
+        # vehicle passes through, while the lateral reach (barrier_extent)
+        # and gap openings stay unchanged. Kept as a separate scenario so
+        # the baseline "winding_obstacle_course" is untouched.
+        path = ScenarioPath.load_csv(
+            _map_path(share_directory, "winding_obstacle_course.csv"),
+            closed_loop=False,
+        )
+        phase = ScenarioPhase(
+            name="winding_mixed_obstacle_course_wide_gates",
+            path=path,
+            cruise_speed=1.8,
+        )
+
+        gate_specs = (
+            (32.0, 2.60, 4.90, 4.5),
+            (86.0, -2.60, 4.80, 5.5),
+            (148.0, 2.60, 4.80, 5.0),
+            (202.0, -2.60, 4.90, 5.5),
+            (252.0, 2.25, 4.90, 4.5),
+        )
+        gates: list[ScenarioGate] = []
+        obstacles: list[ScenarioObstacle] = []
+        for s_position, center, gap, obstacle_length in gate_specs:
+            gate, lower, upper = gate_on_path(
+                path, s_position, lateral_center=center, gap_width=gap,
+                barrier_extent=14.0, obstacle_length=obstacle_length * 3.5,
+            )
+            gates.append(gate)
+            obstacles.extend((lower, upper))
+
+        obstacles.extend(
+            (
+                obstacle_on_path(
+                    path, 58.0, lateral_offset=-1.50, length=4.5, width=2.0,
+                    yaw_offset=math.radians(25.0),
+                ),
+                obstacle_on_path(
+                    path, 112.0, lateral_offset=2.80, length=5.0, width=3.0,
+                    yaw_offset=math.radians(-18.0),
+                ),
+                obstacle_on_path(
+                    path, 130.0, lateral_offset=-2.80, length=4.5, width=3.0,
+                    yaw_offset=math.radians(22.0),
+                ),
+                obstacle_on_path(
+                    path, 174.0, lateral_offset=0.10, length=6.0, width=2.7,
+                    yaw_offset=math.radians(35.0),
+                ),
+            )
+        )
+        return ScenarioDefinition(
+            name=name, phases=(phase,), obstacles=tuple(obstacles), gates=tuple(gates),
+            terminal_margin=3.0,
+        )
+
+    if name == "parking_ramp_loop":
+        # Straight entry ramp -> loop most of the way around a circle ->
+        # straight exit ramp, walled in on both sides the entire way (a
+        # parking-garage-style ramp loop). This is a flat 2D plane (no Z
+        # axis), so a near-360 deg sweep makes the entry/exit ramps
+        # physically overlap the walled corridor near the start -- there is
+        # no elevation change to separate them like a real multi-level ramp.
+        # 270 deg with a 30 m circle radius keeps the entry- and exit-ramp
+        # walls at least ~11 m apart (checked numerically, well clear of the
+        # 4 m corridor width) while still reading as "most of the way
+        # around a big circle".
+        ramp_length = 15.0
+        transition_length = 4.0
+        circle_radius = 30.0
+        sweep_deg = 270.0
+        corridor_half_width = 2.0
+
+        path = build_ramp_loop_path(
+            ramp_length=ramp_length,
+            transition_length=transition_length,
+            circle_radius=circle_radius,
+            sweep_deg=sweep_deg,
+        )
+        phase = ScenarioPhase(
+            name="parking_ramp_loop",
+            path=path,
+            cruise_speed=1.2,
+        )
+
+        obstacles = tuple(
+            wall_segments_along_path(
+                path, 0.0, path.total_length, lateral_offset=corridor_half_width,
+            )
+            + wall_segments_along_path(
+                path, 0.0, path.total_length, lateral_offset=-corridor_half_width,
+            )
+        )
+        return ScenarioDefinition(
+            name=name, phases=(phase,), obstacles=obstacles, gates=tuple(),
+            terminal_margin=3.0,
+        )
+
     supported = (
-        "stadium, crab_switch, reverse_switch, s_curve, obstacle_avoidance, "
-        "terminal_safe_region, s_curve_obstacles, alternating_gate_corridor, curved_gate_maze, "
-        "winding_obstacle_course, narrow_22m_stop_corridor, narrow_28m_corridor, narrow_offset_corridor"
+        "stadium, crab_switch, spot_turn_course, reverse_switch, hdmap_crab1_switch, fmtc_demo, hdmap_lap_switch, s_curve, "
+        "straight_long, obstacle_avoidance, terminal_safe_region, s_curve_obstacles, "
+        "alternating_gate_corridor, curved_gate_maze, winding_obstacle_course, "
+        "winding_obstacle_course_wide_gates, parking_ramp_loop, "
+        "narrow_22m_stop_corridor, narrow_28m_corridor, narrow_offset_corridor"
     )
     raise ValueError(f"Unsupported scenario '{scenario_name}'. Supported: {supported}")
 
@@ -563,6 +1028,83 @@ def obstacle_vertices(obstacle: ScenarioObstacle) -> np.ndarray:
     s = math.sin(float(obstacle.yaw))
     rotation = np.asarray([[c, -s], [s, c]], dtype=float)
     return local @ rotation.T + np.asarray([obstacle.x, obstacle.y])
+
+
+def _rasterize_obstacle_into_grid(
+    grid: np.ndarray,
+    obstacle: ScenarioObstacle,
+    *,
+    resolution: float,
+    origin_x: float,
+    origin_y: float,
+) -> None:
+    """Conservatively mark cells intersected by one rectangular obstacle."""
+    height, width = grid.shape
+    vertices = obstacle_vertices(obstacle)
+    minimum_x = float(np.min(vertices[:, 0]))
+    maximum_x = float(np.max(vertices[:, 0]))
+    minimum_y = float(np.min(vertices[:, 1]))
+    maximum_y = float(np.max(vertices[:, 1]))
+    x_start = max(
+        0,
+        min(width, int(math.floor((minimum_x - origin_x) / resolution)) - 1),
+    )
+    x_stop = max(
+        0,
+        min(width, int(math.ceil((maximum_x - origin_x) / resolution)) + 1),
+    )
+    y_start = max(
+        0,
+        min(height, int(math.floor((minimum_y - origin_y) / resolution)) - 1),
+    )
+    y_stop = max(
+        0,
+        min(height, int(math.ceil((maximum_y - origin_y) / resolution)) + 1),
+    )
+    if x_start >= x_stop or y_start >= y_stop:
+        return
+
+    xs = origin_x + (np.arange(x_start, x_stop) + 0.5) * resolution
+    ys = origin_y + (np.arange(y_start, y_stop) + 0.5) * resolution
+    xx, yy = np.meshgrid(xs, ys)
+    dx = xx - float(obstacle.x)
+    dy = yy - float(obstacle.y)
+    c = math.cos(float(obstacle.yaw))
+    s = math.sin(float(obstacle.yaw))
+    local_x = c * dx + s * dy
+    local_y = -s * dx + c * dy
+
+    # Exact separating-axis test between the rotated obstacle rectangle and
+    # each axis-aligned costmap cell. A cell is occupied whenever its area
+    # intersects the obstacle, not only when its centre lies inside.
+    cell_half = 0.5 * resolution
+    half_length = 0.5 * float(obstacle.length)
+    half_width = 0.5 * float(obstacle.width)
+    abs_c = abs(c)
+    abs_s = abs(s)
+    overlap_obstacle_x = (
+        np.abs(local_x)
+        <= half_length + cell_half * (abs_c + abs_s) + 1.0e-12
+    )
+    overlap_obstacle_y = (
+        np.abs(local_y)
+        <= half_width + cell_half * (abs_c + abs_s) + 1.0e-12
+    )
+    overlap_grid_x = (
+        np.abs(dx)
+        <= cell_half + half_length * abs_c + half_width * abs_s + 1.0e-12
+    )
+    overlap_grid_y = (
+        np.abs(dy)
+        <= cell_half + half_length * abs_s + half_width * abs_c + 1.0e-12
+    )
+    intersects = (
+        overlap_obstacle_x
+        & overlap_obstacle_y
+        & overlap_grid_x
+        & overlap_grid_y
+    )
+    grid[y_start:y_stop, x_start:x_stop][intersects] = 100
 
 
 def rasterize_scenario_costmap(
@@ -601,61 +1143,70 @@ def rasterize_scenario_costmap(
     grid = np.zeros((height, width), dtype=np.int8)
 
     for obstacle in scenario.obstacles:
-        vertices = obstacle_vertices(obstacle)
-        minimum_x = float(np.min(vertices[:, 0]))
-        maximum_x = float(np.max(vertices[:, 0]))
-        minimum_y = float(np.min(vertices[:, 1]))
-        maximum_y = float(np.max(vertices[:, 1]))
-        x_start = max(0, int(math.floor((minimum_x - origin_x) / resolution)) - 1)
-        x_stop = min(width, int(math.ceil((maximum_x - origin_x) / resolution)) + 1)
-        y_start = max(0, int(math.floor((minimum_y - origin_y) / resolution)) - 1)
-        y_stop = min(height, int(math.ceil((maximum_y - origin_y) / resolution)) + 1)
-
-        xs = origin_x + (np.arange(x_start, x_stop) + 0.5) * resolution
-        ys = origin_y + (np.arange(y_start, y_stop) + 0.5) * resolution
-        xx, yy = np.meshgrid(xs, ys)
-        dx = xx - float(obstacle.x)
-        dy = yy - float(obstacle.y)
-        c = math.cos(float(obstacle.yaw))
-        s = math.sin(float(obstacle.yaw))
-        local_x = c * dx + s * dy
-        local_y = -s * dx + c * dy
-
-        # Exact separating-axis test between the rotated obstacle rectangle
-        # and each axis-aligned costmap cell.  A cell is occupied whenever
-        # its area intersects the obstacle, rather than only when its centre
-        # lies inside.  This makes the rasterized obstacle a conservative
-        # superset of the continuous obstacle geometry.
-        cell_half = 0.5 * resolution
-        half_length = 0.5 * float(obstacle.length)
-        half_width = 0.5 * float(obstacle.width)
-        abs_c = abs(c)
-        abs_s = abs(s)
-        overlap_obstacle_x = (
-            np.abs(local_x)
-            <= half_length + cell_half * (abs_c + abs_s) + 1.0e-12
+        _rasterize_obstacle_into_grid(
+            grid,
+            obstacle,
+            resolution=resolution,
+            origin_x=origin_x,
+            origin_y=origin_y,
         )
-        overlap_obstacle_y = (
-            np.abs(local_y)
-            <= half_width + cell_half * (abs_c + abs_s) + 1.0e-12
-        )
-        overlap_world_x = (
-            np.abs(dx)
-            <= cell_half + half_length * abs_c + half_width * abs_s + 1.0e-12
-        )
-        overlap_world_y = (
-            np.abs(dy)
-            <= cell_half + half_length * abs_s + half_width * abs_c + 1.0e-12
-        )
-        intersects = (
-            overlap_obstacle_x
-            & overlap_obstacle_y
-            & overlap_world_x
-            & overlap_world_y
-        )
-        grid[y_start:y_stop, x_start:x_stop][intersects] = 100
 
     return grid, origin_x, origin_y
+
+
+def rasterize_vehicle_costmap(
+    scenario: ScenarioDefinition,
+    *,
+    vehicle_x: float,
+    vehicle_y: float,
+    vehicle_yaw: float,
+    resolution: float = 0.2,
+    size_m: float = 60.0,
+) -> tuple[np.ndarray, float, float, float]:
+    """Rasterize a vehicle-centred costmap whose cell axes follow body yaw.
+
+    The returned origin is the lower-left grid corner expressed in the
+    scenario's odom frame. Together with the returned yaw it is directly
+    suitable for ``OccupancyGrid.info.origin``.
+    """
+    values = (vehicle_x, vehicle_y, vehicle_yaw, resolution, size_m)
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError("Vehicle costmap inputs must be finite")
+    if resolution <= 0.0 or size_m <= 0.0:
+        raise ValueError("Vehicle costmap resolution and size must be positive")
+
+    cell_count = max(2, int(math.ceil(size_m / resolution)))
+    extent = cell_count * resolution
+    local_origin = -0.5 * extent
+    grid = np.zeros((cell_count, cell_count), dtype=np.int8)
+
+    vehicle_c = math.cos(vehicle_yaw)
+    vehicle_s = math.sin(vehicle_yaw)
+    for obstacle in scenario.obstacles:
+        dx = float(obstacle.x) - vehicle_x
+        dy = float(obstacle.y) - vehicle_y
+        body_obstacle = ScenarioObstacle(
+            x=vehicle_c * dx + vehicle_s * dy,
+            y=-vehicle_s * dx + vehicle_c * dy,
+            length=float(obstacle.length),
+            width=float(obstacle.width),
+            yaw=float(obstacle.yaw) - vehicle_yaw,
+        )
+        _rasterize_obstacle_into_grid(
+            grid,
+            body_obstacle,
+            resolution=resolution,
+            origin_x=local_origin,
+            origin_y=local_origin,
+        )
+
+    origin_x = (
+        vehicle_x + vehicle_c * local_origin - vehicle_s * local_origin
+    )
+    origin_y = (
+        vehicle_y + vehicle_s * local_origin + vehicle_c * local_origin
+    )
+    return grid, float(origin_x), float(origin_y), float(vehicle_yaw)
 
 
 def global_display_segments(

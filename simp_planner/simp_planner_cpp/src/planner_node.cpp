@@ -539,7 +539,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
     if (planner_ && !planner_rebuild_required(built, revision_state(input))) return;
     const bool mode_changed = planner_ && planner_mode_revision_ != input.mode_revision;
     const auto old_cap = (!mode_changed && planner_)
-        ? planner_->feasible_speed_cap() : std::nullopt;
+        ? planner_->feasible_speed_cap() : std::nullopt; 
     const int old_count = (!mode_changed && planner_)
         ? planner_->feasible_speed_cap_success_count() : 0;
     const auto old_hint = (!mode_changed && planner_)
@@ -615,6 +615,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
           now_ns() + static_cast<std::int64_t>(
               std::llround(handover_timing_.recommended_lead_sec() * 1.0e9)),
           command_dt_);
+      const auto handover_start = std::chrono::steady_clock::now();
       const auto handover = predict_handover_state(
           input->state, input->body_yaw, input->state_time_ns, scheduled_start,
           active ? std::optional<std::int64_t>(active->start_ns) : std::nullopt,
@@ -817,6 +818,10 @@ class PlannerNodeCpp final : public rclcpp::Node {
     DriveModeControlState mode_state;
     bool mode_ready;
     double measured_speed;
+    bool resumed_after_turn = false;
+    bool waiting_clearance = false;
+    std::optional<BodyCommand> rotating_command;
+    ReferencePathMsg::SharedPtr deferred;
     PlannerState tracking_state;
     double tracking_body_yaw;
     double tracking_body_yaw_rate;
@@ -826,6 +831,87 @@ class PlannerNodeCpp final : public rclcpp::Node {
       measured_speed = current_state_.speed;
       mode_ready = mode_supervisor_.ready();
       mode_state = mode_supervisor_.state(measured_speed, mode_change_stop_speed_);
+      if (maneuver_.on_mode_ready(mode_supervisor_)) {
+        reference_path_ = std::move(pending_post_turn_path_);
+        pending_post_turn_path_.reset();
+        reference_mode_ = *pending_spot_turn_mode_;
+        pending_spot_turn_mode_.reset();
+        ++path_revision_;
+        ++command_revision_;
+        resumed_after_turn = true;
+        deferred = std::move(deferred_reference_);
+      }
+      spot_turn_waiting_clearance_ = false;
+      // terminal_hold_latched()도 반드시 같이 봐야 한다: measured_speed <=
+      // mode_change_stop_speed_ 만으로는 "코너까지 다 몰고 도착해 멈췄다"와
+      // "아직 그 자리(예: 코스 시작점)에서 출발도 안 했다"를 구분할 수 없다.
+      // 내부 코너(split_reference_path_at_corner)는 메시지가 도착하자마자
+      // pending_spot_turn_target_yaw_를 예약하므로, 차량이 실제로 그
+      // before 구간을 끝까지 몰아 terminal_hold가 걸릴 때까지는 기다려야
+      // 한다. 경계 코너는 이전 phase가 이미 도착해 있어야 새 메시지가
+      // 오므로 이 조건이 항상 먼저 참이 되어 있어 기존 동작에는 영향이
+      // 없다.
+      if (mode_ready && maneuver_.state() == SpotTurnManeuverState::Inactive &&
+          mode_supervisor_.current_mode() == reference_mode_ && received_costmap_ &&
+          measured_speed <= mode_change_stop_speed_ && terminal_hold_latched() &&
+          pending_spot_turn_target_yaw_) {
+        if (spot_turn_feasible(*costmap_, current_state_, config_.vehicle, spot_turn_config_.safety_margin)) {
+          maneuver_.trigger(*pending_spot_turn_target_yaw_, *pending_spot_turn_mode_);
+          mode_supervisor_.set_requested_mode(DriveMode::SpotTurn);
+          pending_spot_turn_target_yaw_.reset();
+          ++command_revision_;
+          mode_ready = false;
+          mode_state = mode_supervisor_.state(measured_speed, mode_change_stop_speed_);
+        } else {
+          spot_turn_waiting_clearance_ = true;
+        }
+      }
+      waiting_clearance = spot_turn_waiting_clearance_;
+      if (mode_ready) {
+        const auto previous_request = mode_supervisor_.requested_mode();
+        rotating_command = maneuver_.sample(
+            command_dt_, current_body_yaw_, current_body_yaw_rate_, mode_supervisor_);
+        if (mode_supervisor_.requested_mode() != previous_request) ++command_revision_;
+        if (rotating_command) {
+          rotating_command->segment_start_x = rotating_command->segment_end_x = current_state_.x;
+          rotating_command->segment_start_y = rotating_command->segment_end_y = current_state_.y;
+          rotating_command->segment_start_heading = current_body_yaw_;
+          rotating_command->segment_end_heading =
+              wrap_angle(current_body_yaw_ + rotating_command->yaw_rate * command_dt_);
+          // Spot-turn-local handover: planning_callback() returns immediately
+          // while input->spot_turn_active is true, so predict_handover_state()
+          // never runs during a turn, and odom_callback() only seeds state
+          // once for the whole run (see both call sites). Without this,
+          // measured_yaw handed to YawRotationProfile::sample() next tick
+          // would stay frozen at the pre-turn heading forever, error would
+          // never shrink, and done() could never become true. Advance by
+          // exactly what we just commanded (Vx=Vy=0, pure yaw_rate) so the
+          // next sample() call sees progress.
+          current_body_yaw_ = rotating_command->segment_end_heading;
+          current_body_yaw_rate_ = rotating_command->yaw_rate;
+          current_state_time_ns_ = stamp_ns;
+        }
+      }
+    }
+    if (resumed_after_turn) {
+      invalidate_motion_plan();
+      {
+        std::lock_guard<std::mutex> lock(terminal_hold_mutex_);
+        terminal_hold_.reset();
+      }
+      if (deferred) path_callback(deferred);
+      request_replan("SPOT_TURN_COMPLETED", true);
+    }
+    if (rotating_command || waiting_clearance) {
+      const auto command = rotating_command.value_or(zero_command());
+      invalidate_motion_plan();
+      {
+        std::lock_guard<std::mutex> lock(execution_mutex_);
+        last_command_ = command;
+      }
+      publish_execution_state_if_changed(rotating_command ? "SPOT_TURN_ROTATING" : "SPOT_TURN_WAITING_CLEARANCE");
+      publish_command(command, 0, stamp_ns);
+      return;
       tracking_state = current_state_;
       tracking_body_yaw = current_body_yaw_;
       tracking_body_yaw_rate = current_body_yaw_rate_;

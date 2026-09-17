@@ -1,0 +1,21 @@
+기본 디버깅 명령어
+ros2 run simp_planner_tools  planning_call_count_report_node --ros-args -p scenario:=winding_obstacle_course
+
+ros2 launch simp_planner_tools simulation.launch.py scenario:=winding_obstacle_course target_speed:=3.3 costmap_resolution:=0.1
+
+RVIZ 시뮬 명령어
+(전체 트랙)
+ros2 launch simp_planner_tools simulation.launch.py \
+  scenario:=hdmap_lap_switch use_rviz:=true \
+  target_speed:=3.5 costmap_resolution:=0.1
+
+(워크샵 데모)
+ros2 launch simp_planner_tools simulation.launch.py \
+  scenario:=fmtc_demo use_rviz:=true \
+  target_speed:=4.2 costmap_resolution:=0.1
+
+
+(제자리턴 시나리오 — 7개 phase, 제자리턴 3회)
+ros2 launch simp_planner_tools simulation.launch.py \
+  scenario:=spot_turn_course use_rviz:=true \
+  target_speed:=4.2 costmap_resolution:=0.1
