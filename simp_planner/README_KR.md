@@ -35,8 +35,9 @@ yaw_rate_cmd = yaw_rate_ff + K_lat * e_lat + K_heading * e_heading
 
 위치 오차의 기준은 장애물 회피를 포함한 선택 궤적의 진행 방향이다.
 헤딩 오차는 계획된 차체 yaw와 odometry pose yaw의 차이이다.
-기존 odometry 시각 정렬을 사용하며, 다음 plan의 handover 예측은 원래
-feedforward 방식이다. 기존 정지 명령·안전정지·모드 전환 처리는 유지한다.
+최신 odometry는 P 보정용으로 별도 보관하고 실행 시각에 맞춰 정렬한다.
+계획 상태는 최초 odometry로 한 번 초기화한 뒤 handover 예측으로만 갱신한다.
+따라서 P 보정용 odometry가 다음 plan의 예측 상태를 덮어쓰지 않는다. 기존 정지 명령·안전정지·모드 전환 처리는 유지한다.
 
 P 보정에는 별도의 상한, 가속도·jerk 제한기, 저속 완화를 넣지 않는다.
 원래 Planner/Allocation의 제약 계산은 유지되며, 그 계산 이후 P 항을 더한다.
