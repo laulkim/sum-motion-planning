@@ -490,7 +490,7 @@ Planner의 `mode_change_stop_speed_mps`와 simulator의
 | `oriented_footprint_translation_step_m` | 0.20 m | Planner final swept check |
 | `oriented_footprint_yaw_step_deg` | 2.0° | Planner final swept check |
 | `save_period` | 10.0 s | debug snapshot 저장 주기 |
-| `debug_output_dir` | `/home/sum/Desktop/simp_planner/simp_planner_debug` | debug root |
+| `debug_output_dir` | `~/Desktop/simp_planner/simp_planner_debug` | debug root |
 
 기본 `stadium` 실행에서 sentinel을 해석한 최종 주요값:
 
@@ -671,7 +671,7 @@ Launch 기본값:
 | map | `simp_planner_tools/maps/stadium_track.csv` |
 | target speed | 2.0 m/s |
 | debug save period | 10.0 s |
-| debug root | `/home/sum/Desktop/simp_planner/simp_planner_debug` |
+| debug root | `~/Desktop/simp_planner/simp_planner_debug` |
 
 `track_map_provider_node` 기본값:
 
@@ -699,7 +699,7 @@ Provider heartbeat는 1.0 s이고 costmap은 전체 free cell이다. 이 launch�
 | ROS parameter | 기본값 | 의미 |
 |---|---:|---|
 | `scenario` | `stadium` | 진단 scenario 이름 |
-| `output_dir` | `/home/sum/Desktop/simp_planner/simp_planner_debug` | 출력 root |
+| `output_dir` | `~/Desktop/simp_planner/simp_planner_debug` | 출력 root |
 | `save_period` | 10.0 s | snapshot 주기 |
 | `frame_id` | `odom` | frame |
 | `vehicle_length` | 3.0 m | 시각화 차량 길이 |

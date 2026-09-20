@@ -549,7 +549,7 @@ class PlanningCallCountReportNode(Node):
         super().__init__("planning_call_count_report_node")
         self.declare_parameter("scenario", "run")
         self.declare_parameter(
-            "output_dir", "/home/sum/Desktop/simp_planner/simp_planner_debug"
+            "output_dir", str(Path.home() / "Desktop" / "simp_planner" / "simp_planner_debug")
         )
 
         scenario = str(self.get_parameter("scenario").value)

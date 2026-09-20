@@ -49,7 +49,7 @@ class DebugPlotNode(Node):
         super().__init__("debug_plot_node")
         self.declare_parameter("scenario", "stadium")
         self.declare_parameter(
-            "output_dir", "/home/sum/Desktop/simp_planner/simp_planner_debug"
+            "output_dir", str(Path.home() / "Desktop" / "simp_planner" / "simp_planner_debug")
         )
         self.declare_parameter("save_period", 10.0)
         self.declare_parameter("frame_id", "odom")
