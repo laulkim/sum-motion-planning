@@ -1,5 +1,9 @@
 std_msgs/Header header
 uint64 plan_id
+# Planner execution state paired atomically with this nominal command/plan_id.
+# ACTIVE_PLAN, SAFETY_STOP, MODE_STOP, MODE_WAIT, TERMINAL_HOLD, IDLE,
+# SPOT_TURN_ROTATING or SPOT_TURN_WAITING_CLEARANCE.
+string execution_state
 uint32 interval_index
 float64 trajectory_time
 float64 vx

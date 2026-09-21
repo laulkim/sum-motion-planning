@@ -12,6 +12,7 @@
 #include <simp_planner_msgs/msg/drive_mode_state.hpp>
 #include <simp_planner_msgs/msg/executed_command.hpp>
 #include <simp_planner_msgs/msg/reference_path.hpp>
+#include <simp_planner_msgs/msg/trajectory.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/u_int8.hpp>
@@ -39,6 +40,7 @@ namespace {
 using ReferencePathMsg = simp_planner_msgs::msg::ReferencePath;
 using ExecutedCommandMsg = simp_planner_msgs::msg::ExecutedCommand;
 using DriveModeStateMsg = simp_planner_msgs::msg::DriveModeState;
+using TrajectoryMsg = simp_planner_msgs::msg::Trajectory;
 
 constexpr double kMotionThreshold = 0.03;
 
@@ -233,6 +235,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
         "/planner/selected_trajectory", static_qos);
     trajectory_data_pub_ = create_publisher<ReferencePathMsg>(
         "/planner/selected_trajectory_data", static_qos);
+    timed_trajectory_pub_ = create_publisher<TrajectoryMsg>(
+        "/planner/trajectory", static_qos);
     mode_command_pub_ = create_publisher<std_msgs::msg::UInt8>(
         "/vehicle/drive_mode_command", static_qos);
 
@@ -1584,6 +1588,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
     ExecutedCommandMsg executed;
     executed.header = stamped.header;
     executed.plan_id = plan_id;
+    executed.execution_state = current_execution_state();
     executed.interval_index = static_cast<std::uint32_t>(command.action_index);
     executed.trajectory_time = command.trajectory_time;
     executed.vx = command.vx;
@@ -1610,6 +1615,28 @@ class PlannerNodeCpp final : public rclcpp::Node {
 
   void publish_trajectory(const ExecutablePlan& plan) {
     const auto stamp = get_clock()->now();
+    TrajectoryMsg timed_message;
+    timed_message.header.stamp = stamp;
+    timed_message.header.frame_id = plan.frame_id;
+    timed_message.plan_id = plan.plan_id;
+    timed_message.start_time = rclcpp::Time(plan.start_ns, stamp.get_clock_type());
+    const auto& allocation = plan.allocation;
+    const auto& timed_motion = allocation.trajectory;
+    timed_message.points.reserve(timed_motion.t.size());
+    // Keep the allocation's full horizon, body yaw and original time origin.
+    for (std::size_t i = 0; i < timed_motion.t.size(); ++i) {
+      simp_planner_msgs::msg::TrajectoryPoint point;
+      point.x = timed_motion.x.at(i);
+      point.y = timed_motion.y.at(i);
+      point.yaw = allocation.psi.at(i);
+      point.vx = allocation.vx.at(i);
+      point.vy = allocation.vy.at(i);
+      point.yaw_rate = allocation.yaw_rate.at(i);
+      point.time_from_start = timed_motion.t[i];
+      point.mode = static_cast<std::uint8_t>(timed_motion.drive_mode.at(i));
+      timed_message.points.push_back(point);
+    }
+    timed_trajectory_pub_->publish(timed_message);
     nav_msgs::msg::Path path_message;
     path_message.header.stamp = stamp;
     path_message.header.frame_id = plan.frame_id;
@@ -1945,6 +1972,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr execution_state_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr trajectory_pub_;
   rclcpp::Publisher<ReferencePathMsg>::SharedPtr trajectory_data_pub_;
+  rclcpp::Publisher<TrajectoryMsg>::SharedPtr timed_trajectory_pub_;
   rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr mode_command_pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<ReferencePathMsg>::SharedPtr path_sub_;

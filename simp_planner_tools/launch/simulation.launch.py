@@ -17,6 +17,7 @@ _HDMAP_DIR = os.path.join(get_package_share_directory("simp_planner_tools"), "HD
 
 def _resolved_nodes(context):
     scenario_name = LaunchConfiguration("scenario").perform(context)
+    use_tracker = IfCondition(LaunchConfiguration("use_tracking_controller")).evaluate(context)
     target_speed = float(LaunchConfiguration("target_speed").perform(context))
     save_period = float(LaunchConfiguration("save_period").perform(context))
     debug_output_dir = LaunchConfiguration("debug_output_dir").perform(context)
@@ -109,6 +110,7 @@ def _resolved_nodes(context):
             executable="planner_node_cpp",
             name="planner_node_cpp",
             output="screen",
+            remappings=[("/cmd_vel", "/planner/cmd_vel")] if use_tracker else [],
             parameters=[
                 {
                     "command_frequency_hz": command_frequency_hz,
@@ -118,6 +120,19 @@ def _resolved_nodes(context):
                     "oriented_footprint_yaw_step_deg": footprint_yaw_step,
                 }
             ],
+        ),
+        Node(
+            package="simp_tracker",
+            executable="tracking_controller_node",
+            name="tracking_controller",
+            output="screen",
+            condition=IfCondition(LaunchConfiguration("use_tracking_controller")),
+            parameters=[{
+                "control_frequency_hz": float(LaunchConfiguration("control_frequency_hz").perform(context)),
+                "kx": float(LaunchConfiguration("tracking_kx").perform(context)),
+                "ky": float(LaunchConfiguration("tracking_ky").perform(context)),
+                "k_yaw": float(LaunchConfiguration("tracking_k_yaw").perform(context)),
+            }],
         ),
         Node(
             package="simp_planner_tools",
@@ -200,6 +215,11 @@ def generate_launch_description() -> LaunchDescription:
                 description="Vehicle-side drive-mode transition duration.",
             ),
             DeclareLaunchArgument("command_frequency_hz", default_value="100.0"),
+            DeclareLaunchArgument("use_tracking_controller", default_value="true"),
+            DeclareLaunchArgument("control_frequency_hz", default_value="50.0"),
+            DeclareLaunchArgument("tracking_kx", default_value="3.0"),
+            DeclareLaunchArgument("tracking_ky", default_value="4.0"),
+            DeclareLaunchArgument("tracking_k_yaw", default_value="2.0"),
             DeclareLaunchArgument(
                 "oriented_footprint_circle_count", default_value="0",
                 description="0 uses the scenario-recommended footprint resolution.",

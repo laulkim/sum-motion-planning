@@ -2,6 +2,13 @@
 
 입력 시나리오, reference path/costmap 생성, debug plot 및 통합 launch를 제공합니다.
 
+통합 launch는 기본적으로 Python `simp_tracker`를 포함합니다. 플래너의 nominal
+속도 토픽은 `/planner/cmd_vel`, 제어기 최종 출력은 `/cmd_vel`입니다.
+`use_tracking_controller:=false`로 기존 직접 연결을 사용할 수 있습니다.
+제어기는 기본 50 Hz, 플래너 명령은 100 Hz이며 `control_frequency_hz`와
+`command_frequency_hz`로 조정합니다. 제어식과 파라미터는
+[`simp_tracker/README_KR.md`](../simp_tracker/README_KR.md)를 참고하십시오.
+
 ## 차량 기준 local costmap
 
 Scenario Manager는 odom을 받은 뒤 캡처 시점 차량 Body 축에 정렬된

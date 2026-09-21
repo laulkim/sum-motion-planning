@@ -36,6 +36,11 @@ class PlanarVelocitySimNode(Node):
         self.declare_parameter("mode_state_topic", "/vehicle/drive_mode_state")
         self.declare_parameter("odom_frame", "odom")
         self.declare_parameter("base_frame", "base_link")
+        self.declare_parameter("command_timeout_sec", 0.5)
+        self.command_timeout_sec = float(self.get_parameter("command_timeout_sec").value)
+        if not math.isfinite(self.command_timeout_sec) or self.command_timeout_sec <= 0.0:
+            raise ValueError("command_timeout_sec must be finite and positive")
+        self.last_command_time = None
 
         update_rate_hz = float(self.get_parameter("update_rate_hz").value)
         mode_state_rate_hz = float(self.get_parameter("mode_state_rate_hz").value)
@@ -100,9 +105,11 @@ class PlanarVelocitySimNode(Node):
         self.publish_mode_state()
 
     def cmd_vel_callback(self, message: Twist) -> None:
-        self.command_vx = float(message.linear.x)
-        self.command_vy = float(message.linear.y)
-        self.command_yaw_rate = float(message.angular.z)
+        values = (float(message.linear.x), float(message.linear.y), float(message.angular.z))
+        self.command_vx, self.command_vy, self.command_yaw_rate = (
+            values if all(math.isfinite(value) for value in values) else (0.0, 0.0, 0.0)
+        )
+        self.last_command_time = self.get_clock().now()
 
     def mode_command_callback(self, message: UInt8) -> None:
         requested = int(message.data)
@@ -146,6 +153,10 @@ class PlanarVelocitySimNode(Node):
         self.last_update_time = now
         if dt <= 0.0:
             return
+
+        age = (now - self.last_command_time).nanoseconds * 1e-9 if self.last_command_time is not None else -1.0
+        if age < 0.0 or age > self.command_timeout_sec:
+            self.command_vx = self.command_vy = self.command_yaw_rate = 0.0
 
         completed = self.mode_model.update(now.nanoseconds * 1.0e-9)
         if completed:
