@@ -16,7 +16,7 @@ from ament_index_python.packages import get_package_share_directory
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as PathMessage
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from simp_planner_msgs.msg import DriveModeState, ExecutedCommand
+from simp_planner_msgs.msg import DriveModeState, ExecutedCommand, Trajectory
 from simp_planner_msgs.msg import ReferencePath as ReferencePathMessage
 from std_msgs.msg import Float64, String, UInt8
 
@@ -24,6 +24,7 @@ from .debug_allocation_metrics import compute_allocation_debug_sample
 from .debug_plot_renderer import render_debug_snapshot
 from .debug_scenario_geometry import scenario_obstacle_polygons
 from .debug_signal_history import SourceTimeAligner
+from .debug_position_history import PositionComparison
 from .diagnostic_metrics import OpenPathGeometry, tracking_error_to_executed_segment
 from .path_geometry import PathProjection, project_open_path, wrap_angle
 
@@ -52,6 +53,8 @@ class DebugPlotNode(Node):
             "output_dir", str(Path.home() / "Desktop" / "simp_planner" / "simp_planner_debug")
         )
         self.declare_parameter("save_period", 10.0)
+        self.declare_parameter("use_tracking_controller", True)
+        self.use_tracking_controller = bool(self.get_parameter("use_tracking_controller").value)
         self.declare_parameter("frame_id", "odom")
         self.declare_parameter("vehicle_length", 3.0)
         self.declare_parameter("vehicle_width", 2.0)
@@ -179,6 +182,11 @@ class DebugPlotNode(Node):
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.position_comparison = PositionComparison()
+        self.position_history = []
+        self.create_subscription(
+            Trajectory, "/planner/trajectory", self.trajectory_callback, static_qos
         )
         self.create_subscription(Odometry, "/odom", self.odom_callback, 50)
         self.create_subscription(
@@ -485,7 +493,14 @@ class DebugPlotNode(Node):
         self.mode = int(message.current_mode)
         self.vehicle_status = int(message.status)
 
+    def trajectory_callback(self, message: Trajectory) -> None:
+        try:
+            self.position_comparison.on_trajectory(message)
+        except ValueError as error:
+            self.get_logger().warning(f"Position plot: {error}")
+
     def executed_command_callback(self, message: ExecutedCommand) -> None:
+        self.position_comparison.on_command(message)
         self.mark("cmd_vel")
         receive_time = self.elapsed()
         publish_time = self.cmd_time_aligner.align(
@@ -717,6 +732,9 @@ class DebugPlotNode(Node):
         twist = message.twist.twist
         x = float(pose.position.x)
         y = float(pose.position.y)
+        # 기준 경로를 아직 받지 않았어도 목표/실제 위치 비교는 독립적으로 기록한다.
+        target_x, target_y = self.position_comparison.reference_xy(message)
+        self.position_history.append((elapsed, target_x, target_y, x, y))
         body_yaw = quaternion_to_yaw(
             pose.orientation.x, pose.orientation.y,
             pose.orientation.z, pose.orientation.w,
@@ -1032,6 +1050,8 @@ class DebugPlotNode(Node):
         timing = copy.deepcopy(self.planner_section("timing"))
         execution = copy.deepcopy(self.planner_section("execution"))
         return {
+            "position_history": list(self.position_history),
+            "use_tracking_controller": self.use_tracking_controller,
             "scenario_name": self.scenario_name,
             "vehicle_length": self.vehicle_length,
             "vehicle_width": self.vehicle_width,

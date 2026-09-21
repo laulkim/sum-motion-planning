@@ -143,6 +143,7 @@ def _resolved_nodes(context):
                 {
                     "scenario": scenario_name,
                     "save_period": save_period,
+                    "use_tracking_controller": use_tracker,
                     "output_dir": debug_output_dir,
                 }
             ],

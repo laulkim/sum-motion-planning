@@ -69,3 +69,38 @@ ros2 launch simp_planner_tools simulation.launch.py \
 ```
 
 물리 통로는 global `y=0`을 중심으로 70 m 직선 구간이며, reference path는 통로 내부에서 약 `+0.25 m` 편향됩니다. 이 시나리오는 0.05 m Costmap과 16-circle footprint를 사용합니다.
+## 목표 궤적과 실제 위치 비교 (Tracker ON/OFF 공통)
+
+`debug_plot_node`는 `/planner/trajectory`와 `/planner/executed_command`를 받아,
+`/odom.header.stamp`와 같은 시각의 활성 계획 목표 위치를 보간합니다.
+Tracker 전용 진단 토픽을 사용하지 않으므로 Tracker를 꺼도 같은 기준으로 비교합니다.
+실행 명령의 `plan_id`에 해당하는 계획을 사용하며, 새 계획 수신만으로 목표를 바꾸지 않습니다.
+
+워크스페이스에서 필요한 패키지를 빌드한 뒤 실행합니다.
+
+```bash
+cd /home/sum/ros2_ws
+source /opt/ros/jazzy/setup.bash
+colcon build --symlink-install --packages-select \
+  simp_planner_msgs simp_planner_cpp planar_velocity_sim simp_tracker simp_planner_tools
+source install/setup.bash
+
+# ON 실행을 종료한 뒤 false로 바꾸어 OFF 결과를 별도로 기록합니다.
+ros2 launch simp_planner_tools simulation.launch.py \
+  scenario:=s_curve use_tracking_controller:=true \
+  save_period:=5.0 debug_output_dir:=/tmp/simp_position_plots
+```
+
+결과는 `/tmp/simp_position_plots/s_curve/<실행시각>/`에 저장됩니다.
+
+- `position_comparison_latest.png`: 최신 목표/실제 x·y 위치, x·y 오차, 거리 오차 그래프.
+- `position_comparison_<경과초>.png`: 주기별 그래프 이력. 제목에 Tracker ON/OFF 표시.
+- `position_comparison.csv`: 마지막 그래프 저장 시점까지의 전체 위치와 오차 데이터.
+
+위치는 궤적의 전역 좌표계 기준이며 단위는 m입니다.
+오차는 `dx = 실제 x - 목표 x`, `dy = 실제 y - 목표 y`,
+거리 오차는 `sqrt(dx² + dy²)`입니다. 차체 축 기준의 `/tracker/error`와는 다릅니다.
+정지·모드 전환·계획 시작 전·만료 후·계획 미수신·프레임 불일치 구간이나,
+측정 시각 기준 실행 명령이 0.25초보다 오래된 구간은 목표/오차를 NaN으로 기록합니다.
+그래프에서도 해당 구간은 끊어 표시하며 실제 위치는 계속 기록합니다.
+이미지는 저장 주기마다 갱신되는 파일이며 실시간 GUI 창을 열지는 않습니다.
