@@ -33,7 +33,7 @@ def main() -> int:
     from ament_index_python.packages import get_package_prefix, get_package_share_directory
     from nav_msgs.msg import Odometry
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-    from simp_planner_msgs.msg import DriveModeState
+    from simp_planner_msgs.msg import DriveModeState, ExecutedCommand, Trajectory, ExecutionStatus
     from std_msgs.msg import String
     from simp_planner_tools.models import DriveMode, MODE_BETA_CENTER
     from simp_planner_tools.scenario_definition import load_scenario_definition
@@ -96,6 +96,19 @@ def main() -> int:
                                  "corner_distance": distance, "target_body_yaw": target_yaw})
         print(f"turn {len(summary['turns'])}: phase {phase}, corner distance {distance:.3f} m", flush=True)
 
+    def executed_callback(msg):
+        latest["executed_reference"] = {"x": msg.segment_start_x, "y": msg.segment_start_y,
+                                        "speed": msg.planned_speed, "plan_id": msg.plan_id}
+    def trajectory_callback(msg):
+        if msg.trajectory_type != "ACTIVE_PLAN":
+            print(f"reference {msg.plan_id} {msg.trajectory_type}: "
+                  f"x={msg.points[0].x:.3f}->{msg.points[-1].x:.3f} "
+                  f"v={msg.points[0].command.planned_speed:.3f}->{msg.points[-1].command.planned_speed:.3f}", flush=True)
+    def execution_status_callback(msg):
+        latest["tracker"] = {"state": msg.execution_state, "acceptance": msg.acceptance}
+    node.create_subscription(ExecutedCommand, "/planner/executed_command", executed_callback, 200)
+    node.create_subscription(Trajectory, "/planner/trajectory", trajectory_callback, 10)
+    node.create_subscription(ExecutionStatus, "/tracker/execution_status", execution_status_callback, 10)
     node.create_subscription(String, "/scenario/status", scenario_callback, qos)
     node.create_subscription(String, "/planner/status", planner_callback, qos)
     node.create_subscription(Odometry, "/odom", odom_callback, 50)
@@ -106,6 +119,7 @@ def main() -> int:
         ("simp_planner_tools", "scenario_manager_node", {
             "scenario": "spot_turn_course", "target_speed": args.speed,
             "costmap_resolution": 0.1, "costmap_size_m": 60.0, "costmap_publish_hz": 5.0}),
+        ("simp_planner_cpp", "simp_tracker", {}),
         ("simp_planner_cpp", "planner_node_cpp", {}),
     ]
     processes, logs = [], []
@@ -156,6 +170,8 @@ def main() -> int:
         summary["elapsed_seconds"] = time.monotonic() - started
         summary["scenario"] = latest["scenario"]
         summary["planner"] = latest["planner"]
+        summary["executed_reference"] = latest.get("executed_reference")
+        summary["tracker"] = latest.get("tracker")
         for process in processes:
             if process.poll() is None:
                 process.send_signal(signal.SIGINT)

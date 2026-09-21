@@ -1,0 +1,13 @@
+std_msgs/Header header
+string session_id
+uint64 plan_id
+uint64 execution_epoch
+uint64 base_plan_id
+builtin_interfaces/Time start_time
+float64 duration
+string trajectory_type
+string stop_reason
+uint8 drive_mode
+float64 fallback_deceleration
+float64 fallback_jerk
+TrajectoryPoint[] points

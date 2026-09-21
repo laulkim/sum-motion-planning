@@ -1,0 +1,8 @@
+std_msgs/Header header
+string session_id
+uint64 execution_epoch
+uint64 active_plan_id
+uint64 pending_plan_id
+uint64 received_plan_id
+string acceptance
+string execution_state

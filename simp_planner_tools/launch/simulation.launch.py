@@ -6,7 +6,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
+from launch_ros.actions import Node, SetParameter
 
 from simp_planner_tools.scenario_definition import load_scenario_definition
 
@@ -73,6 +73,8 @@ def _resolved_nodes(context):
     initial_body_yaw = float(first_path.yaw[0]) - mode_heading_offset
 
     return [
+        Node(package="simp_planner_cpp", executable="simp_tracker", name="simp_tracker",
+             output="screen", parameters=[{"command_frequency_hz": command_frequency_hz}]),
         Node(
             package="planar_velocity_sim",
             executable="planar_velocity_sim_node",
@@ -187,6 +189,8 @@ def _resolved_nodes(context):
 def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
+            DeclareLaunchArgument("use_sim_time", default_value="false"),
+            SetParameter(name="use_sim_time", value=LaunchConfiguration("use_sim_time")),
             DeclareLaunchArgument("scenario", default_value="stadium"),
             DeclareLaunchArgument(
                 "target_speed",
