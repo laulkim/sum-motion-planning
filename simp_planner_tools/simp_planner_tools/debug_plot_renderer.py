@@ -276,53 +276,6 @@ def _draw_costmap_boundary(map_ax: Any, snapshot: dict[str, Any]) -> Polygon | N
     return boundary
 
 
-def render_position_comparison(snapshot: dict[str, Any], session_dir: Path, elapsed_int: int) -> None:
-    """목표/실측을 동일한 시간축에 그린다. 목표가 없는 구간은 NaN으로 끊는다."""
-    rows = np.asarray(snapshot.get("position_history", []), dtype=float)
-    if rows.size == 0:
-        rows = np.empty((0, 5))
-    time, target_x, target_y, actual_x, actual_y = rows.T
-    # 부호는 전역 좌표계의 실제 위치 - 목표 위치로 통일한다.
-    dx, dy = actual_x - target_x, actual_y - target_y
-    distance = np.hypot(dx, dy)
-    mode = "ON" if snapshot.get("use_tracking_controller", True) else "OFF"
-    figure, axes = plt.subplots(2, 2, figsize=(13, 8), sharex=True, constrained_layout=True)
-    for axis, target, actual, coordinate in (
-        (axes[0, 0], target_x, actual_x, "x"),
-        (axes[0, 1], target_y, actual_y, "y"),
-    ):
-        axis.plot(time, target, "--", label="Planner target (same timestamp)")
-        axis.plot(time, actual, label="Simulator /odom")
-        axis.set_title(f"{coordinate.upper()} position")
-        axis.set_ylabel(f"{coordinate} [m]")
-    axes[1, 0].plot(time, dx, label="dx = actual x - target x")
-    axes[1, 0].plot(time, dy, label="dy = actual y - target y")
-    axes[1, 0].axhline(0, color="gray", linewidth=0.8)
-    axes[1, 0].set_title("Position error in trajectory frame")
-    axes[1, 0].set_ylabel("error [m]")
-    axes[1, 1].plot(time, distance, label="sqrt(dx² + dy²)")
-    axes[1, 1].set_title("Position error magnitude")
-    axes[1, 1].set_ylabel("distance [m]")
-    axes[1, 1].set_ylim(bottom=0)
-    for axis in axes.flat:
-        axis.set_xlabel("time [s]")
-        axis.grid(True, alpha=0.3)
-        axis.legend(fontsize=8)
-    figure.suptitle(
-        f"{snapshot.get('scenario_name', 'N/A')} | Tracker {mode}\n"
-        "Target: active timed trajectory at odometry timestamp; gaps = unavailable target"
-    )
-    path = session_dir / f"position_comparison_{elapsed_int:06d}.png"
-    figure.savefig(path, dpi=150)
-    plt.close(figure)
-    shutil.copy2(path, session_dir / "position_comparison_latest.png")
-    np.savetxt(
-        session_dir / "position_comparison.csv",
-        np.column_stack((rows, dx, dy, distance)), delimiter=",", comments="",
-        header="time_s,target_x_m,target_y_m,actual_x_m,actual_y_m,dx_m,dy_m,error_norm_m",
-    )
-
-
 def render_debug_snapshot(
     snapshot: dict[str, Any],
     session_dir_value: str,
@@ -763,5 +716,4 @@ def render_debug_snapshot(
     figure.savefig(snapshot_path, dpi=150)
     plt.close(figure)
     shutil.copy2(snapshot_path, latest_path)
-    render_position_comparison(snapshot, session_dir, elapsed_int)
     return str(snapshot_path)

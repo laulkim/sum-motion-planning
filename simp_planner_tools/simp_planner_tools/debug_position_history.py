@@ -22,7 +22,7 @@ class PositionComparison:
     def on_command(self, message):
         self.commands.append(message)
 
-    def reference_xy(self, odom):
+    def reference_state(self, odom):
         now_ns = stamp_ns(odom.header.stamp)
         if self.last_odom_ns is not None and now_ns < self.last_odom_ns:
             self.plans.clear()
@@ -33,7 +33,7 @@ class PositionComparison:
             (cmd for cmd in self.commands if stamp_ns(cmd.header.stamp) <= now_ns),
             key=lambda cmd: stamp_ns(cmd.header.stamp), default=None,
         )
-        missing = (math.nan, math.nan)
+        missing = (math.nan,) * 4
         if command is None or command.execution_state != "ACTIVE_PLAN":
             return missing
         if now_ns - stamp_ns(command.header.stamp) > 250_000_000:
@@ -45,4 +45,7 @@ class PositionComparison:
         reference = reference_at(plan, elapsed)
         if reference is None:
             return missing
-        return reference.x, reference.y
+        return reference.x, reference.y, reference.yaw, reference.yaw_rate
+
+    def reference_xy(self, odom):
+        return self.reference_state(odom)[:2]

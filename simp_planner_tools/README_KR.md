@@ -93,9 +93,17 @@ ros2 launch simp_planner_tools simulation.launch.py \
 
 결과는 `/tmp/simp_position_plots/s_curve/<실행시각>/`에 저장됩니다.
 
-- `position_comparison_latest.png`: 최신 목표/실제 x·y 위치, x·y 오차, 거리 오차 그래프.
-- `position_comparison_<경과초>.png`: 주기별 그래프 이력. 제목에 Tracker ON/OFF 표시.
-- `position_comparison.csv`: 마지막 그래프 저장 시점까지의 전체 위치와 오차 데이터.
+Ctrl+C로 종료하면 마지막으로 수신한 odometry까지 포함한 Matplotlib 창 두 개가 뜹니다.
+
+- 목표/실제 비교 창: x, y, yaw, yaw rate (계획 목표와 시뮬레이터 `/odom`).
+- 오차 창: x, y, yaw, yaw rate 오차와 위치 오차 크기. 각도 오차는 ±180° 경계를 보정합니다.
+- `position_comparison.csv`: 종료 시점까지의 전체 비교 데이터. 각도는 rad, 각속도는 rad/s입니다.
+
+비교 그래프는 주기적 PNG에 저장하지 않습니다. 기존 진단 PNG 저장은 유지합니다.
+창은 런치와 독립적으로 실행되므로 런치 종료 후에도 확대·이동·저장할 수 있습니다.
+데스크톱 디스플레이와 `python3-tk`가 필요하며, 창 실행 오류는 `tracking_viewer.log`에서 확인합니다.
+CSV는 다음 명령으로 다시 열 수 있습니다:
+`python3 -m simp_planner_tools.tracking_result_viewer <position_comparison.csv 경로>`.
 
 위치는 궤적의 전역 좌표계 기준이며 단위는 m입니다.
 오차는 `dx = 실제 x - 목표 x`, `dy = 실제 y - 목표 y`,

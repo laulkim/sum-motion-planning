@@ -244,7 +244,9 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("save_period", default_value="10.0"),
             DeclareLaunchArgument(
                 "debug_output_dir",
-                default_value="/home/a/Desktop/simp_planner/simp_planner_debug",
+                default_value=os.path.join(
+                    os.path.expanduser("~"), "Desktop", "simp_planner", "simp_planner_debug"
+                ),
             ),
             DeclareLaunchArgument(
                 "vehicle_length", default_value="3.0",

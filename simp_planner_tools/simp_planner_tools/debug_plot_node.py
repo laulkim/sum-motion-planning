@@ -5,6 +5,8 @@ import csv
 import json
 import math
 import multiprocessing
+import subprocess
+import sys
 from concurrent.futures import Future, ProcessPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +17,7 @@ import rclpy
 from ament_index_python.packages import get_package_share_directory
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as PathMessage
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from simp_planner_msgs.msg import DriveModeState, ExecutedCommand, Trajectory
 from simp_planner_msgs.msg import ReferencePath as ReferencePathMessage
@@ -25,6 +28,7 @@ from .debug_plot_renderer import render_debug_snapshot
 from .debug_scenario_geometry import scenario_obstacle_polygons
 from .debug_signal_history import SourceTimeAligner
 from .debug_position_history import PositionComparison
+from . import tracking_result_viewer
 from .diagnostic_metrics import OpenPathGeometry, tracking_error_to_executed_segment
 from .path_geometry import PathProjection, project_open_path, wrap_angle
 
@@ -733,12 +737,17 @@ class DebugPlotNode(Node):
         x = float(pose.position.x)
         y = float(pose.position.y)
         # 기준 경로를 아직 받지 않았어도 목표/실제 위치 비교는 독립적으로 기록한다.
-        target_x, target_y = self.position_comparison.reference_xy(message)
-        self.position_history.append((elapsed, target_x, target_y, x, y))
+        target_x, target_y, target_yaw, target_yaw_rate = (
+            self.position_comparison.reference_state(message)
+        )
         body_yaw = quaternion_to_yaw(
             pose.orientation.x, pose.orientation.y,
             pose.orientation.z, pose.orientation.w,
         )
+        self.position_history.append((
+            elapsed, target_x, target_y, x, y,
+            target_yaw, target_yaw_rate, body_yaw, float(twist.angular.z),
+        ))
         vx = float(twist.linear.x)
         vy = float(twist.linear.y)
         speed = math.hypot(vx, vy)
@@ -1192,6 +1201,18 @@ class DebugPlotNode(Node):
         )
 
     def destroy_node(self) -> bool:
+        # Export before waiting for a periodic PNG worker: include the final odom callback.
+        if self.position_history:
+            result_path = self.session_dir / "position_comparison.csv"
+            tracking_result_viewer.save_history(self.position_history, result_path)
+            with (self.session_dir / "tracking_viewer.log").open("w") as log:
+                subprocess.Popen(
+                    [sys.executable, str(Path(tracking_result_viewer.__file__).resolve()),
+                     str(result_path),
+                     f"{self.scenario_name} | Tracker {'ON' if self.use_tracking_controller else 'OFF'}"],
+                    start_new_session=True, stdin=subprocess.DEVNULL,
+                    stdout=log, stderr=log,
+                )
         self.check_render_future()
         if self.render_future is not None:
             try:
@@ -1211,11 +1232,11 @@ def main(args=None) -> None:
     node = DebugPlotNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == "__main__":
