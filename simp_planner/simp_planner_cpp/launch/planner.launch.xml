@@ -1,6 +1,6 @@
 <launch>
   <arg name="use_sim_time" default="false" />
-  <node pkg="simp_planner_cpp" exec="simp_tracker" name="simp_tracker" output="screen">
+  <node pkg="simp_tracker" exec="tracker_node" name="simp_tracker" output="screen">
     <param name="use_sim_time" value="$(var use_sim_time)" />
   </node>
   <arg name="costmap_update_period_sec" default="0.20" />

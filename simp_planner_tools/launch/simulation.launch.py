@@ -73,7 +73,7 @@ def _resolved_nodes(context):
     initial_body_yaw = float(first_path.yaw[0]) - mode_heading_offset
 
     return [
-        Node(package="simp_planner_cpp", executable="simp_tracker", name="simp_tracker",
+        Node(package="simp_tracker", executable="tracker_node", name="simp_tracker",
              output="screen", parameters=[{"command_frequency_hz": command_frequency_hz}]),
         Node(
             package="planar_velocity_sim",

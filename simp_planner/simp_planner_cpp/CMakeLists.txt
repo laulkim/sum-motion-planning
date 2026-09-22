@@ -59,11 +59,6 @@ target_compile_options(planner_node_cpp PRIVATE
   -Wall -Wextra -Wpedantic -O3
 )
 
-add_executable(simp_tracker src/tracker_node.cpp)
-target_link_libraries(simp_tracker simp_planner_core)
-ament_target_dependencies(simp_tracker rclcpp geometry_msgs std_msgs simp_planner_msgs)
-target_compile_options(simp_tracker PRIVATE -Wall -Wextra -Wpedantic -O3)
-
 if(BUILD_TESTING)
   enable_testing()
   add_executable(test_execution test/test_execution.cpp)
@@ -87,7 +82,6 @@ endif()
 
 install(TARGETS
   planner_node_cpp
-  simp_tracker
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY launch/ DESTINATION share/${PROJECT_NAME}/launch)

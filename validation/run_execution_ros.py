@@ -33,7 +33,7 @@ def main():
     statuses, commands = [], []
     node.create_subscription(ExecutionStatus, '/tracker/execution_status', statuses.append, 100)
     node.create_subscription(ExecutedCommand, '/planner/executed_command', commands.append, 200)
-    binary = Path(get_package_prefix('simp_planner_cpp')) / 'lib/simp_planner_cpp/simp_tracker'
+    binary = Path(get_package_prefix('simp_tracker')) / 'lib/simp_tracker/tracker_node'
     log = (args.output / 'tracker.log').open('w')
     process = subprocess.Popen([str(binary), '--ros-args', '-p', 'use_sim_time:=true'], stdout=log, stderr=log)
     def pump(seconds=.08):
