@@ -508,6 +508,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
     last_motion_chi_ = chi;
     const double acceleration = last ? last->planned_acceleration : 0.0;
     const double heading_rate = last ? last->motion_heading_rate : 0.0;
+    ReferencePathMsg::SharedPtr deferred;
     {
       std::lock_guard<std::mutex> lock(input_mutex_);
       current_state_ = {msg->pose.pose.position.x, msg->pose.pose.position.y,
@@ -518,7 +519,14 @@ class PlannerNodeCpp final : public rclcpp::Node {
       if (current_state_time_ns_ <= 0) current_state_time_ns_ = now_ns();
       odom_frame_ = msg->header.frame_id;
       received_odom_ = true;
+      // A reference path that arrived before this, the first, odom message
+      // was deferred in path_callback() rather than judged against
+      // current_body_yaw_'s 0.0 placeholder. current_body_yaw_ is real now
+      // (just set above), so re-run that decision with a heading
+      // path_callback() can actually trust.
+      deferred = std::move(deferred_reference_);
     }
+    if (deferred) path_callback(deferred);
     request_replan("LATEST_ODOMETRY", false);
   }
 
@@ -739,6 +747,18 @@ class PlannerNodeCpp final : public rclcpp::Node {
         const auto frame = msg->header.frame_id.empty() ? "map" : msg->header.frame_id;
         if (received_odom_ && !odom_frame_.empty() && frame != odom_frame_) {
           throw std::invalid_argument("reference path frame does not match odometry");
+        }
+        if (!received_odom_) {
+          // current_body_yaw_ defaults to 0.0 until the first odom message
+          // seeds it (see odom_callback), and odom_sub_/path_sub_ sit on
+          // separate callback groups with no ordering guarantee between
+          // them. Deciding needs_boundary_spot_turn against that placeholder
+          // 0.0 below would silently skip the initial spot turn whenever the
+          // path's start heading happens to be near zero. Defer -- exactly
+          // like the maneuver-active case just below -- and let odom_callback
+          // re-run this once the real heading is known.
+          deferred_reference_ = msg;
+          return;
         }
         if (maneuver_.state() != SpotTurnManeuverState::Inactive) {
           if (reference_mode != reference_mode_ || frame != path_frame_) deferred_reference_ = msg;
