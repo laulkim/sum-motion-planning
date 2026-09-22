@@ -803,14 +803,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
           pending_post_turn_path_ = std::move(split.before);
           path_frame_ = frame;
           received_path_ = true;
-          // reference_path_/reference_mode_는 일부러 안 건드린다 --
-          // 시나리오 매니저는 차량이 이전 phase를 끝까지 몰고 도착한 뒤에만
-          // 다음 phase를 보내므로, 지금 활성 경로는 이미 다 주행되어 그
-          // 자리에 자연히 멈춰 있다. reference_mode_를 여기서 새 모드로
-          // 바꾸면 아래 command_callback()의 트리거 가드(차량이 여전히
-          // 회전 전 모드로 안정적으로 있는지 확인)가 어긋나므로, 회전이
-          // 실제로 끝나 새 경로를 설치하는 시점(1292절 부근)까지 그대로
-          // 둔다.
+          // Keep the completed leg for terminal-hold validation until rotation
+          // finishes. The vehicle may still be in its old mode or already READY
+          // in the new mode: can_start() handles both callback arrival orders.
         } else {
           identical = reference_path_ && reference_mode == reference_mode_ &&
                       same_reference_path(*reference_path_, *split.before);
@@ -1528,10 +1523,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
       // 한다. 경계 코너는 이전 phase가 이미 도착해 있어야 새 메시지가
       // 오므로 이 조건이 항상 먼저 참이 되어 있어 기존 동작에는 영향이
       // 없다.
-      if (mode_ready && maneuver_.state() == SpotTurnManeuverState::Inactive &&
-          mode_supervisor_.current_mode() == reference_mode_ && received_costmap_ &&
-          measured_speed <= mode_change_stop_speed_ && terminal_hold_latched() &&
-          pending_spot_turn_target_yaw_) {
+      if (received_costmap_ && pending_spot_turn_target_yaw_ && pending_spot_turn_mode_ &&
+          maneuver_.can_start(mode_supervisor_, reference_mode_, *pending_spot_turn_mode_,
+                              measured_speed, mode_change_stop_speed_, terminal_hold_latched())) {
         if (spot_turn_feasible(*costmap_, current_state_, config_.vehicle, spot_turn_config_.safety_margin)) {
           execution_turn_target_ = *pending_spot_turn_target_yaw_;
           maneuver_.trigger(*pending_spot_turn_target_yaw_, *pending_spot_turn_mode_);

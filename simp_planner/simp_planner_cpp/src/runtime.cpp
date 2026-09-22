@@ -470,6 +470,24 @@ BodyCommand YawRotationProfile::sample(double dt, double measured_yaw,
 
 SpotTurnManeuver::SpotTurnManeuver(const SpotTurnConfig& config) : rotation_(config) {}
 
+bool SpotTurnManeuver::can_start(
+    const DriveModeSupervisor& supervisor, DriveMode reference_mode,
+    DriveMode return_mode, double speed, double stop_speed_threshold,
+    bool terminal_hold) const {
+  // At a phase boundary the old reference intentionally stays installed until
+  // rotation completes. The independent mode request/feedback may arrive before
+  // or after that new path: accept either stable wheel configuration, but never
+  // start while the wheels are aligning or before the old leg has stopped.
+  const auto current = supervisor.current_mode();
+  const auto requested = supervisor.requested_mode();
+  return state_ == SpotTurnManeuverState::Inactive && terminal_hold &&
+         std::isfinite(speed) && speed >= 0.0 && speed <= stop_speed_threshold &&
+         return_mode != DriveMode::SpotTurn &&
+         supervisor.vehicle_status() == VehicleModeStatus::Ready &&
+         (current == reference_mode || current == return_mode) &&
+         (requested == reference_mode || requested == return_mode);
+}
+
 void SpotTurnManeuver::trigger(double target_body_yaw, DriveMode external_mode) {
   if (state_ != SpotTurnManeuverState::Inactive) throw std::logic_error("spot turn already active");
   target_yaw_ = target_body_yaw;

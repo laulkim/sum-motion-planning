@@ -191,6 +191,46 @@ void test_clearance_gate() {
   require(!spot_turn_feasible(blocked, {}, VehicleConfig{}, 0), "unsafe rotation accepted");
   require(spot_turn_feasible(clear, {}, VehicleConfig{}, 0), "cleared obstacle did not release gate");
 }
+
+void test_crab_to_forward_boundary_turn_in_either_feedback_order() {
+  for (auto crab : {DriveMode::Left, DriveMode::Right}) {
+    for (bool new_mode_confirmed : {false, true}) {
+      SpotTurnManeuver maneuver;
+      DriveModeSupervisor supervisor;
+      supervisor.set_requested_mode(DriveMode::Forward);
+      const auto actual = new_mode_confirmed ? DriveMode::Forward : crab;
+      supervisor.update_vehicle_feedback(actual, actual, VehicleModeStatus::Ready);
+      require(maneuver.can_start(supervisor, crab, DriveMode::Forward, 0.0, 0.03, true),
+              "boundary turn blocked by old reference mode after crab phase");
+      require(!maneuver.can_start(supervisor, crab, DriveMode::Forward, 0.2, 0.03, true),
+              "turn allowed while translating");
+      require(!maneuver.can_start(supervisor, crab, DriveMode::Forward, 0.0, 0.03, false),
+              "turn allowed before terminal arrival");
+      supervisor.update_vehicle_feedback(actual, DriveMode::Forward, VehicleModeStatus::Aligning);
+      require(!maneuver.can_start(supervisor, crab, DriveMode::Forward, 0.0, 0.03, true),
+              "turn allowed while wheels align");
+      supervisor.update_vehicle_feedback(actual, actual, VehicleModeStatus::Ready);
+      maneuver.trigger(0.4, DriveMode::Forward);
+      supervisor.set_requested_mode(DriveMode::SpotTurn);
+      supervisor.update_vehicle_feedback(DriveMode::SpotTurn, DriveMode::SpotTurn, VehicleModeStatus::Ready);
+      maneuver.on_mode_ready(supervisor);
+      double yaw = 0.0, rate = 0.0;
+      for (int i = 0; i < 2000 && maneuver.state() == SpotTurnManeuverState::Rotating; ++i) {
+        const auto command = maneuver.sample(0.01, yaw, rate, supervisor);
+        require(command.has_value(), "rotation did not produce a command");
+        rate = command->yaw_rate;
+        yaw = wrap_angle(yaw + 0.01 * rate);
+      }
+      require(supervisor.requested_mode() == DriveMode::Forward,
+              "turn returned to old crab mode instead of new forward mode");
+      supervisor.update_vehicle_feedback(DriveMode::SpotTurn, DriveMode::Forward, VehicleModeStatus::Aligning);
+      require(!maneuver.on_mode_ready(supervisor), "turn completed before return-mode READY");
+      supervisor.update_vehicle_feedback(DriveMode::Forward, DriveMode::Forward, VehicleModeStatus::Ready);
+      require(maneuver.on_mode_ready(supervisor), "turn did not release the new forward path");
+      require(maneuver.state() == SpotTurnManeuverState::Inactive, "turn state remained active");
+    }
+  }
+}
 }  // namespace
 
 int main() {
@@ -201,6 +241,7 @@ int main() {
     test_invalid_reference_arrays_are_rejected();
     test_rotation_uses_feedback_and_accepts_new_return_mode();
     test_clearance_gate();
+    test_crab_to_forward_boundary_turn_in_either_feedback_order();
     std::cout << "all spot-turn integration tests passed\n";
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

@@ -219,6 +219,9 @@ enum class SpotTurnManeuverState { Inactive, AligningWheels, Rotating };
 class SpotTurnManeuver {
  public:
   explicit SpotTurnManeuver(const SpotTurnConfig& config = {});
+  bool can_start(const DriveModeSupervisor& supervisor, DriveMode reference_mode,
+                 DriveMode return_mode, double speed, double stop_speed_threshold,
+                 bool terminal_hold) const;
   void trigger(double target_body_yaw, DriveMode external_mode);
   bool on_mode_ready(const DriveModeSupervisor& supervisor);
   std::optional<BodyCommand> sample(double dt, double measured_yaw,
