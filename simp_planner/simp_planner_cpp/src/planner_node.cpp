@@ -9,6 +9,8 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <simp_planner_msgs/msg/candidate_path.hpp>
+#include <simp_planner_msgs/msg/candidate_set.hpp>
 #include <simp_planner_msgs/msg/drive_mode_state.hpp>
 #include <simp_planner_msgs/msg/executed_command.hpp>
 #include <simp_planner_msgs/msg/reference_path.hpp>
@@ -38,6 +40,8 @@ namespace {
 
 using ReferencePathMsg = simp_planner_msgs::msg::ReferencePath;
 using ExecutedCommandMsg = simp_planner_msgs::msg::ExecutedCommand;
+using CandidatePathMsg = simp_planner_msgs::msg::CandidatePath;
+using CandidateSetMsg = simp_planner_msgs::msg::CandidateSet;
 using DriveModeStateMsg = simp_planner_msgs::msg::DriveModeState;
 
 constexpr double kMotionThreshold = 0.03;
@@ -215,6 +219,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
         footprint_yaw_step_deg_ <= 0.0) {
       throw std::invalid_argument("invalid oriented footprint parameters");
     }
+    config_.export_debug_candidates =
+        declare_parameter<bool>("export_debug_candidates", false);
 
     input_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     environment_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -233,6 +239,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
         "/planner/selected_trajectory", static_qos);
     trajectory_data_pub_ = create_publisher<ReferencePathMsg>(
         "/planner/selected_trajectory_data", static_qos);
+    candidate_set_pub_ = create_publisher<CandidateSetMsg>(
+        "/planner/candidate_set", static_qos);
     mode_command_pub_ = create_publisher<std_msgs::msg::UInt8>(
         "/vehicle/drive_mode_command", static_qos);
 
@@ -1476,6 +1484,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
 
     if (activated) {
       publish_trajectory(*activated);
+      publish_candidate_set(*activated);
       publish_plan_status(*activated, activated->compute_ms);
     }
     const bool terminal_hold = terminal_hold_active();
@@ -1601,6 +1610,31 @@ class PlannerNodeCpp final : public rclcpp::Node {
     }
     trajectory_pub_->publish(path_message);
     trajectory_data_pub_->publish(data_message);
+  }
+
+  void publish_candidate_set(const ExecutablePlan& plan) {
+    if (plan.result.debug_candidates.empty()) return;
+    CandidateSetMsg message;
+    message.header.stamp = get_clock()->now();
+    message.header.frame_id = plan.frame_id;
+    message.plan_id = plan.plan_id;
+    message.candidates.reserve(plan.result.debug_candidates.size());
+    for (const auto& sample : plan.result.debug_candidates) {
+      CandidatePathMsg candidate;
+      candidate.candidate_id = sample.candidate_id;
+      candidate.n_target = sample.n_target;
+      candidate.total_cost = sample.total_cost;
+      candidate.preview_collision_free = sample.preview_collision_free;
+      candidate.trajectory_evaluated = sample.trajectory_evaluated;
+      candidate.dynamic_valid = sample.dynamic_valid;
+      candidate.collision_free = sample.collision_free;
+      candidate.safe = sample.safe;
+      candidate.selected = sample.selected;
+      candidate.x = sample.x;
+      candidate.y = sample.y;
+      message.candidates.push_back(std::move(candidate));
+    }
+    candidate_set_pub_->publish(message);
   }
 
   CostmapBuildSnapshot costmap_build_snapshot() const {
@@ -1910,6 +1944,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr execution_state_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr trajectory_pub_;
   rclcpp::Publisher<ReferencePathMsg>::SharedPtr trajectory_data_pub_;
+  rclcpp::Publisher<CandidateSetMsg>::SharedPtr candidate_set_pub_;
   rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr mode_command_pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<ReferencePathMsg>::SharedPtr path_sub_;

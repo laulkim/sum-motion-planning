@@ -23,7 +23,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("save_period", default_value="10.0"),
             DeclareLaunchArgument(
                 "debug_output_dir",
-                default_value="/home/sum/Desktop/simp_planner/simp_planner_debug",
+                default_value="/home/hoone/sum-motion-planning/simp_planner_debug",
             ),
             Node(
                 package="planar_velocity_sim",

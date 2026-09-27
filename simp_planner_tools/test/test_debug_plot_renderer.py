@@ -78,7 +78,7 @@ def test_all_scenario_obstacles_and_vehicle_relative_costmap_size_are_drawn() ->
     boundary = _draw_costmap_boundary(axis, snapshot)
 
     assert len(obstacles) == 2
-    assert obstacles[0].get_label() == "Scenario obstacles (2 total)"
+    assert obstacles[0].get_label() == "Scenario obstacles"
     assert boundary is not None
     assert "60.0×60.0 m" in boundary.get_label()
     assert "as received" in boundary.get_label()

@@ -9,6 +9,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ReferencePath.msg"
   "msg/ExecutedCommand.msg"
   "msg/DriveModeState.msg"
+  "msg/CandidatePath.msg"
+  "msg/CandidateSet.msg"
   DEPENDENCIES std_msgs
 )
 

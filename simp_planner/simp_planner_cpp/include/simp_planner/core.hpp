@@ -330,6 +330,10 @@ struct EnvConfig {
   TerminalConstraintConfig terminal{};
   SimulationConfig simulation{};
   AdaptiveReplanConfig adaptive_replan{};
+  // Debug-only: export every lateral candidate evaluated this cycle into
+  // PlanResult::debug_candidates. Off by default since it copies every
+  // candidate's spatial path (~65 by default) each planning call.
+  bool export_debug_candidates{false};
 };
 
 struct FrenetProjection {
@@ -519,11 +523,29 @@ struct PlanDiagnostics {
   int excluded_candidate_id{-1};
 };
 
+// One lateral candidate's debug-only export: its raw spatial path plus how
+// far it got through screening/trajectory evaluation. Only populated when
+// EnvConfig::export_debug_candidates is set (see PathVelocityPlanner::plan).
+struct CandidateDebugSample {
+  int candidate_id{-1};
+  double n_target{0.0};
+  double total_cost{0.0};
+  bool preview_collision_free{false};
+  bool trajectory_evaluated{false};
+  bool dynamic_valid{false};
+  bool collision_free{false};
+  bool safe{false};
+  bool selected{false};
+  std::vector<double> x;
+  std::vector<double> y;
+};
+
 struct PlanResult {
   TimeTrajectory trajectory;
   std::optional<SpatialPathCandidate> selected_path;
   PlannerMotionTrajectory motion;
   PlanDiagnostics diagnostics;
+  std::vector<CandidateDebugSample> debug_candidates;
 };
 
 struct ManeuverProfileState {

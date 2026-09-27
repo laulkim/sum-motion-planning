@@ -20,6 +20,9 @@ def _resolved_nodes(context):
     target_speed = float(LaunchConfiguration("target_speed").perform(context))
     save_period = float(LaunchConfiguration("save_period").perform(context))
     debug_output_dir = LaunchConfiguration("debug_output_dir").perform(context)
+    export_debug_candidates = LaunchConfiguration(
+        "export_debug_candidates"
+    ).perform(context).strip().lower() in ("1", "true", "yes")
     path_update_distance = float(
         LaunchConfiguration("path_update_distance").perform(context)
     )
@@ -116,6 +119,7 @@ def _resolved_nodes(context):
                     "oriented_footprint_circle_count": footprint_circle_count,
                     "oriented_footprint_translation_step_m": footprint_translation_step,
                     "oriented_footprint_yaw_step_deg": footprint_yaw_step,
+                    "export_debug_candidates": export_debug_candidates,
                 }
             ],
         ),
@@ -220,10 +224,15 @@ def generate_launch_description() -> LaunchDescription:
                 "oriented_footprint_translation_step_m", default_value="0.20"
             ),
             DeclareLaunchArgument("oriented_footprint_yaw_step_deg", default_value="2.0"),
+            DeclareLaunchArgument(
+                "export_debug_candidates", default_value="true",
+                description="Publish every lateral candidate path each cycle "
+                            "on /planner/candidate_set for debug_plot_node.",
+            ),
             DeclareLaunchArgument("save_period", default_value="10.0"),
             DeclareLaunchArgument(
                 "debug_output_dir",
-                default_value="/home/sum/Desktop/simp_planner/simp_planner_debug",
+                default_value="/home/hoone/sum-motion-planning/simp_planner_debug",
             ),
             DeclareLaunchArgument(
                 "vehicle_length", default_value="3.0",

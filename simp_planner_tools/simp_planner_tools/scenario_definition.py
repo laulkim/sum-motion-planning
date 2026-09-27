@@ -275,7 +275,14 @@ def build_spot_turn_crab_course_phases(
     코너의 위치를 따로 표시하거나 넘겨줄 필요가 없다.
     """
     turns = [math.radians(value) for value in turn_degrees]
-    heading = 0.0
+    # All relative turn/mode logic below is unaffected by this starting
+    # heading -- it only rotates the whole authored course about its own
+    # start point. 108 deg was picked because the course's default turn
+    # sequence otherwise spends most of its length pointed almost straight
+    # up (bounding box ~65 m wide x 140 m tall); this angle instead lays it
+    # out landscape (~148 m wide x 49 m tall), which is what the debug
+    # snapshot plots want to render.
+    heading = math.radians(108.0)
     x, y = 0.0, 0.0
 
     forward1a = _straight_segment(x, y, heading, forward_leg_length, mode=0, ds=ds)

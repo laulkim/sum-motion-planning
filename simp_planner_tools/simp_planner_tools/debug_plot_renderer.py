@@ -178,7 +178,7 @@ def _draw_scenario_obstacles(
             linewidth=1.1,
             alpha=0.24,
             zorder=3,
-            label=(f"Scenario obstacles ({len(valid)} total)" if index == 0 else None),
+            label=("Scenario obstacles" if index == 0 else None),
         )
         map_ax.add_patch(artist)
         artists.append(artist)

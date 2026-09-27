@@ -16,13 +16,17 @@ from ament_index_python.packages import get_package_share_directory
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as PathMessage
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from simp_planner_msgs.msg import CandidateSet as CandidateSetMessage
 from simp_planner_msgs.msg import DriveModeState, ExecutedCommand
 from simp_planner_msgs.msg import ReferencePath as ReferencePathMessage
 from std_msgs.msg import Float64, String, UInt8
 
+from .combined_snapshot_renderer import render_combined_snapshot
 from .debug_allocation_metrics import compute_allocation_debug_sample
 from .debug_plot_renderer import render_debug_snapshot
 from .debug_scenario_geometry import scenario_obstacle_polygons
+from .local_costmap_snapshot_renderer import render_local_costmap_snapshot
+from .mode_transition_renderer import render_mode_transition_summary
 from .debug_signal_history import SourceTimeAligner
 from .diagnostic_metrics import OpenPathGeometry, tracking_error_to_executed_segment
 from .path_geometry import PathProjection, project_open_path, wrap_angle
@@ -49,9 +53,10 @@ class DebugPlotNode(Node):
         super().__init__("debug_plot_node")
         self.declare_parameter("scenario", "stadium")
         self.declare_parameter(
-            "output_dir", "/home/sum/Desktop/simp_planner/simp_planner_debug"
+            "output_dir", "/home/hoone/sum-motion-planning/simp_planner_debug"
         )
         self.declare_parameter("save_period", 10.0)
+        self.declare_parameter("candidate_snapshot_period", 10.0)
         self.declare_parameter("frame_id", "odom")
         self.declare_parameter("vehicle_length", 3.0)
         self.declare_parameter("vehicle_width", 2.0)
@@ -69,6 +74,9 @@ class DebugPlotNode(Node):
         )
         self.frame_id = str(self.get_parameter("frame_id").value)
         self.save_period = float(self.get_parameter("save_period").value)
+        self.candidate_snapshot_period = float(
+            self.get_parameter("candidate_snapshot_period").value
+        )
         self.vehicle_length = float(self.get_parameter("vehicle_length").value)
         self.vehicle_width = float(self.get_parameter("vehicle_width").value)
         self.movement_speed_threshold = float(
@@ -103,6 +111,13 @@ class DebugPlotNode(Node):
             base / self.scenario_name / datetime.now().strftime("%Y%m%d_%H%M%S")
         )
         self.session_dir.mkdir(parents=True, exist_ok=False)
+        self.local_costmap_snapshot_dir = self.session_dir / "local_costmap_snapshots"
+        self.local_costmap_snapshot_dir.mkdir(parents=True, exist_ok=True)
+        self.mode_transition_dir = self.session_dir / "mode_transition_summary"
+        self.mode_transition_dir.mkdir(parents=True, exist_ok=True)
+        self.combined_snapshot_dir = self.session_dir / "combined_snapshots"
+        self.combined_snapshot_dir.mkdir(parents=True, exist_ok=True)
+        self.candidate_snapshot_index = 0
 
         self.csv_file = (self.session_dir / "odom_history.csv").open(
             "w", newline="", encoding="utf-8", buffering=1
@@ -234,6 +249,12 @@ class DebugPlotNode(Node):
             self.selected_path_callback,
             static_qos,
         )
+        self.create_subscription(
+            CandidateSetMessage,
+            "/planner/candidate_set",
+            self.candidate_set_callback,
+            static_qos,
+        )
 
         self.start_time = self.get_clock().now()
         self.last_seen: dict[str, Optional[float]] = {
@@ -261,6 +282,7 @@ class DebugPlotNode(Node):
         self.selected_projection: Optional[PathProjection] = None
         self.current_state: Optional[dict[str, float]] = None
         self.last_motion_direction: Optional[float] = None
+        self.latest_candidates: list[dict[str, object]] = []
 
         self.costmap_data: Optional[np.ndarray] = None
         self.costmap_extent: Optional[tuple[float, float, float, float]] = None
@@ -334,6 +356,7 @@ class DebugPlotNode(Node):
         self.beta_history: list[float] = []
         self.reference_kappa_history: list[float] = []
         self.executed_kappa_history: list[float] = []
+        self.mode_value_history: list[int] = []
 
         self.plan_time_history: list[float] = []
         self.plan_id_history: list[int] = []
@@ -352,7 +375,19 @@ class DebugPlotNode(Node):
         self.render_future: Optional[Future[str]] = None
         self.render_skip_count = 0
         self.save_timer = self.create_timer(self.save_period, self.save_output)
+        self.candidate_snapshot_timer = self.create_timer(
+            self.candidate_snapshot_period, self.save_candidate_snapshot
+        )
         self.get_logger().info(f"Debug output: {self.session_dir}")
+        self.get_logger().info(
+            f"Local costmap snapshot output: {self.local_costmap_snapshot_dir}"
+        )
+        self.get_logger().info(
+            f"Mode transition summary output: {self.mode_transition_dir}"
+        )
+        self.get_logger().info(
+            f"Combined snapshot output: {self.combined_snapshot_dir}"
+        )
 
     def elapsed(self) -> float:
         return (self.get_clock().now() - self.start_time).nanoseconds * 1.0e-9
@@ -434,6 +469,24 @@ class DebugPlotNode(Node):
             self.reference_y = np.asarray(
                 [pose.pose.position.y for pose in message.poses], dtype=float
             )
+
+    def candidate_set_callback(self, message: CandidateSetMessage) -> None:
+        self.latest_candidates = [
+            {
+                "candidate_id": int(candidate.candidate_id),
+                "n_target": float(candidate.n_target),
+                "total_cost": float(candidate.total_cost),
+                "preview_collision_free": bool(candidate.preview_collision_free),
+                "trajectory_evaluated": bool(candidate.trajectory_evaluated),
+                "dynamic_valid": bool(candidate.dynamic_valid),
+                "collision_free": bool(candidate.collision_free),
+                "safe": bool(candidate.safe),
+                "selected": bool(candidate.selected),
+                "x": np.asarray(candidate.x, dtype=float),
+                "y": np.asarray(candidate.y, dtype=float),
+            }
+            for candidate in message.candidates
+        ]
 
     def global_path_callback(self, message: PathMessage) -> None:
         self.mark("global_path")
@@ -843,6 +896,7 @@ class DebugPlotNode(Node):
         self.beta_history.append(math.degrees(beta))
         self.reference_kappa_history.append(float(projection.kappa))
         self.executed_kappa_history.append(executed_kappa)
+        self.mode_value_history.append(-1 if self.mode is None else int(self.mode))
 
         diagnosis, _ = self.diagnose()
         self.csv_writer.writerow(
@@ -1033,6 +1087,7 @@ class DebugPlotNode(Node):
         execution = copy.deepcopy(self.planner_section("execution"))
         return {
             "scenario_name": self.scenario_name,
+            "candidates": [dict(candidate) for candidate in self.latest_candidates],
             "vehicle_length": self.vehicle_length,
             "vehicle_width": self.vehicle_width,
             "latest_cmd_vx": self.cmd_vx,
@@ -1171,6 +1226,35 @@ class DebugPlotNode(Node):
             render_debug_snapshot, snapshot, str(self.session_dir), elapsed_int
         )
 
+    def save_candidate_snapshot(self) -> None:
+        if self.current_state is None:
+            return
+        diagnosis, detail = self.diagnose()
+        snapshot = self.build_plot_snapshot(diagnosis, detail)
+        elapsed = self.elapsed()
+        self.candidate_snapshot_index += 1
+        try:
+            render_local_costmap_snapshot(
+                snapshot,
+                str(self.local_costmap_snapshot_dir),
+                self.candidate_snapshot_index,
+                elapsed,
+            )
+        except Exception as exc:  # pragma: no cover - ROS runtime path
+            self.get_logger().error(f"Local costmap snapshot rendering failed: {exc}")
+        try:
+            render_combined_snapshot(
+                str(self.combined_snapshot_dir),
+                snapshot,
+                self.candidate_snapshot_index,
+                elapsed,
+                self.plan_time_history,
+                self.plan_compute_history,
+                self.planning_deadline_ms,
+            )
+        except Exception as exc:  # pragma: no cover - ROS runtime path
+            self.get_logger().error(f"Combined snapshot rendering failed: {exc}")
+
     def destroy_node(self) -> bool:
         self.check_render_future()
         if self.render_future is not None:
@@ -1183,6 +1267,16 @@ class DebugPlotNode(Node):
             if not file.closed:
                 file.flush()
                 file.close()
+        try:
+            saved_path = render_mode_transition_summary(
+                str(self.mode_transition_dir),
+                self.odom_time_history,
+                self.mode_value_history,
+            )
+            if saved_path:
+                self.get_logger().info(f"Saved mode transition summary: {saved_path}")
+        except Exception as exc:  # pragma: no cover - ROS runtime path
+            self.get_logger().error(f"Mode transition summary rendering failed: {exc}")
         return super().destroy_node()
 
 

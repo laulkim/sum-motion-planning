@@ -2903,6 +2903,32 @@ PlanResult PathVelocityPlanner::plan_at_speed(
   result.motion = build_allocator_trajectory(result.selected_path, result.trajectory,
       drive_mode, config_.longitudinal.dt, "planner_trajectory",
       "C++ Path-Velocity Decomposed Planner trajectory");
+  if (config_.export_debug_candidates) {
+    result.debug_candidates.reserve(all_spatial.size());
+    for (const auto& entry : all_spatial) {
+      CandidateDebugSample sample;
+      sample.candidate_id = entry.path.candidate_id;
+      sample.n_target = entry.path.n_target;
+      sample.preview_collision_free = entry.screen.preview_collision_free;
+      sample.x = entry.path.x;
+      sample.y = entry.path.y;
+      result.debug_candidates.push_back(std::move(sample));
+    }
+    for (const auto& item : full) {
+      for (auto& sample : result.debug_candidates) {
+        if (sample.candidate_id != item.path.candidate_id) continue;
+        sample.trajectory_evaluated = true;
+        sample.dynamic_valid = item.trajectory.valid_dynamic;
+        sample.collision_free = item.trajectory.collision_free;
+        sample.safe = item.trajectory.safe();
+        sample.total_cost = item.total_cost;
+        break;
+      }
+    }
+    for (auto& sample : result.debug_candidates) {
+      sample.selected = sample.candidate_id == result.diagnostics.selected_candidate_id;
+    }
+  }
   result.diagnostics.compute_time_ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - start_time).count();
   return result;

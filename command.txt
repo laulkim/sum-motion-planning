@@ -1,7 +1,7 @@
 기본 디버깅 명령어
 ros2 run simp_planner_tools  planning_call_count_report_node --ros-args -p scenario:=winding_obstacle_course
 
-ros2 launch simp_planner_tools simulation.launch.py scenario:=winding_obstacle_course target_speed:=3.3 costmap_resolution:=0.1
+ros2 launch simp_planner_tools simulation.launch.py scenario:=winding_obstacle_course target_speed:=2.8 costmap_resolution:=0.1
 
 RVIZ 시뮬 명령어
 (전체 트랙)
@@ -19,3 +19,39 @@ ros2 launch simp_planner_tools simulation.launch.py \
 ros2 launch simp_planner_tools simulation.launch.py \
   scenario:=spot_turn_course use_rviz:=true \
   target_speed:=4.2 costmap_resolution:=0.1
+
+
+scenario_definition.py의 load_scenario_definition()에 정의된 전체 시나리오 목록입니다 (총 20개 + alias 2개 + track_map 별도 모드).
+
+기본/직선
+
+stadium — 스타디움 트랙 반복 랩 (2.0 m/s)
+s_curve — S자 커브 단일 구간 (2.0 m/s)
+straight_long — 장애물/게이트 없는 1km 순수 직선, 고속 순항/추종 테스트용 (2.0 m/s)
+모드 전환 (전진↔크랩/후진, spot turn)
+
+crab_switch — 전진 → 좌측 크랩 전환 (1.5→1.0 m/s)
+reverse_switch — 전진 정지 → 후진 이탈 (1.5→1.0 m/s)
+spot_turn_course — 제자리턴 포함 크랩 코스 (build_spot_turn_crab_course_phases)
+HD맵 기반 (HDMap/ 데이터 사용)
+
+hdmap_crab1_switch — 큰트랙+크랩1 3-phase (전진→좌크랩→복귀)
+fmtc_demo — ref_ver1 기반 3-phase (레귤러1→크랩2→레귤러3)
+hdmap_lap_switch — 크랩 1/2/3 switch를 순서대로 지나는 10-phase 연속 랩
+track_map — 별도 launch(track_map.launch.py)로 도는 HD맵 트랙 모드 (costmap이 차량중심이 아님)
+장애물 회피
+
+obstacle_avoidance — 직선 위 장애물 1개 회피 (1.5 m/s)
+s_curve_obstacles — S커브 위 장애물 3개 (1.2 m/s)
+terminal_safe_region — 경로 끝(정지 목표) 바로 앞을 막는 장애물, 종방향 정지좌표 유지하며 최소 횡오프셋 선택 검증용
+winding_obstacle_course — 곡률 부호가 바뀌는 구간에 게이트 5개 + 회전된 독립 장애물 4개 혼합 (1.8 m/s)
+winding_obstacle_course_wide_gates — 위와 동일 경로/게이트 위치, 게이트 벽만 진행방향으로 3.5배 두껍게 (동일하게 1.8 m/s)
+게이트 통과
+
+alternating_gate_corridor — 좌우 번갈아 게이트 5개, gap 4.8m (1.5 m/s)
+curved_gate_maze — 곡선 경로 위 게이트 5개, gap 5.0m (1.6 m/s)
+좁은 통로 (narrow corridor, 논문 대표 케이스들)
+
+narrow_22m_stop_corridor — 2.20m 개구부, 차폭 2.0m 대비 편측 10cm 여유, 정지 전용 검증 (0.8 m/s) — alias: narrow_10pct_corridor
+narrow_28m_corridor — 2.80m 고정 스펙 통로, costmap 0.20m 해상도 + 3-circle footprint 고정 (0.6 m/s) — alias: narrow_28m_coarse_corridor
+narrow_offset_corridor — 2.40m 통로, 레퍼런스가 통로 중심에서 약간 오프셋+헤딩 불일치, costmap 0.05m + 16-circle footprint (1.0 m/s)
