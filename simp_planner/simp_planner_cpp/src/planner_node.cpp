@@ -12,6 +12,7 @@
 #include <simp_planner_msgs/msg/drive_mode_state.hpp>
 #include <simp_planner_msgs/msg/executed_command.hpp>
 #include <simp_planner_msgs/msg/reference_path.hpp>
+#include <simp_planner_msgs/msg/tracking_trajectory.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/u_int8.hpp>
@@ -233,6 +234,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
         "/planner/selected_trajectory", static_qos);
     trajectory_data_pub_ = create_publisher<ReferencePathMsg>(
         "/planner/selected_trajectory_data", static_qos);
+    tracking_pub_ = create_publisher<simp_planner_msgs::msg::TrackingTrajectory>(
+        "/planner/tracking_trajectory", rclcpp::QoS(1).reliable());
     mode_command_pub_ = create_publisher<std_msgs::msg::UInt8>(
         "/vehicle/drive_mode_command", static_qos);
 
@@ -270,6 +273,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
     command_timer_ = create_wall_timer(
         std::chrono::duration<double>(command_dt_),
         std::bind(&PlannerNodeCpp::command_callback, this), execution_group_);
+    tracking_timer_ = create_wall_timer(
+        std::chrono::milliseconds(100),
+        std::bind(&PlannerNodeCpp::tracking_callback, this), execution_group_);
 
     RCLCPP_INFO(get_logger(),
                 "Native C++ planner ready: planning<=%.1f Hz, command=%.1f Hz, "
@@ -1569,6 +1575,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
 
   void publish_command(const BodyCommand& command, std::uint64_t plan_id,
                        std::int64_t stamp_ns) {
+    update_tracking_reference(command, stamp_ns);
     geometry_msgs::msg::Twist twist;
     twist.linear.x = command.vx;
     twist.linear.y = command.vy;
@@ -1606,6 +1613,132 @@ class PlannerNodeCpp final : public rclcpp::Node {
     executed.segment_end_y = command.segment_end_y;
     executed.segment_end_heading = command.segment_end_heading;
     executed_pub_->publish(executed);
+  }
+
+  static void advance_tracking_pose(
+      simp_planner_msgs::msg::TrackingTrajectoryPoint& point, double dt) {
+    const double yaw_mid = point.body_yaw + 0.5 * point.yaw_rate * dt;
+    point.x += (std::cos(yaw_mid) * point.vx - std::sin(yaw_mid) * point.vy) * dt;
+    point.y += (std::sin(yaw_mid) * point.vx + std::cos(yaw_mid) * point.vy) * dt;
+    point.body_yaw = wrap_angle(point.body_yaw + point.yaw_rate * dt);
+  }
+
+  void update_tracking_reference(const BodyCommand& command, std::int64_t stamp_ns) {
+    // 현재 실행 참조를 유지한다. 미래 handover 상태인 current_state_로 매번
+    // 재시작하지 않으며, 정지·회전에서는 직전 출력 명령으로 자세를 진행한다.
+    if (!tracking_reference_) {
+      std::lock_guard<std::mutex> lock(input_mutex_);
+      if (!received_odom_) return;
+      tracking_reference_.emplace();
+      tracking_reference_->x = current_state_.x;
+      tracking_reference_->y = current_state_.y;
+      tracking_reference_->body_yaw = current_body_yaw_;
+    } else {
+      advance_tracking_pose(*tracking_reference_,
+                            std::max(0.0, (stamp_ns - tracking_reference_ns_) * 1.0e-9));
+    }
+    auto& point = *tracking_reference_;
+    if (current_execution_state() == "ACTIVE_PLAN") {
+      point.x = command.segment_start_x;
+      point.y = command.segment_start_y;
+      point.body_yaw = wrap_angle(command.motion_heading - command.beta);
+    }
+    point.vx = command.vx;
+    point.vy = command.vy;
+    point.yaw_rate = command.yaw_rate;
+    tracking_reference_ns_ = stamp_ns;
+  }
+
+  void tracking_callback() {
+    constexpr std::int64_t sample_ns = 10000000;  // 0.01초
+    constexpr double sample_dt = 0.01;
+    // 실행 콜백과 같은 그룹에서 동작한다. 입력·계획 무효화와 발행 사이의
+    // 순서를 유지하기 위해 31점 생성과 발행 동안 관련 상태를 잠근다.
+    std::scoped_lock lock(input_mutex_, execution_mutex_, terminal_hold_mutex_);
+    if (!tracking_reference_ || !mode_supervisor_.current_mode() ||
+        !mode_supervisor_.requested_mode()) return;
+    const auto stamp_ns = now_ns();
+    simp_planner_msgs::msg::TrackingTrajectory message;
+    message.header.stamp = rclcpp::Time(stamp_ns);
+    message.header.frame_id = received_path_ ? path_frame_ : odom_frame_;
+    message.sample_period.nanosec = static_cast<std::uint32_t>(sample_ns);
+    message.points.reserve(31);
+    auto point = *tracking_reference_;
+    advance_tracking_pose(point,
+                          std::max(0.0, (stamp_ns - tracking_reference_ns_) * 1.0e-9));
+    point.current_mode = static_cast<std::uint8_t>(*mode_supervisor_.current_mode());
+    point.requested_mode = static_cast<std::uint8_t>(*mode_supervisor_.requested_mode());
+    auto supervisor = mode_supervisor_;
+    auto maneuver = maneuver_;
+    const bool mode_ready = supervisor.ready();
+    const bool hold = terminal_hold_.active() &&
+        maneuver.state() == SpotTurnManeuverState::Inactive && mode_ready;
+    const double deceleration = std::min(std::abs(config_.constraints.a_min),
+                                         config_.longitudinal.service_deceleration);
+    const double jerk = std::min(config_.constraints.jerk_max,
+                                 config_.longitudinal.comfort_jerk);
+    std::optional<JerkLimitedSafetyStop> stop;
+    const bool stopping_for_mode = !mode_ready &&
+        supervisor.state(current_state_.speed, mode_change_stop_speed_) ==
+            DriveModeControlState::StoppingForChange;
+    if ((forced_safety_stop_ || stopping_for_mode || safety_stop_) && last_command_) {
+      stop = JerkLimitedSafetyStop::from_command(*last_command_, deceleration, jerk);
+    }
+    std::shared_ptr<const ExecutablePlan> previous_plan;
+    for (int i = 0; i <= 30; ++i) {
+      const auto target_ns = stamp_ns + i * sample_ns;
+      BodyCommand command;
+      if (spot_turn_waiting_clearance_ || hold) {
+        // 현재 확인된 정지 상태를 유지한다.
+      } else if (!mode_ready) {
+        if (stop) command = stop->sample_and_advance(sample_dt);
+      } else if (maneuver.state() != SpotTurnManeuverState::Inactive) {
+        // 복사본만 진행한다. 미래의 휠 정렬 완료는 가정하지 않는다.
+        if (supervisor.ready()) {
+          command = maneuver.sample(sample_dt, point.body_yaw, point.yaw_rate,
+                                    supervisor).value_or(BodyCommand{});
+        }
+      } else if (forced_safety_stop_) {
+        if (stop) command = stop->sample_and_advance(sample_dt);
+      } else {
+        auto plan = pending_plan_ && target_ns >= pending_plan_->start_ns
+            ? pending_plan_ : active_plan_;
+        if (plan && target_ns >= plan->start_ns) {
+          const double elapsed = (target_ns - plan->start_ns) * 1.0e-9;
+          const double end = plan->allocation.trajectory.t.back();
+          if (elapsed <= end + 1.0e-12) {
+            // ponytail: 기존 위치 선형 보간을 유지한다. 모델 통합은
+            // simp_tracker/TRACKING_TRAJECTORY_KR.md의 개선 조건을 따른다.
+            command = sample_body_command(plan->allocation,
+                plan->result.trajectory.actions, elapsed, sample_dt);
+            point.x = command.segment_start_x;
+            point.y = command.segment_start_y;
+            point.body_yaw = wrap_angle(command.motion_heading - command.beta);
+            stop.reset();
+          } else {
+            if (!stop || (previous_plan && previous_plan != plan)) {
+              const auto final_command = sample_body_command(plan->allocation,
+                  plan->result.trajectory.actions, end, sample_dt);
+              stop = JerkLimitedSafetyStop::from_command(final_command, deceleration, jerk);
+              // 샘플 시각이 계획 끝과 정확히 일치하지 않는 경우도 처리한다.
+              for (double remaining = elapsed - end; remaining > 1.0e-12;) {
+                const double dt = std::min(sample_dt, remaining);
+                stop->advance(dt);
+                remaining -= dt;
+              }
+            }
+            command = stop->sample_and_advance(sample_dt);
+          }
+          previous_plan = plan;
+        }
+      }
+      point.vx = command.vx;
+      point.vy = command.vy;
+      point.yaw_rate = command.yaw_rate;
+      message.points.push_back(point);
+      advance_tracking_pose(point, sample_dt);
+    }
+    tracking_pub_->publish(message);
   }
 
   void publish_trajectory(const ExecutablePlan& plan) {
@@ -1945,6 +2078,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr execution_state_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr trajectory_pub_;
   rclcpp::Publisher<ReferencePathMsg>::SharedPtr trajectory_data_pub_;
+  rclcpp::Publisher<simp_planner_msgs::msg::TrackingTrajectory>::SharedPtr tracking_pub_;
+  std::optional<simp_planner_msgs::msg::TrackingTrajectoryPoint> tracking_reference_;
+  std::int64_t tracking_reference_ns_{0};
   rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr mode_command_pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<ReferencePathMsg>::SharedPtr path_sub_;
@@ -1954,6 +2090,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
   rclcpp::Subscription<DriveModeStateMsg>::SharedPtr vehicle_mode_sub_;
   rclcpp::TimerBase::SharedPtr planning_timer_;
   rclcpp::TimerBase::SharedPtr command_timer_;
+  rclcpp::TimerBase::SharedPtr tracking_timer_;
 };
 
 }  // namespace simp_planner
