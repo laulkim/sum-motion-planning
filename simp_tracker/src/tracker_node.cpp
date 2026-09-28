@@ -9,9 +9,9 @@
 class TrackerNode final : public rclcpp::Node {
  public:
   TrackerNode() : Node("simp_tracker") {
-    declare_parameter("kx", 3.0);
-    declare_parameter("ky", 4.0);
-    declare_parameter("ktheta", 2.0);
+    declare_parameter("kx", 0.3);
+    declare_parameter("ky", 0.2);
+    declare_parameter("ktheta", 0.2);
     velocity_pub_ = create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 1);
     mode_pub_ = create_publisher<std_msgs::msg::UInt8>(
         "/vehicle/drive_mode_command", rclcpp::QoS(1).reliable().transient_local());
