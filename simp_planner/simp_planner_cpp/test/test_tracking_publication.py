@@ -42,10 +42,10 @@ def main():
     request = UInt8(data=DriveModeState.FORWARD)
     path = ReferencePath()
     path.header.frame_id = "map"
-    path.x = [5.0 + i for i in range(61)]
-    path.y = [2.0] * 61
-    path.yaw = [0.0] * 61
-    path.mode = [DriveModeState.FORWARD] * 61
+    path.x = [5.0 + 0.1 * i for i in range(31)]
+    path.y = [2.0] * 31
+    path.yaw = [0.0] * 31
+    path.mode = [DriveModeState.FORWARD] * 31
     grid = OccupancyGrid()
     grid.header.frame_id = "map"
     grid.info.resolution = 0.5
@@ -84,8 +84,13 @@ def main():
                           "/vehicle/drive_mode_command"):
                 assert node.count_publishers(topic) == 0, f"Planner가 직접 발행함: {topic}"
             odom.pose.pose.position.x = 6.0
-            wait_for(lambda: messages[-1].points[0].x == 6.0)
-            assert stationary(messages[-1]), "새 odometry 반영에 명령 콜백이 필요함"
+            odom.twist.twist.linear.x = 9.0
+            odom.pose.pose.orientation.z = 1.0
+            odom.pose.pose.orientation.w = 0.0
+            count = len(messages)
+            wait_for(lambda: len(messages) >= count + 4)
+            assert messages[-1].points[0].x == 5.0
+            assert stationary(messages[-1]), "초기화 이후 odometry가 nominal 상태를 덮어씀"
 
             path_pub.publish(path)
             map_pub.publish(grid)
@@ -95,8 +100,7 @@ def main():
             assert moving.points[-1].x > moving.points[0].x, "미래 위치가 진행하지 않음"
             assert all(abs(p.y - 2.0) < 1e-5 for p in moving.points), "직선 경로 이탈"
 
-            # 실제 주행 중 모드 변경은 감속 참조를 만들되 미래 정렬 완료를 가정하지 않는다.
-            odom.twist.twist.linear.x = 0.5
+            # nominal 주행 중 모드 변경은 감속 참조를 만들되 미래 정렬 완료를 가정하지 않는다.
             mode.requested_mode = DriveModeState.LEFT
             mode.status = DriveModeState.STATUS_ALIGNING
             request.data = DriveModeState.LEFT
@@ -105,7 +109,6 @@ def main():
             wait_for(lambda: messages[-1].points[0].requested_mode == DriveModeState.LEFT
                      and messages[-1].points[0].vx > 0.1
                      and messages[-1].points[-1].vx < messages[-1].points[0].vx)
-            odom.twist.twist.linear.x = 0.0
             wait_for(lambda: messages[-1].points[0].requested_mode == DriveModeState.LEFT
                      and stationary(messages[-1]))
             held = messages[-1]
@@ -114,18 +117,18 @@ def main():
             assert all(p.x == held.points[0].x and p.y == held.points[0].y
                        for p in held.points), "정렬 대기 중 위치 변화"
 
-            # 실제 종점 도착과 회전 완료 피드백으로만 다음 단계로 넘어간다.
-            odom.pose.pose.position.x = 64.0  # 마지막 curvature pad를 뺀 경로 끝
+            # nominal 종점 도착·회전 완료와 실제 모드 정렬 확인으로 진행한다.
             request.data = DriveModeState.FORWARD
             mode.requested_mode = DriveModeState.FORWARD
             mode.status = DriveModeState.STATUS_READY
             request_pub.publish(request)
             mode_pub.publish(mode)
             wait_for(lambda: states and states[-1] == "TERMINAL_HOLD"
-                     and stationary(messages[-1]) and messages[-1].points[0].x == 64.0)
-            path.x = [64.0] * 21
-            path.y = [2.0 + i for i in range(21)]
-            path.yaw = [math.pi / 2] * 21
+                     and stationary(messages[-1]), timeout=30.0)
+            origin = messages[-1].points[0]
+            path.x = [origin.x + i * math.cos(0.6) for i in range(21)]
+            path.y = [origin.y + i * math.sin(0.6) for i in range(21)]
+            path.yaw = [0.6] * 21
             path.mode = [DriveModeState.FORWARD] * 21
             path_pub.publish(path)
             wait_for(lambda: messages[-1].points[0].requested_mode == DriveModeState.SPOT_TURN)
@@ -135,26 +138,22 @@ def main():
             wait_for(lambda: messages[-1].points[0].yaw_rate > 0.0)
             turn_start = len(messages)
             wait_for(lambda: len(messages) >= turn_start + 4)
-            assert all(abs(msg.points[0].body_yaw) < 1e-9 for msg in messages[turn_start:]), \
-                "미리보기가 실제 현재 자세를 진행시킴"
+            assert messages[-1].points[0].body_yaw > messages[turn_start].points[0].body_yaw, \
+                "odometry 없이 nominal 회전이 진행되지 않음"
             assert messages[-1].points[-1].body_yaw > messages[-1].points[0].body_yaw
-            odom.pose.pose.orientation.z = math.sin(math.pi / 4)
-            odom.pose.pose.orientation.w = math.cos(math.pi / 4)
             wait_for(lambda: messages[-1].points[0].requested_mode == DriveModeState.FORWARD)
             assert stationary(messages[-1]), "회전 후 일반 모드 정렬 전에 이동함"
             mode.current_mode = mode.requested_mode = DriveModeState.FORWARD
             mode_pub.publish(mode)
-            wait_for(lambda: messages[-1].points[0].vx > 0.01
+            wait_for(lambda: messages[-1].points[0].vx > 0.3
                      and messages[-1].points[-1].y > messages[-1].points[0].y)
 
-            # 충돌로 인한 강제 정지도 이전 /cmd_vel 기록 없이 측정 상태로 생성한다.
-            odom.twist.twist.linear.x = 0.5
+            # 충돌로 인한 강제 정지도 nominal 상태에서 생성한다.
             grid.data = [100] * len(grid.data)
             map_pub.publish(grid)
             wait_for(lambda: states[-1] == "SAFETY_STOP"
                      and messages[-1].points[0].vx > 0.1
                      and messages[-1].points[-1].vx < messages[-1].points[0].vx)
-            odom.twist.twist.linear.x = 0.0
             wait_for(lambda: stationary(messages[-1]))
             grid.data = [0] * len(grid.data)
             map_pub.publish(grid)
