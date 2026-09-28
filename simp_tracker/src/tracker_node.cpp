@@ -19,6 +19,12 @@ class TrackerNode final : public rclcpp::Node {
         "/planner/tracking_trajectory", rclcpp::QoS(1).reliable(),
         [this](simp_tracker::Trajectory::ConstSharedPtr message) {
           std::lock_guard<std::mutex> lock(input_mutex_);
+          if (latest_.trajectory) {
+            const auto& incoming = message->header.stamp;
+            const auto& stored = latest_.trajectory->header.stamp;
+            if (incoming.sec < stored.sec ||
+                (incoming.sec == stored.sec && incoming.nanosec <= stored.nanosec)) return;
+          }
           latest_.trajectory = std::move(message);
         });
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
@@ -27,6 +33,7 @@ class TrackerNode final : public rclcpp::Node {
           const auto pose = simp_tracker::odom_pose(*message);
           std::lock_guard<std::mutex> lock(input_mutex_);
           latest_.pose = pose;
+          latest_.odom_frame = message->header.frame_id;
         });
     control_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     timer_ = create_wall_timer(std::chrono::milliseconds(10), [this] { control(); }, control_group_);

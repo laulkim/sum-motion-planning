@@ -47,6 +47,7 @@ int main() {
     near(wrap_angle(-3.0 * kPi), kPi);
 
     auto a = std::make_shared<Trajectory>();
+    a->header.frame_id = "odom";
     a->header.stamp.sec = 1;
     a->sample_period.nanosec = 10000000;
     a->points.resize(31);
@@ -63,7 +64,7 @@ int main() {
     require(reference_index(*a, 1300000000) == 30, "last point must be usable");
     require(!reference_index(*a, 1300000001), "expired trajectory accepted");
 
-    Inputs latest{a, Pose{0.0, 0.0, 0.0}};
+    Inputs latest{a, Pose{0.0, 0.0, 0.0}, "odom"};
     std::mutex mutex;
     Inputs snapshot;
     {
@@ -85,10 +86,23 @@ int main() {
     const auto next_cycle = control_cycle(latest, 1000000001, Gains{});
     near(next_cycle.velocity.linear.x, 99.0);
     require(next_cycle.requested_mode == 3, "next cycle must use B");
+    auto wrong_frame = latest;
+    wrong_frame.odom_frame = "map";
+    const auto mismatch = control_cycle(wrong_frame, 1000000001, Gains{});
+    zero(mismatch);
+    require(mismatch.requested_mode == 3, "frame check must not change mode relay");
+    wrong_frame.odom_frame.clear();
+    zero(control_cycle(wrong_frame, 1000000001, Gains{}));
+    auto empty_frame = std::make_shared<Trajectory>(*b);
+    empty_frame->header.frame_id.clear();
+    wrong_frame.trajectory = empty_frame;
+    zero(control_cycle(wrong_frame, 1000000001, Gains{})); // 둘 다 빈 frame
+    wrong_frame.odom_frame = "odom";
+    zero(control_cycle(wrong_frame, 1000000001, Gains{})); // trajectory만 빈 frame
     zero(control_cycle(latest, 1300000001, Gains{}));
     zero(control_cycle(latest, 999999999, Gains{}));
     zero(control_cycle(Inputs{}, 1000000000, Gains{}));
-    zero(control_cycle(Inputs{a, std::nullopt}, 1010000000, Gains{}));
+    zero(control_cycle(Inputs{a, std::nullopt, "odom"}, 1010000000, Gains{}));
 
     auto invalid = std::make_shared<Trajectory>(*a);
     latest.trajectory = invalid;

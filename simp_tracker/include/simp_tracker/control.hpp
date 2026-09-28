@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <optional>
+#include <string>
 
 #include <geometry_msgs/msg/twist.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -19,6 +20,7 @@ struct Error { double ex, ey, etheta; };
 struct Inputs {
   Trajectory::ConstSharedPtr trajectory;
   std::optional<Pose> pose;
+  std::string odom_frame;
 };
 struct Control {
   geometry_msgs::msg::Twist velocity;
@@ -89,6 +91,9 @@ inline Control control_cycle(const Inputs& snapshot, std::int64_t now_ns,
   const auto& reference = snapshot.trajectory->points[*index];
   output.requested_mode = reference.requested_mode;
   if (!snapshot.pose) return output;
+  // 비어 있는 frame도 허용하지 않는다. 모드 전달은 기존 정책을 유지한다.
+  if (snapshot.odom_frame.empty() ||
+      snapshot.trajectory->header.frame_id != snapshot.odom_frame) return output;
   const auto& pose = *snapshot.pose;
   if (!std::isfinite(pose.x) || !std::isfinite(pose.y) || !std::isfinite(pose.yaw) ||
       !std::isfinite(gains.kx) || !std::isfinite(gains.ky) || !std::isfinite(gains.ktheta) ||

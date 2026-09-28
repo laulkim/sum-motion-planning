@@ -1,4 +1,5 @@
 """실제 ROS 노드의 독립 100 Hz 제어, 모드 전달, 만료 정지를 확인한다."""
+import copy
 import os
 import statistics
 import subprocess
@@ -68,7 +69,41 @@ def main():
             count = len(commands)
             wait_for(lambda: len(commands) >= count + 10)
             assert all(stopped(msg) for _, msg in commands[count:]), "stale command persisted"
+
+            # 새 참조를 저장한 뒤 늦게 도착한 과거/동일 stamp는 제어에 반영하지 않는다.
+            stamp = node.get_clock().now().nanoseconds
+            trajectory.header.stamp.sec, trajectory.header.stamp.nanosec = divmod(stamp, 1000000000)
+            trajectory.points = [TrackingTrajectoryPoint(x=2.0, requested_mode=2) for _ in range(31)]
+            trajectory_pub.publish(trajectory)
+            wait_for(lambda: commands[-1][1].linear.x == 6.0)
+            rejected = copy.deepcopy(trajectory)
+            rejected.points = [TrackingTrajectoryPoint(x=9.0, requested_mode=4) for _ in range(31)]
+            for rejected_stamp in (stamp - 10000000, stamp):
+                rejected.header.stamp.sec, rejected.header.stamp.nanosec = divmod(rejected_stamp, 1000000000)
+                trajectory_pub.publish(rejected)
+                count = len(commands)
+                wait_for(lambda: len(commands) >= count + 5)
+                assert all(msg.linear.x == 6.0 for _, msg in commands[count:]), \
+                    "older/equal stamp replaced latest trajectory"
+                assert modes[-1] == 2, "rejected trajectory changed mode relay"
+            trajectory.header.stamp.sec, trajectory.header.stamp.nanosec = divmod(stamp + 1, 1000000000)
+            trajectory.points = [TrackingTrajectoryPoint(x=4.0, requested_mode=3) for _ in range(31)]
+            trajectory_pub.publish(trajectory)
+            wait_for(lambda: commands[-1][1].linear.x == 12.0 and modes[-1] == 3)
+
+            # 동일 frame에서 제어하다 odom frame이 바뀌면 즉시 zero로 바뀐다.
+            stamp = node.get_clock().now().nanoseconds
+            trajectory.header.stamp.sec, trajectory.header.stamp.nanosec = divmod(stamp, 1000000000)
+            trajectory_pub.publish(trajectory)
+            odom.header.frame_id = "map"
+            odom_pub.publish(odom)
+            wait_for(lambda: stopped(commands[-1][1]))
+            assert modes[-1] == 3, "frame mismatch changed mode relay"
+            odom.header.frame_id = "odom"
+            odom_pub.publish(odom)
+            wait_for(lambda: commands[-1][1].linear.x == 12.0)
             print(f"tracker ROS passed: {len(valid)} controls from one input, median {median:.4f}s")
+            print("timestamp ordering/equality and frame mismatch/recovery passed")
         except Exception:
             log.seek(0)
             print(log.read(), file=sys.stderr)
