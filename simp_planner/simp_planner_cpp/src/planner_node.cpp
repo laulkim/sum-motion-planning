@@ -214,7 +214,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
     input_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     environment_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     planning_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-    execution_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    tracking_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
     auto static_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
     status_pub_ = create_publisher<std_msgs::msg::String>("/planner/status", static_qos);
@@ -260,7 +260,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
         std::bind(&PlannerNodeCpp::planning_callback, this), planning_group_);
     tracking_timer_ = create_wall_timer(
         std::chrono::milliseconds(100),
-        std::bind(&PlannerNodeCpp::tracking_callback, this), execution_group_);
+        std::bind(&PlannerNodeCpp::tracking_callback, this), tracking_group_);
 
     RCLCPP_INFO(get_logger(),
                 "Native C++ planner ready: planning<=%.1f Hz, tracking=10 Hz / 31 points, "
@@ -323,16 +323,11 @@ class PlannerNodeCpp final : public rclcpp::Node {
         revision_state(input), current_revision_state_locked());
   }
 
-  void invalidate_pending_plan() {
-    std::lock_guard<std::mutex> lock(execution_mutex_);
-    pending_plan_.reset();
-  }
-
   void invalidate_motion_plan() {
-    std::scoped_lock lock(input_mutex_, execution_mutex_);
+    std::scoped_lock lock(input_mutex_, plan_mutex_);
     advance_nominal_state_locked(now_ns());
-    pending_plan_.reset();
-    active_plan_.reset();
+    latest_plan_.reset();
+    previous_plan_.reset();
     start_nominal_stop_locked();
   }
 
@@ -670,8 +665,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
         }
       }
       if (identical) return;
-      // A rolling local window is a soft update: keep the already validated
-      // pending/active plan.  A route or mode discontinuity remains hard.
+      // Rolling local windows keep validated reference plans;
+      // route or mode discontinuities invalidate them.
       if (hard_change) invalidate_motion_plan();
       if (hard_change) {
         std::lock_guard<std::mutex> lock(terminal_hold_mutex_);
@@ -772,26 +767,23 @@ class PlannerNodeCpp final : public rclcpp::Node {
       const double build_ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - build_start).count();
 
-      // Precompute the common pending-plan validation path outside both state
-      // mutexes.  The final pointer comparison below handles a plan that was
-      // registered or activated while this check was running.
-      std::shared_ptr<const ExecutablePlan> pending_to_validate;
+      // 최신 참조 계획의 충돌 검사는 잠금 밖에서 수행하고 등록 경쟁을 재확인한다.
+      std::shared_ptr<const ExecutablePlan> plan_to_validate;
       {
-        std::lock_guard<std::mutex> lock(execution_mutex_);
-        pending_to_validate = pending_plan_;
+        std::lock_guard<std::mutex> lock(plan_mutex_);
+        plan_to_validate = latest_plan_;
       }
-      std::optional<OrientedCollisionResult> pending_collision;
-      if (pending_to_validate) {
-        pending_collision = check_oriented_allocation_collision(
-            pending_to_validate->allocation, *map, config_.vehicle,
+      std::optional<OrientedCollisionResult> plan_collision;
+      if (plan_to_validate) {
+        plan_collision = check_oriented_allocation_collision(
+            plan_to_validate->allocation, *map, config_.vehicle,
             config_.cost, oriented_footprint_config());
       }
 
-      std::shared_ptr<const ExecutablePlan> invalidated_pending;
+      std::shared_ptr<const ExecutablePlan> invalidated_plan;
       {
-        // Commit the map and validate pending handover as one state change.
-        // tracking_callback cannot activate a plan between these operations.
-        std::scoped_lock lock(input_mutex_, execution_mutex_);
+        // 지도 반영과 참조 무효화를 배열 생성에 대해 원자적으로 처리한다.
+        std::scoped_lock lock(input_mutex_, plan_mutex_);
         if (received_odom_ && !odom_frame_.empty() &&
             msg->header.frame_id != odom_frame_) {
           throw std::invalid_argument(
@@ -802,14 +794,19 @@ class PlannerNodeCpp final : public rclcpp::Node {
           throw std::invalid_argument(
               "OccupancyGrid frame changed relative to reference path during build");
         }
-        if (pending_plan_) {
-          const auto collision = pending_plan_ == pending_to_validate
-              ? *pending_collision
+        if (latest_plan_) {
+          const auto collision = latest_plan_ == plan_to_validate
+              ? *plan_collision
               : check_oriented_allocation_collision(
-                    pending_plan_->allocation, *map, config_.vehicle,
+                    latest_plan_->allocation, *map, config_.vehicle,
                     config_.cost, oriented_footprint_config());
           if (!collision.collision_free) {
-            invalidated_pending = std::move(pending_plan_);
+            invalidated_plan = latest_plan_;
+            advance_nominal_state_locked(now_ns());
+            latest_plan_.reset();
+            previous_plan_.reset();
+            forced_safety_stop_ = true;
+            start_nominal_stop_locked();
           }
         }
         costmap_ = std::move(map);
@@ -830,11 +827,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
         costmap_crop_height_ = map_height;
         costmap_crop_resolution_ = msg->info.resolution;
       }
-      // A rolling costmap supersedes the environment for the next planning
-      // cycle.  A collision-free pending handover survives arbitrary update
-      // rates; a newly colliding one is discarded by the atomic gate above.
+      // 충돌한 참조는 감속으로 대체하고 새 지도에서 재계획한다.
       request_replan(
-          invalidated_pending ? "COSTMAP_INVALIDATED_PENDING"
+          invalidated_plan ? "COSTMAP_INVALIDATED_REFERENCE"
                               : "COSTMAP_CHANGED",
           true);
     } catch (const std::exception& error) {
@@ -856,7 +851,6 @@ class PlannerNodeCpp final : public rclcpp::Node {
       if (changed) ++command_revision_;
     }
     if (!changed) return;
-    invalidate_pending_plan();
     request_replan("TARGET_SPEED_CHANGED", true);
   }
 
@@ -974,7 +968,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
   }
 
   void planning_callback() {
-    const auto input = snapshot();
+    auto input = snapshot();
     if (!input) {
       publish_status("WAITING_FOR_INPUTS", 0.0, -1);
       return;
@@ -999,11 +993,10 @@ class PlannerNodeCpp final : public rclcpp::Node {
     }
     bool has_plan;
     {
-      std::lock_guard<std::mutex> lock(execution_mutex_);
+      std::lock_guard<std::mutex> lock(plan_mutex_);
       // 감속 중에는 nominal 정지 상태까지 진행한 뒤 새 계획을 만든다.
       if (nominal_stop_ && !nominal_stop_->stopped()) return;
-      has_plan = static_cast<bool>(active_plan_) || static_cast<bool>(pending_plan_);
-      if (pending_plan_ && now_ns() < pending_plan_->start_ns) return;
+      has_plan = static_cast<bool>(previous_plan_) || static_cast<bool>(latest_plan_);
     }
     const auto token = scheduler_.begin_if_due(now_ns(), has_plan, false);
     if (!token) return;
@@ -1012,21 +1005,32 @@ class PlannerNodeCpp final : public rclcpp::Node {
       simp_planner::reset_planning_call_counts();
       ensure_planner(*input);
       const auto start_wall = std::chrono::steady_clock::now();
-      const auto scheduled_start = align_time_ns(
+      auto scheduled_start = align_time_ns(
           now_ns() + static_cast<std::int64_t>(
               std::llround(handover_timing_.recommended_lead_sec() * 1.0e9)),
           kTrackingSampleDt);
-      std::shared_ptr<const ExecutablePlan> active;
+      std::shared_ptr<const ExecutablePlan> predecessor;
       {
-        std::lock_guard<std::mutex> lock(execution_mutex_);
-        active = active_plan_;
+        std::scoped_lock lock(input_mutex_, plan_mutex_);
+        const auto stamp_ns = now_ns();
+        advance_nominal_state_locked(stamp_ns);
+        input->state = current_state_;
+        input->body_yaw = current_body_yaw_;
+        input->state_time_ns = current_state_time_ns_;
+        // 미래 계획의 재계산은 같은 경계에서 교체한다. 시작 시각을 계속 미루지 않는다.
+        if (latest_plan_ && stamp_ns < latest_plan_->start_ns) {
+          scheduled_start = latest_plan_->start_ns;
+          predecessor = previous_plan_;
+        } else {
+          predecessor = latest_plan_;
+        }
       }
       const auto handover_start = std::chrono::steady_clock::now();
       const auto handover = predict_handover_state(
           input->state, input->body_yaw, input->state_time_ns, scheduled_start,
-          active ? std::optional<std::int64_t>(active->start_ns) : std::nullopt,
-          active ? &active->allocation : nullptr,
-          active ? &active->result.trajectory.actions : nullptr,
+          predecessor ? std::optional<std::int64_t>(predecessor->start_ns) : std::nullopt,
+          predecessor ? &predecessor->allocation : nullptr,
+          predecessor ? &predecessor->result.trajectory.actions : nullptr,
           kTrackingSampleDt, std::min(std::abs(config_.constraints.a_min),
                                 config_.longitudinal.service_deceleration),
           std::min(config_.constraints.jerk_max, config_.longitudinal.comfort_jerk));
@@ -1036,7 +1040,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       // 미래 handover는 새 계획의 초기 조건이다. 현재 nominal 시각을 덮어쓰지 않는다.
 
       std::optional<FrenetProjection> handover_projection;
-      if (active) {
+      if (predecessor) {
         handover_projection = planner_->path().project(
             handover.state.x, handover.state.y, handover.state.chi);
         const double terminal_goal_s = std::max(
@@ -1045,8 +1049,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
             0.0);
         const double remaining = terminal_goal_s - handover_projection->s;
         if (std::abs(remaining) <= 0.20 && handover.state.speed <= 0.25) {
-          publish_status("TERMINAL_ACTIVE_PLAN_FINISHING", 0.0,
-                         static_cast<std::int64_t>(active->plan_id));
+          publish_status("TERMINAL_REFERENCE_FINISHING", 0.0,
+                         static_cast<std::int64_t>(predecessor->plan_id));
           return;
         }
       }
@@ -1113,7 +1117,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
                            input->structural_revision,
                            "NO_SAFE_PLAN_RETRY", false);
         publish_status("NO_SAFE_PLAN_SAFETY_STOP", 0.0,
-                       active ? static_cast<std::int64_t>(active->plan_id) : -1);
+                       predecessor ? static_cast<std::int64_t>(predecessor->plan_id) : -1);
         return;
       }
       auto result = std::move(*selected_result);
@@ -1215,11 +1219,14 @@ class PlannerNodeCpp final : public rclcpp::Node {
       bool registration_collision = false;
       {
         // Register atomically with respect to hard input revision updates and
-        // costmap commit/pending validation.  The second collision check is a
+        // costmap commit/reference validation.  The second collision check is a
         // rare TOCTOU guard if a map landed after the optimistic check above.
-        std::scoped_lock lock(input_mutex_, execution_mutex_);
+        std::scoped_lock lock(input_mutex_, plan_mutex_);
+        const auto reference = latest_plan_ && now_ns() < latest_plan_->start_ns
+            ? previous_plan_ : latest_plan_;
         registration_stale = !plan_registration_is_current(
-            revision_state(*input), current_revision_state_locked());
+            revision_state(*input), current_revision_state_locked()) ||
+            reference != predecessor;
         if (!registration_stale &&
             executable->structural_revision != structural_revision_) {
           const auto latest_collision = check_oriented_allocation_collision(
@@ -1233,8 +1240,14 @@ class PlannerNodeCpp final : public rclcpp::Node {
                 latest_collision.minimum_clearance);
           }
         }
+        registration_stale = registration_stale || now_ns() >= scheduled_start;
         if (!registration_stale && !registration_collision) {
-          pending_plan_ = executable;
+          advance_nominal_state_locked(ready_ns);
+          previous_plan_ = predecessor;
+          latest_plan_ = executable;
+          nominal_stop_.reset();
+          forced_safety_stop_ = false;
+          scheduler_.mark_plan_registered(ready_ns);
         }
       }
       if (registration_stale) {
@@ -1247,7 +1260,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
             "LATEST_COSTMAP_COLLISION_REPLAN", elapsed_sec * 1000.0, -1);
         return;
       }
-      publish_status("PENDING_PLAN_READY", elapsed_sec * 1000.0,
+      publish_trajectory(*executable);
+      publish_plan_status(*executable, executable->compute_ms);
+      publish_status("REFERENCE_PLAN_READY", elapsed_sec * 1000.0,
                      executable->result.diagnostics.selected_candidate_id);
     } catch (const std::exception& error) {
       RCLCPP_ERROR(get_logger(), "Planning failed: %s", error.what());
@@ -1257,23 +1272,12 @@ class PlannerNodeCpp final : public rclcpp::Node {
   }
 
   void engage_forced_safety_stop() {
-    std::scoped_lock lock(input_mutex_, execution_mutex_);
+    std::scoped_lock lock(input_mutex_, plan_mutex_);
     advance_nominal_state_locked(now_ns());
     forced_safety_stop_ = true;
-    pending_plan_.reset();
-    active_plan_.reset();
+    latest_plan_.reset();
+    previous_plan_.reset();
     start_nominal_stop_locked();
-  }
-
-  std::shared_ptr<const ExecutablePlan> activate_pending_locked(
-      std::int64_t stamp_ns) {
-    if (!pending_plan_ || stamp_ns < pending_plan_->start_ns) return nullptr;
-    active_plan_ = pending_plan_;
-    pending_plan_.reset();
-    nominal_stop_.reset();
-    forced_safety_stop_ = false;
-    scheduler_.mark_plan_activated(stamp_ns);
-    return active_plan_;
   }
 
   void publish_execution_state_if_changed(const std::string& state) {
@@ -1299,8 +1303,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
   }
 
   std::uint64_t current_plan_id() const {
-    std::lock_guard<std::mutex> lock(execution_mutex_);
-    return active_plan_ ? active_plan_->plan_id : 0;
+    std::lock_guard<std::mutex> lock(plan_mutex_);
+    return latest_plan_ ? latest_plan_->plan_id : 0;
   }
 
   static void advance_tracking_pose(
@@ -1321,14 +1325,21 @@ class PlannerNodeCpp final : public rclcpp::Node {
   }
 
   // 첫 odometry 이후의 상태는 nominal 시간축으로만 진행한다.
-  // 호출자는 input_mutex_와 execution_mutex_를 소유해야 한다.
+  // 호출자는 input_mutex_와 plan_mutex_를 소유해야 한다.
   void advance_nominal_state_locked(std::int64_t stamp_ns) {
     if (!received_odom_ || stamp_ns <= current_state_time_ns_) return;
-    if (active_plan_) {
+    // handover를 가로지르면 이전 구간을 먼저 적분하고 같은 시각에서 이어간다.
+    if (latest_plan_ && current_state_time_ns_ < latest_plan_->start_ns &&
+        stamp_ns > latest_plan_->start_ns) {
+      advance_nominal_state_locked(latest_plan_->start_ns);
+    }
+    const auto plan = latest_plan_ && current_state_time_ns_ >= latest_plan_->start_ns
+        ? latest_plan_ : previous_plan_;
+    if (plan) {
       const auto predicted = predict_handover_state(
           current_state_, current_body_yaw_, current_state_time_ns_, stamp_ns,
-          active_plan_->start_ns, &active_plan_->allocation,
-          &active_plan_->result.trajectory.actions, kTrackingSampleDt,
+          plan->start_ns, &plan->allocation,
+          &plan->result.trajectory.actions, kTrackingSampleDt,
           std::min(std::abs(config_.constraints.a_min), config_.longitudinal.service_deceleration),
           std::min(config_.constraints.jerk_max, config_.longitudinal.comfort_jerk));
       current_state_ = predicted.state;
@@ -1379,23 +1390,19 @@ class PlannerNodeCpp final : public rclcpp::Node {
     }
     current_state_time_ns_ = stamp_ns;
     last_motion_chi_ = current_state_.chi;
+    if (latest_plan_ && stamp_ns >= latest_plan_->start_ns) previous_plan_.reset();
   }
 
   void tracking_callback() {
-    std::shared_ptr<const ExecutablePlan> activated;
     ReferencePathMsg::SharedPtr deferred;
     bool resumed_after_turn = false;
     std::string reference_state;
     {
       // 계획 등록·무효화와 배열 발행 순서를 보호한다. 미리보기는 복사본만 진행한다.
-      std::scoped_lock lock(input_mutex_, execution_mutex_, terminal_hold_mutex_);
+      std::scoped_lock lock(input_mutex_, plan_mutex_, terminal_hold_mutex_);
       if (!received_odom_ || !mode_supervisor_.current_mode() ||
           !mode_supervisor_.requested_mode()) return;
       const auto stamp_ns = now_ns();
-      if (pending_plan_ && pending_plan_->start_ns <= stamp_ns && mode_supervisor_.ready()) {
-        advance_nominal_state_locked(pending_plan_->start_ns);
-        activated = activate_pending_locked(stamp_ns);
-      }
       advance_nominal_state_locked(stamp_ns);
 
       if (reference_path_ && mode_supervisor_.current_mode() == reference_mode_) {
@@ -1414,8 +1421,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
         ++path_revision_;
         ++command_revision_;
         terminal_hold_.reset();
-        active_plan_.reset();
-        pending_plan_.reset();
+        previous_plan_.reset();
+        latest_plan_.reset();
         deferred = std::move(deferred_reference_);
         resumed_after_turn = true;
       }
@@ -1439,8 +1446,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
       const bool mode_ready = mode_supervisor_.ready();
       const bool turning = maneuver_.state() != SpotTurnManeuverState::Inactive;
       if (!mode_ready || turning || spot_turn_waiting_clearance_) {
-        pending_plan_.reset();
-        active_plan_.reset();
+        latest_plan_.reset();
+        previous_plan_.reset();
       }
       const bool hold = mode_ready && !turning && terminal_hold_.active();
       const bool stopping_for_mode = !mode_ready &&
@@ -1492,8 +1499,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
         } else if (forced_safety_stop_) {
           command = stop->sample_and_advance(kTrackingSampleDt);
         } else {
-          auto plan = pending_plan_ && target_ns >= pending_plan_->start_ns
-              ? pending_plan_ : active_plan_;
+          auto plan = latest_plan_ && target_ns >= latest_plan_->start_ns
+              ? latest_plan_ : previous_plan_;
           if (plan && target_ns >= plan->start_ns) {
             const double time = (target_ns - plan->start_ns) * 1.0e-9;
             const double end = plan->allocation.trajectory.t.back();
@@ -1543,16 +1550,12 @@ class PlannerNodeCpp final : public rclcpp::Node {
           : (turning ? "SPOT_TURN_ROTATING"
           : (hold ? "TERMINAL_HOLD"
           : ((forced_safety_stop_ || expired) ? "SAFETY_STOP"
-          : (active_plan_ ? "ACTIVE_PLAN" : "IDLE")))));
+          : (latest_plan_ ? "PLAN_REFERENCE" : "IDLE")))));
       tracking_pub_->publish(message);
     }
     if (resumed_after_turn) {
       if (deferred) path_callback(deferred);
       request_replan("SPOT_TURN_COMPLETED", true);
-    }
-    if (activated) {
-      publish_trajectory(*activated);
-      publish_plan_status(*activated, activated->compute_ms);
     }
     publish_execution_state_if_changed(reference_state);
   }
@@ -1668,7 +1671,10 @@ class PlannerNodeCpp final : public rclcpp::Node {
            << "\"current_plan_id\":" << plan.plan_id
            << ",\"state\":\"" << current_execution_state() << "\"}"
            << ",\"plan\":{"
-           << "\"status\":\"" << diagnostics.status << "\""
+           << "\"id\":" << plan.plan_id
+           << ",\"start_ns\":" << plan.start_ns
+           << ",\"ready_ns\":" << plan.ready_ns
+           << ",\"status\":\"" << diagnostics.status << "\""
            << ",\"selected_candidate_id\":"
            << diagnostics.selected_candidate_id
            << ",\"selected_n_target\":" << selected_n_target
@@ -1805,13 +1811,13 @@ class PlannerNodeCpp final : public rclcpp::Node {
   }
 
   mutable std::mutex input_mutex_;
-  mutable std::mutex execution_mutex_;
+  mutable std::mutex plan_mutex_;
   mutable std::mutex terminal_hold_mutex_;
   mutable std::mutex execution_state_mutex_;
   rclcpp::CallbackGroup::SharedPtr input_group_;
   rclcpp::CallbackGroup::SharedPtr environment_group_;
   rclcpp::CallbackGroup::SharedPtr planning_group_;
-  rclcpp::CallbackGroup::SharedPtr execution_group_;
+  rclcpp::CallbackGroup::SharedPtr tracking_group_;
 
   LatestOnlyPlanningScheduler scheduler_;
   AdaptiveHandoverTiming handover_timing_;
@@ -1866,8 +1872,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
   double costmap_crop_resolution_{0.0};
 
   // 참조 생성과 handover용 계획 상태. Tracker의 실행/수락 상태가 아니다.
-  std::shared_ptr<const ExecutablePlan> active_plan_;
-  std::shared_ptr<const ExecutablePlan> pending_plan_;
+  std::shared_ptr<const ExecutablePlan> previous_plan_;
+  std::shared_ptr<const ExecutablePlan> latest_plan_;
   bool forced_safety_stop_{false};
   std::uint64_t plan_id_counter_{0};
   std::string execution_state_{"STARTUP"};

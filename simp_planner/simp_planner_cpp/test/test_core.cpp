@@ -814,6 +814,11 @@ void test_scheduler_and_safety_tail() {
   require(coalesced->input_revision == 10 &&
               coalesced->structural_revision == 10,
           "costmap burst did not coalesce to the latest revision");
+  scheduler.mark_plan_registered(120000000);
+  require(!scheduler.begin_if_due(619000000, true, false),
+          "registered reference aged too early");
+  require(scheduler.begin_if_due(620000000, true, false).has_value(),
+          "reference refresh still depends on plan activation");
 
   simp_planner::JerkLimitedSafetyStop safety(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.8);
   for (int i = 0; i < 1000 && !safety.stopped(); ++i) safety.advance(0.01);

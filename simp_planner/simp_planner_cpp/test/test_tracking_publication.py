@@ -1,5 +1,6 @@
 """ROS 환경을 source한 뒤 python3 이파일 planner_node_cpp경로 로 실행한다."""
 
+import json
 import math
 import os
 import statistics
@@ -29,8 +30,16 @@ def main():
     speed_pub = node.create_publisher(Float64, "/target_speed", qos)
     messages = []
     states = []
+    plans = []
     node.create_subscription(TrackingTrajectory, "/planner/tracking_trajectory", messages.append, 100)
     node.create_subscription(String, "/planner/execution_state", lambda msg: states.append(msg.data), qos)
+
+    def receive_status(message):
+        plan = json.loads(message.data).get("plan", {})
+        if "start_ns" in plan:
+            plans.append(plan)
+
+    node.create_subscription(String, "/planner/status", receive_status, 100)
 
     odom = Odometry()
     odom.header.frame_id = "map"
@@ -71,7 +80,11 @@ def main():
         return all(abs(p.vx) + abs(p.vy) + abs(p.yaw_rate) < 1e-9 for p in message.points)
 
     with tempfile.TemporaryFile(mode="w+") as log:
-        process = subprocess.Popen([sys.argv[1]], stdout=log, stderr=log)
+        process = subprocess.Popen([
+            sys.argv[1], "--ros-args",
+            "-p", "planning_handover_min_lead_sec:=0.6",
+            "-p", "planning_handover_initial_lead_sec:=0.6",
+        ], stdout=log, stderr=log)
         try:
             mode_pub.publish(mode)
             request_pub.publish(request)
@@ -95,10 +108,38 @@ def main():
             path_pub.publish(path)
             map_pub.publish(grid)
             speed_pub.publish(Float64(data=1.0))
+            wait_for(lambda: len(plans) >= 1)
+            first_plan = plans[-1]
+            speed_pub.publish(Float64(data=0.8))
+            wait_for(lambda: plans[-1]["id"] > first_plan["id"])
+            assert plans[-1]["ready_ns"] < first_plan["start_ns"], \
+                "미래 계획 존재로 다음 planning이 차단됨"
+            assert plans[-1]["start_ns"] == first_plan["start_ns"], \
+                "재계획이 handover 시각을 계속 뒤로 미룸"
             wait_for(lambda: messages[-1].points[0].vx > 0.1)
             moving = messages[-1]
             assert moving.points[-1].x > moving.points[0].x, "미래 위치가 진행하지 않음"
             assert all(abs(p.y - 2.0) < 1e-5 for p in moving.points), "직선 경로 이탈"
+
+            # 주행 중에도 새 계획을 즉시 등록하고 한 배열 안에서 경계를 연결한다.
+            plan_id = plans[-1]["id"]
+            speed_pub.publish(Float64(data=0.6))
+            wait_for(lambda: plans[-1]["id"] > plan_id)
+            boundary = plans[-1]["start_ns"]
+
+            def stamp_ns(message):
+                return message.header.stamp.sec * 1000000000 + message.header.stamp.nanosec
+
+            wait_for(lambda: stamp_ns(messages[-1]) < boundary <
+                     stamp_ns(messages[-1]) + 300000000)
+            crossing = messages[-1]
+            assert crossing.points[0].vx > 0.0, "handover 이전 계획 구간이 사라짐"
+            assert all(0 <= b.x - a.x < 0.03 and abs(b.vx - a.vx) < 0.05
+                       for a, b in zip(crossing.points, crossing.points[1:])), \
+                "handover 경계에서 참조 위치/속도 단절"
+            wait_for(lambda: stamp_ns(messages[-1]) > boundary + 100000000)
+            assert messages[-1].points[0].x > crossing.points[0].x, \
+                "이전 계획 정리 후 nominal 진행 중단"
 
             # nominal 주행 중 모드 변경은 감속 참조를 만들되 미래 정렬 완료를 가정하지 않는다.
             mode.requested_mode = DriveModeState.LEFT

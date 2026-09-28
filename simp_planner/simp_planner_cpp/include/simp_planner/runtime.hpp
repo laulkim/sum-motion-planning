@@ -125,7 +125,7 @@ PredictedHandoverState predict_handover_state(
     double current_body_yaw,
     std::int64_t current_state_time_ns,
     std::int64_t handover_time_ns,
-    std::optional<std::int64_t> active_plan_start_ns,
+    std::optional<std::int64_t> plan_start_ns,
     const AllocationResult* allocation,
     const std::vector<PlannerAction>* planned_actions,
     double integration_dt,
@@ -256,10 +256,10 @@ class LatestOnlyPlanningScheduler {
   void request(std::int64_t now_ns, std::uint64_t input_revision,
                std::uint64_t structural_revision, std::string reason,
                bool urgent = false);
-  void mark_plan_activated(std::int64_t now_ns);
+  void mark_plan_registered(std::int64_t now_ns);
   bool request_pending() const;
   std::optional<PlanningRequestToken> begin_if_due(std::int64_t now_ns,
-                                                    bool has_active_plan,
+                                                    bool has_plan,
                                                     bool worker_busy);
 
  private:
@@ -276,7 +276,7 @@ class LatestOnlyPlanningScheduler {
   std::set<std::string> reasons_;
   std::uint64_t request_id_{0};
   std::optional<std::int64_t> last_started_ns_;
-  std::optional<std::int64_t> last_activated_ns_;
+  std::optional<std::int64_t> last_registered_ns_;
 };
 
 class AdaptiveHandoverTiming {

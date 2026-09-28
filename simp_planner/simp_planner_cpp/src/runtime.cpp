@@ -198,7 +198,7 @@ std::int64_t align_time_ns(std::int64_t time_ns, double period_sec) {
 PredictedHandoverState predict_handover_state(
     const PlannerState& current_state, double current_body_yaw,
     std::int64_t current_state_time_ns, std::int64_t handover_time_ns,
-    std::optional<std::int64_t> active_plan_start_ns,
+    std::optional<std::int64_t> plan_start_ns,
     const AllocationResult* allocation,
     const std::vector<PlannerAction>* planned_actions,
     double integration_dt, double safety_deceleration_limit,
@@ -207,14 +207,14 @@ PredictedHandoverState predict_handover_state(
       !std::isfinite(integration_dt) || handover_time_ns < current_state_time_ns) {
     throw std::invalid_argument("invalid handover prediction input");
   }
-  if (allocation == nullptr || planned_actions == nullptr || !active_plan_start_ns) {
+  if (allocation == nullptr || planned_actions == nullptr || !plan_start_ns) {
     return {current_state, current_body_yaw, {}, std::nullopt, std::nullopt};
   }
   validate_allocation(*allocation, *planned_actions);
   const double start_elapsed = std::max(0.0, 1.0e-9 *
-      static_cast<double>(current_state_time_ns - *active_plan_start_ns));
+      static_cast<double>(current_state_time_ns - *plan_start_ns));
   const double end_elapsed = std::max(0.0, 1.0e-9 *
-      static_cast<double>(handover_time_ns - *active_plan_start_ns));
+      static_cast<double>(handover_time_ns - *plan_start_ns));
   const double trajectory_end = allocation->trajectory.t.back();
   double x = current_state.x;
   double y = current_state.y;
@@ -539,9 +539,9 @@ void LatestOnlyPlanningScheduler::request(
   ++request_id_;
 }
 
-void LatestOnlyPlanningScheduler::mark_plan_activated(std::int64_t now_ns) {
+void LatestOnlyPlanningScheduler::mark_plan_registered(std::int64_t now_ns) {
   std::lock_guard<std::mutex> lock(mutex_);
-  last_activated_ns_ = now_ns;
+  last_registered_ns_ = now_ns;
 }
 
 bool LatestOnlyPlanningScheduler::request_pending() const {
@@ -550,11 +550,11 @@ bool LatestOnlyPlanningScheduler::request_pending() const {
 }
 
 std::optional<PlanningRequestToken> LatestOnlyPlanningScheduler::begin_if_due(
-    std::int64_t now_ns, bool has_active_plan, bool worker_busy) {
+    std::int64_t now_ns, bool has_plan, bool worker_busy) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (worker_busy) return std::nullopt;
-  const bool watchdog_due = !has_active_plan ||
-      (last_activated_ns_ && now_ns - *last_activated_ns_ >= maximum_plan_age_ns_);
+  const bool watchdog_due = !has_plan ||
+      (last_registered_ns_ && now_ns - *last_registered_ns_ >= maximum_plan_age_ns_);
   const bool request_due = pending_ && (urgent_ || now_ns - first_request_ns_ >= input_coalescing_ns_);
   if (!request_due && !watchdog_due) return std::nullopt;
   if (last_started_ns_ && now_ns - *last_started_ns_ < minimum_start_interval_ns_) return std::nullopt;

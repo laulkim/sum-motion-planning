@@ -24,9 +24,14 @@
   `command_callback()`과 100 Hz 명령 타이머는 제거했다. `/cmd_vel`,
   `/planner/cmd_vel_stamped`, `/planner/executed_command`,
   `/vehicle/drive_mode_command`를 직접 발행하지 않는다.
-- `active_plan_ / pending_plan_`은 시각에 따른 내부 계획 handover용이다.
-  Tracker의 실행 확인이 아니다. 기존 `/planner/execution_state` 진단도
-  실제 실행이 아닌 참조 생성 상태를 나타낸다.
+- 계산 결과는 즉시 `latest_plan_`으로 등록한다. `previous_plan_`은 새
+  계획의 `start_ns` 이전 구간에만 사용하고 현재 시각이 경계를 지나면 버린다.
+  배열의 각 점을 절대시간으로 선택하며 계획 activation은 없다.
+  미래 계획을 다시 계산하면 같은 handover 시각에서 교체하고,
+  초기조건은 이전 nominal 계획을 `predict_handover_state()`로 예측한다.
+  미래 계획의 존재로 planning을 막지 않는다. 재계산이 경계에 늦으면 버리고 재시도한다.
+  기존 `/planner/execution_state`와 status의 `execution` 필드는 호환용
+  참조 생성 진단이며 차량의 실제 실행 여부를 나타내지 않는다.
 - odometry는 첫 1회 초기 자세·속도 설정에만 사용하며 이후 수신은 무시한다.
   이후 상태는 nominal 계획과 handover의 시간축으로 진행한다.
   지속적인 차량 피드백은 `DriveModeState`의 모드와 정렬 상태뿐이다.
@@ -39,7 +44,8 @@
 - 각 점의 `current_mode`는 마지막으로 확인한 차량 모드,
   `requested_mode`는 발행 시 플래너의 요청이다. 미래 정렬 완료나 모드
   전환 완료를 추측하지 않는다. 회전 완료 예측 뒤에는 정지해 기다린다.
-- Tracker만 odometry를 지속 수신해 실제 위치·자세·속도 오차를 계산한다.
+- Tracker는 가장 최신 배열 하나만 저장하고 새 배열 수신 시 교체한다.
+  Tracker만 odometry를 지속 수신해 실제 위치·자세·속도 오차를 계산한다.
   향후 100 Hz 제어 루프가 현재 시각의 참조점 선택, 추종 제어,
   하위제어기로의 모드 요청과 차량 명령 발행을 담당한다. 배열의 최신 교체,
   취소·만료와 모드 준비 상태 처리도 필요하다. 아직 Tracker는 구현하지
@@ -48,7 +54,8 @@
 ## 확인
 
 워크스페이스에서 빌드와 환경 설정 후 실행한다. 테스트가 별도 ROS domain에
-플래너를 띄워 배열 크기·간격·발행 주기와 주행·모드 대기를 확인한다.
+플래너를 띄워 배열 크기·간격·발행 주기, 시작 전 계획 교체와 handover
+경계의 연속성, odom-once, nominal 주행·감속·회전·모드 대기를 확인한다.
 
 ```bash
 source install/setup.bash
