@@ -74,6 +74,11 @@ if(BUILD_TESTING)
   target_link_libraries(test_spot_turn simp_planner_core)
   target_compile_options(test_spot_turn PRIVATE -Wall -Wextra -Wpedantic)
   add_test(NAME spot_turn_tests COMMAND test_spot_turn)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME tracking_publication_tests COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_tracking_publication.py
+    $<TARGET_FILE:planner_node_cpp>)
+  set_tests_properties(tracking_publication_tests PROPERTIES TIMEOUT 90)
 endif()
 
 install(TARGETS

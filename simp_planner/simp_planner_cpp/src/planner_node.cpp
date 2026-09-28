@@ -3,14 +3,11 @@
 
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/quaternion.hpp>
-#include <geometry_msgs/msg/twist.hpp>
-#include <geometry_msgs/msg/twist_stamped.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <simp_planner_msgs/msg/drive_mode_state.hpp>
-#include <simp_planner_msgs/msg/executed_command.hpp>
 #include <simp_planner_msgs/msg/reference_path.hpp>
 #include <simp_planner_msgs/msg/tracking_trajectory.hpp>
 #include <std_msgs/msg/float64.hpp>
@@ -38,10 +35,10 @@ namespace simp_planner {
 namespace {
 
 using ReferencePathMsg = simp_planner_msgs::msg::ReferencePath;
-using ExecutedCommandMsg = simp_planner_msgs::msg::ExecutedCommand;
 using DriveModeStateMsg = simp_planner_msgs::msg::DriveModeState;
 
 constexpr double kMotionThreshold = 0.03;
+constexpr double kTrackingSampleDt = 0.01;
 
 double quaternion_to_yaw(double x, double y, double z, double w) {
   const double siny_cosp = 2.0 * (w * z + x * y);
@@ -179,14 +176,12 @@ class PlannerNodeCpp final : public rclcpp::Node {
             0.95,
             declare_parameter<double>("planning_handover_scale", 1.20)) {
     trajectory_knot_dt_ = declare_parameter<double>("trajectory_knot_dt_sec", 0.10);
-    command_frequency_hz_ = declare_parameter<double>("command_frequency_hz", 100.0);
     scheduler_frequency_hz_ = declare_parameter<double>("planning_scheduler_frequency_hz", 100.0);
     costmap_update_period_sec_ =
         declare_parameter<double>("costmap_update_period_sec", 0.20);
     maximum_handover_lead_sec_ =
         get_parameter("planning_handover_max_lead_sec").as_double();
     mode_change_stop_speed_ = declare_parameter<double>("mode_change_stop_speed_mps", 0.03);
-    mode_command_period_sec_ = declare_parameter<double>("mode_command_period_sec", 0.25);
     spot_turn_config_.heading_jump_threshold_rad =
         declare_parameter<double>("spot_turn_heading_jump_threshold_rad", 0.349066);
     spot_turn_config_.safety_margin = declare_parameter<double>("spot_turn_safety_margin", 0.0);
@@ -201,14 +196,13 @@ class PlannerNodeCpp final : public rclcpp::Node {
       throw std::invalid_argument("invalid spot turn detection/clearance settings");
     }
     maneuver_ = SpotTurnManeuver(spot_turn_config_);
-    if (!(trajectory_knot_dt_ > 0.0) || !(command_frequency_hz_ > 0.0) ||
+    if (!(trajectory_knot_dt_ > 0.0) ||
         !(scheduler_frequency_hz_ > 0.0) || !(costmap_update_period_sec_ > 0.0) ||
         !std::isfinite(costmap_update_period_sec_)) {
       throw std::invalid_argument("planner timing parameters must be positive");
     }
-    command_dt_ = 1.0 / command_frequency_hz_;
     config_.longitudinal.dt = trajectory_knot_dt_;
-    config_.longitudinal.execution_dt = command_dt_;
+    config_.longitudinal.execution_dt = kTrackingSampleDt;
     footprint_circle_count_ = declare_parameter<int>("oriented_footprint_circle_count", 3);
     footprint_translation_step_m_ = declare_parameter<double>("oriented_footprint_translation_step_m", 0.20);
     footprint_yaw_step_deg_ = declare_parameter<double>("oriented_footprint_yaw_step_deg", 2.0);
@@ -223,10 +217,6 @@ class PlannerNodeCpp final : public rclcpp::Node {
     execution_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
     auto static_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
-    cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
-    cmd_stamped_pub_ = create_publisher<geometry_msgs::msg::TwistStamped>(
-        "/planner/cmd_vel_stamped", 200);
-    executed_pub_ = create_publisher<ExecutedCommandMsg>("/planner/executed_command", 200);
     status_pub_ = create_publisher<std_msgs::msg::String>("/planner/status", static_qos);
     execution_state_pub_ = create_publisher<std_msgs::msg::String>(
         "/planner/execution_state", static_qos);
@@ -236,8 +226,6 @@ class PlannerNodeCpp final : public rclcpp::Node {
         "/planner/selected_trajectory_data", static_qos);
     tracking_pub_ = create_publisher<simp_planner_msgs::msg::TrackingTrajectory>(
         "/planner/tracking_trajectory", rclcpp::QoS(1).reliable());
-    mode_command_pub_ = create_publisher<std_msgs::msg::UInt8>(
-        "/vehicle/drive_mode_command", static_qos);
 
     rclcpp::SubscriptionOptions input_options;
     input_options.callback_group = input_group_;
@@ -270,18 +258,15 @@ class PlannerNodeCpp final : public rclcpp::Node {
     planning_timer_ = create_wall_timer(
         std::chrono::duration<double>(1.0 / scheduler_frequency_hz_),
         std::bind(&PlannerNodeCpp::planning_callback, this), planning_group_);
-    command_timer_ = create_wall_timer(
-        std::chrono::duration<double>(command_dt_),
-        std::bind(&PlannerNodeCpp::command_callback, this), execution_group_);
     tracking_timer_ = create_wall_timer(
         std::chrono::milliseconds(100),
         std::bind(&PlannerNodeCpp::tracking_callback, this), execution_group_);
 
     RCLCPP_INFO(get_logger(),
-                "Native C++ planner ready: planning<=%.1f Hz, command=%.1f Hz, "
+                "Native C++ planner ready: planning<=%.1f Hz, tracking=10 Hz / 31 points, "
                 "knot=%.3f s, allocation=LATERAL_PRIORITY",
                 get_parameter("max_planning_frequency_hz").as_double(),
-                command_frequency_hz_, trajectory_knot_dt_);
+                trajectory_knot_dt_);
   }
 
  private:
@@ -300,7 +285,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
   }
 
   bool inputs_ready_locked() const {
-    return received_odom_ && received_path_ && received_costmap_ &&
+    return received_odom_ && received_path_ && reference_path_ && received_costmap_ &&
            received_target_speed_ && received_requested_mode_ &&
            received_vehicle_mode_;
   }
@@ -347,20 +332,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
     std::lock_guard<std::mutex> lock(execution_mutex_);
     pending_plan_.reset();
     active_plan_.reset();
-    safety_stop_.reset();
-    mode_stop_.reset();
   }
 
   void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
-    {
-      // Odometry seeds current_state_ exactly once. After that, state
-      // updates come from predict_handover_state in planning_callback
-      // instead of continued odometry callbacks. The subscription is left
-      // open so a future policy can decide when odom should be consulted
-      // again; for now every message after the first is a no-op.
-      std::lock_guard<std::mutex> lock(input_mutex_);
-      if (received_odom_) return;
-    }
     const auto& q = msg->pose.pose.orientation;
     const double body_yaw = quaternion_to_yaw(q.x, q.y, q.z, q.w);
     const double body_vx = msg->twist.twist.linear.x;
@@ -369,38 +343,34 @@ class PlannerNodeCpp final : public rclcpp::Node {
     if (!std::isfinite(body_yaw) || !std::isfinite(speed) ||
         !std::isfinite(msg->pose.pose.position.x) || !std::isfinite(msg->pose.pose.position.y) ||
         !std::isfinite(msg->twist.twist.angular.z)) return;
-    std::optional<BodyCommand> last;
-    {
-      std::lock_guard<std::mutex> lock(execution_mutex_);
-      last = last_command_;
-    }
-    std::optional<DriveMode> confirmed_mode;
+    auto stamp_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
+    if (stamp_ns <= 0) stamp_ns = now_ns();
     {
       std::lock_guard<std::mutex> lock(input_mutex_);
-      confirmed_mode = mode_supervisor_.current_mode();
-    }
-    double chi;
-    if (speed > kMotionThreshold) {
-      chi = wrap_angle(body_yaw + std::atan2(body_vy, body_vx));
-    } else if (confirmed_mode) {
-      // At standstill the velocity direction is undefined. Reconstruct it from
-      // the vehicle-confirmed mode instead of retaining the previous phase's
-      // motion direction. This is essential for Forward -> Crab/Reverse.
-      chi = motion_heading_from_body_yaw(body_yaw, *confirmed_mode);
-    } else {
-      chi = last_motion_chi_.value_or(body_yaw);
-    }
-    last_motion_chi_ = chi;
-    const double acceleration = last ? last->planned_acceleration : 0.0;
-    const double heading_rate = last ? last->motion_heading_rate : 0.0;
-    {
-      std::lock_guard<std::mutex> lock(input_mutex_);
+      if (received_odom_ && stamp_ns <= current_state_time_ns_) return;
+      const auto confirmed_mode = mode_supervisor_.current_mode();
+      double chi;
+      if (speed > kMotionThreshold) {
+        chi = wrap_angle(body_yaw + std::atan2(body_vy, body_vx));
+      } else if (confirmed_mode) {
+        // 정지 중에는 속도 방향 대신 차량이 확인한 모드로 이동 방향을 정한다.
+        chi = motion_heading_from_body_yaw(body_yaw, *confirmed_mode);
+      } else {
+        chi = last_motion_chi_.value_or(body_yaw);
+      }
+      const double dt = (stamp_ns - current_state_time_ns_) * 1.0e-9;
+      const double acceleration = received_odom_ && dt > 1.0e-6
+          ? std::clamp((speed - current_state_.speed) / dt,
+                       config_.constraints.a_min, config_.constraints.a_max) : 0.0;
+      const double heading_rate = received_odom_ && dt > 1.0e-6 &&
+          speed > kMotionThreshold && current_state_.speed > kMotionThreshold
+          ? wrap_angle(chi - current_state_.chi) / dt : 0.0;
+      last_motion_chi_ = chi;
       current_state_ = {msg->pose.pose.position.x, msg->pose.pose.position.y,
                         chi, speed, acceleration, heading_rate};
       current_body_yaw_ = body_yaw;
       current_body_yaw_rate_ = msg->twist.twist.angular.z;
-      current_state_time_ns_ = rclcpp::Time(msg->header.stamp).nanoseconds();
-      if (current_state_time_ns_ <= 0) current_state_time_ns_ = now_ns();
+      current_state_time_ns_ = stamp_ns;
       odom_frame_ = msg->header.frame_id;
       received_odom_ = true;
     }
@@ -672,9 +642,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
           // 시나리오 매니저는 차량이 이전 phase를 끝까지 몰고 도착한 뒤에만
           // 다음 phase를 보내므로, 지금 활성 경로는 이미 다 주행되어 그
           // 자리에 자연히 멈춰 있다. reference_mode_를 여기서 새 모드로
-          // 바꾸면 아래 command_callback()의 트리거 가드(차량이 여전히
+          // 바꾸면 아래 tracking_callback()의 트리거 가드(차량이 여전히
           // 회전 전 모드로 안정적으로 있는지 확인)가 어긋나므로, 회전이
-          // 실제로 끝나 새 경로를 설치하는 시점(1292절 부근)까지 그대로
+          // 실제로 끝나 새 경로를 설치하는 시점까지 그대로
           // 둔다.
         } else {
           identical = reference_path_ && reference_mode == reference_mode_ &&
@@ -691,7 +661,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
           if (split.after) {
             // 내부 코너: curvature_max를 넘어 이미 확정됐으므로 실측 비교
             // 없이 바로 예약한다. 방금 설치한 before 구간을 다 몰아 정지하면
-            // (모드는 그대로이므로) command_callback()의 트리거가 바로
+            // (모드는 그대로이므로) tracking_callback()의 트리거가 바로
             // 제자리턴을 건다.
             pending_spot_turn_target_yaw_ =
                 spot_turn_target_body_yaw(split.after->psi().front(), reference_mode);
@@ -821,7 +791,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       std::shared_ptr<const ExecutablePlan> invalidated_pending;
       {
         // Commit the map and validate pending handover as one state change.
-        // command_callback cannot activate a plan between these operations.
+        // tracking_callback cannot activate a plan between these operations.
         std::scoped_lock lock(input_mutex_, execution_mutex_);
         if (received_odom_ && !odom_frame_.empty() &&
             msg->header.frame_id != odom_frame_) {
@@ -1028,6 +998,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
     bool has_plan;
     {
       std::lock_guard<std::mutex> lock(execution_mutex_);
+      // 강제 감속 중에는 실제 정지를 확인한 뒤 새 계획을 만든다.
+      if (forced_safety_stop_ && input->state.speed > mode_change_stop_speed_) return;
       has_plan = static_cast<bool>(active_plan_) || static_cast<bool>(pending_plan_);
       if (pending_plan_ && now_ns() < pending_plan_->start_ns) return;
     }
@@ -1041,7 +1013,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       const auto scheduled_start = align_time_ns(
           now_ns() + static_cast<std::int64_t>(
               std::llround(handover_timing_.recommended_lead_sec() * 1.0e9)),
-          command_dt_);
+          kTrackingSampleDt);
       std::shared_ptr<const ExecutablePlan> active;
       {
         std::lock_guard<std::mutex> lock(execution_mutex_);
@@ -1053,25 +1025,13 @@ class PlannerNodeCpp final : public rclcpp::Node {
           active ? std::optional<std::int64_t>(active->start_ns) : std::nullopt,
           active ? &active->allocation : nullptr,
           active ? &active->result.trajectory.actions : nullptr,
-          command_dt_, std::min(std::abs(config_.constraints.a_min),
+          kTrackingSampleDt, std::min(std::abs(config_.constraints.a_min),
                                 config_.longitudinal.service_deceleration),
           std::min(config_.constraints.jerk_max, config_.longitudinal.comfort_jerk));
       const double handover_prediction_ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - handover_start).count();
 
-      {
-        // Odom only seeds the very first cycle (see odom_callback). From
-        // here on, current_state_ tracks this handover prediction instead
-        // of live odometry, so the next planning cycle's snapshot is
-        // anchored to where the active plan says the vehicle will be.
-        std::lock_guard<std::mutex> lock(input_mutex_);
-        current_state_ = handover.state;
-        current_body_yaw_ = handover.body_yaw;
-        if (handover.expected_command) {
-          current_body_yaw_rate_ = handover.expected_command->yaw_rate;
-        }
-        current_state_time_ns_ = scheduled_start;
-      }
+      // handover는 새 계획의 초기 조건이다. 현재 차량 상태는 odometry가 소유한다.
 
       std::optional<FrenetProjection> handover_projection;
       if (active) {
@@ -1296,17 +1256,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
 
   void engage_forced_safety_stop() {
     std::lock_guard<std::mutex> lock(execution_mutex_);
-    if (!safety_stop_) {
-      const BodyCommand initial = last_command_.value_or(BodyCommand{});
-      safety_stop_ = JerkLimitedSafetyStop::from_command(
-          initial,
-          std::min(std::abs(config_.constraints.a_min),
-                   config_.longitudinal.service_deceleration),
-          std::min(config_.constraints.jerk_max,
-                   config_.longitudinal.comfort_jerk));
-    }
     forced_safety_stop_ = true;
     pending_plan_.reset();
+    active_plan_.reset();
   }
 
   std::shared_ptr<const ExecutablePlan> activate_pending_locked(
@@ -1314,222 +1266,13 @@ class PlannerNodeCpp final : public rclcpp::Node {
     if (!pending_plan_ || stamp_ns < pending_plan_->start_ns) return nullptr;
     active_plan_ = pending_plan_;
     pending_plan_.reset();
-    safety_stop_.reset();
     forced_safety_stop_ = false;
     scheduler_.mark_plan_activated(stamp_ns);
     return active_plan_;
   }
 
-  void publish_mode_command_if_due(std::int64_t stamp_ns) {
-    std::optional<DriveMode> requested;
-    bool should_publish = false;
-    {
-      std::lock_guard<std::mutex> lock(input_mutex_);
-      requested = mode_supervisor_.requested_mode();
-      should_publish = mode_supervisor_.should_publish_command(
-          current_state_.speed, mode_change_stop_speed_);
-    }
-    const auto period_ns = static_cast<std::int64_t>(
-        std::llround(mode_command_period_sec_ * 1.0e9));
-    if (!requested || !should_publish ||
-        (last_mode_command_ns_ > 0 && stamp_ns - last_mode_command_ns_ < period_ns)) {
-      return;
-    }
-    std_msgs::msg::UInt8 message;
-    message.data = static_cast<std::uint8_t>(*requested);
-    mode_command_pub_->publish(message);
-    last_mode_command_ns_ = stamp_ns;
-  }
-
-  void command_callback() {
-    const auto stamp_ns = now_ns();
-    DriveModeControlState mode_state;
-    bool mode_ready;
-    double measured_speed;
-    bool resumed_after_turn = false;
-    bool waiting_clearance = false;
-    std::optional<BodyCommand> rotating_command;
-    ReferencePathMsg::SharedPtr deferred;
-    {
-      std::lock_guard<std::mutex> lock(input_mutex_);
-      measured_speed = current_state_.speed;
-      mode_ready = mode_supervisor_.ready();
-      mode_state = mode_supervisor_.state(measured_speed, mode_change_stop_speed_);
-      if (maneuver_.on_mode_ready(mode_supervisor_)) {
-        reference_path_ = std::move(pending_post_turn_path_);
-        pending_post_turn_path_.reset();
-        reference_mode_ = *pending_spot_turn_mode_;
-        pending_spot_turn_mode_.reset();
-        ++path_revision_;
-        ++command_revision_;
-        resumed_after_turn = true;
-        deferred = std::move(deferred_reference_);
-      }
-      spot_turn_waiting_clearance_ = false;
-      // terminal_hold_latched()도 반드시 같이 봐야 한다: measured_speed <=
-      // mode_change_stop_speed_ 만으로는 "코너까지 다 몰고 도착해 멈췄다"와
-      // "아직 그 자리(예: 코스 시작점)에서 출발도 안 했다"를 구분할 수 없다.
-      // 내부 코너(split_reference_path_at_corner)는 메시지가 도착하자마자
-      // pending_spot_turn_target_yaw_를 예약하므로, 차량이 실제로 그
-      // before 구간을 끝까지 몰아 terminal_hold가 걸릴 때까지는 기다려야
-      // 한다. 경계 코너는 이전 phase가 이미 도착해 있어야 새 메시지가
-      // 오므로 이 조건이 항상 먼저 참이 되어 있어 기존 동작에는 영향이
-      // 없다.
-      if (mode_ready && maneuver_.state() == SpotTurnManeuverState::Inactive &&
-          mode_supervisor_.current_mode() == reference_mode_ && received_costmap_ &&
-          measured_speed <= mode_change_stop_speed_ && terminal_hold_latched() &&
-          pending_spot_turn_target_yaw_) {
-        if (spot_turn_feasible(*costmap_, current_state_, config_.vehicle, spot_turn_config_.safety_margin)) {
-          maneuver_.trigger(*pending_spot_turn_target_yaw_, *pending_spot_turn_mode_);
-          mode_supervisor_.set_requested_mode(DriveMode::SpotTurn);
-          pending_spot_turn_target_yaw_.reset();
-          ++command_revision_;
-          mode_ready = false;
-          mode_state = mode_supervisor_.state(measured_speed, mode_change_stop_speed_);
-        } else {
-          spot_turn_waiting_clearance_ = true;
-        }
-      }
-      waiting_clearance = spot_turn_waiting_clearance_;
-      if (mode_ready) {
-        const auto previous_request = mode_supervisor_.requested_mode();
-        rotating_command = maneuver_.sample(
-            command_dt_, current_body_yaw_, current_body_yaw_rate_, mode_supervisor_);
-        if (mode_supervisor_.requested_mode() != previous_request) ++command_revision_;
-        if (rotating_command) {
-          rotating_command->segment_start_x = rotating_command->segment_end_x = current_state_.x;
-          rotating_command->segment_start_y = rotating_command->segment_end_y = current_state_.y;
-          rotating_command->segment_start_heading = current_body_yaw_;
-          rotating_command->segment_end_heading =
-              wrap_angle(current_body_yaw_ + rotating_command->yaw_rate * command_dt_);
-          // Spot-turn-local handover: planning_callback() returns immediately
-          // while input->spot_turn_active is true, so predict_handover_state()
-          // never runs during a turn, and odom_callback() only seeds state
-          // once for the whole run (see both call sites). Without this,
-          // measured_yaw handed to YawRotationProfile::sample() next tick
-          // would stay frozen at the pre-turn heading forever, error would
-          // never shrink, and done() could never become true. Advance by
-          // exactly what we just commanded (Vx=Vy=0, pure yaw_rate) so the
-          // next sample() call sees progress.
-          current_body_yaw_ = rotating_command->segment_end_heading;
-          current_body_yaw_rate_ = rotating_command->yaw_rate;
-          current_state_time_ns_ = stamp_ns;
-        }
-      }
-    }
-    if (resumed_after_turn) {
-      invalidate_motion_plan();
-      {
-        std::lock_guard<std::mutex> lock(terminal_hold_mutex_);
-        terminal_hold_.reset();
-      }
-      if (deferred) path_callback(deferred);
-      request_replan("SPOT_TURN_COMPLETED", true);
-    }
-    if (rotating_command || waiting_clearance) {
-      const auto command = rotating_command.value_or(zero_command());
-      invalidate_motion_plan();
-      {
-        std::lock_guard<std::mutex> lock(execution_mutex_);
-        last_command_ = command;
-      }
-      publish_execution_state_if_changed(rotating_command ? "SPOT_TURN_ROTATING" : "SPOT_TURN_WAITING_CLEARANCE");
-      publish_command(command, 0, stamp_ns);
-      return;
-    }
-
-    if (!mode_ready) {
-      publish_mode_command_if_due(stamp_ns);
-      std::optional<BodyCommand> command;
-      {
-        std::lock_guard<std::mutex> lock(execution_mutex_);
-        pending_plan_.reset();
-        active_plan_.reset();
-        safety_stop_.reset();
-        forced_safety_stop_ = false;
-        if (mode_state == DriveModeControlState::StoppingForChange && last_command_) {
-          if (!mode_stop_) {
-            mode_stop_ = JerkLimitedSafetyStop::from_command(
-                *last_command_,
-                std::min(std::abs(config_.constraints.a_min),
-                         config_.longitudinal.service_deceleration),
-                std::min(config_.constraints.jerk_max,
-                         config_.longitudinal.comfort_jerk));
-          }
-          command = mode_stop_->sample_and_advance(command_dt_);
-        } else {
-          mode_stop_.reset();
-          command = zero_command();
-        }
-        last_command_ = command;
-      }
-      publish_execution_state_if_changed(
-          mode_state == DriveModeControlState::StoppingForChange
-              ? "MODE_STOP" : "MODE_WAIT");
-      publish_command(*command, 0, stamp_ns);
-      return;
-    }
-
-    std::optional<BodyCommand> command;
-    std::shared_ptr<const ExecutablePlan> active;
-    std::shared_ptr<const ExecutablePlan> activated;
-    bool using_safety_stop = false;
-    {
-      std::lock_guard<std::mutex> lock(execution_mutex_);
-      mode_stop_.reset();
-      activated = activate_pending_locked(stamp_ns);
-      active = active_plan_;
-      if (forced_safety_stop_) {
-        if (!safety_stop_) {
-          safety_stop_ = JerkLimitedSafetyStop::from_command(
-              last_command_.value_or(BodyCommand{}),
-              std::min(std::abs(config_.constraints.a_min),
-                       config_.longitudinal.service_deceleration),
-              std::min(config_.constraints.jerk_max,
-                       config_.longitudinal.comfort_jerk));
-        }
-        command = safety_stop_->sample_and_advance(command_dt_);
-        using_safety_stop = true;
-      } else if (active) {
-        const double elapsed = std::max(0.0, 1.0e-9 * (stamp_ns - active->start_ns));
-        if (elapsed <= active->allocation.trajectory.t.back() + 1.0e-12) {
-          command = sample_body_command(active->allocation,
-                                        active->result.trajectory.actions,
-                                        elapsed, command_dt_);
-        } else {
-          if (!safety_stop_) {
-            const auto final_command = sample_body_command(
-                active->allocation, active->result.trajectory.actions,
-                active->allocation.trajectory.t.back(), command_dt_);
-            safety_stop_ = JerkLimitedSafetyStop::from_command(
-                final_command,
-                std::min(std::abs(config_.constraints.a_min),
-                         config_.longitudinal.service_deceleration),
-                std::min(config_.constraints.jerk_max,
-                         config_.longitudinal.comfort_jerk));
-          }
-          command = safety_stop_->sample_and_advance(command_dt_);
-          using_safety_stop = true;
-        }
-      }
-      if (command) last_command_ = command;
-    }
-
-    if (activated) {
-      publish_trajectory(*activated);
-      publish_plan_status(*activated, activated->compute_ms);
-    }
-    const bool terminal_hold = terminal_hold_active();
-    if (terminal_hold) command = zero_command();
-    if (!command) command = zero_command();
-    const std::string execution_state = terminal_hold ? "TERMINAL_HOLD"
-        : (using_safety_stop ? "SAFETY_STOP"
-                            : (active ? "ACTIVE_PLAN" : "IDLE"));
-    publish_execution_state_if_changed(execution_state);
-    publish_command(*command, active ? active->plan_id : 0, stamp_ns);
-  }
-
   void publish_execution_state_if_changed(const std::string& state) {
+    // 기존 진단 토픽의 상태는 참조 생성 상태이며 Tracker의 실행 확인이 아니다.
     {
       std::lock_guard<std::mutex> lock(execution_state_mutex_);
       if (state == execution_state_) return;
@@ -1545,20 +1288,6 @@ class PlannerNodeCpp final : public rclcpp::Node {
     return execution_state_;
   }
 
-  bool terminal_hold_active() {
-    const auto input = snapshot();
-    if (!input) return false;
-    const auto projection = input->path->project(
-        input->state.x, input->state.y, input->state.chi);
-    const double goal = std::max(
-        input->path->s_max() - config_.simulation.path_end_margin,
-        input->path->s_min());
-    std::lock_guard<std::mutex> lock(terminal_hold_mutex_);
-    terminal_hold_.set_goal(goal, input->drive_mode);
-    return terminal_hold_.update(
-        goal - projection.s, input->state.speed, input->state.acceleration);
-  }
-
   bool terminal_hold_latched() const {
     std::lock_guard<std::mutex> lock(terminal_hold_mutex_);
     return terminal_hold_.active();
@@ -1569,52 +1298,6 @@ class PlannerNodeCpp final : public rclcpp::Node {
     return active_plan_ ? active_plan_->plan_id : 0;
   }
 
-  static BodyCommand zero_command() {
-    return BodyCommand{};
-  }
-
-  void publish_command(const BodyCommand& command, std::uint64_t plan_id,
-                       std::int64_t stamp_ns) {
-    update_tracking_reference(command, stamp_ns);
-    geometry_msgs::msg::Twist twist;
-    twist.linear.x = command.vx;
-    twist.linear.y = command.vy;
-    twist.angular.z = command.yaw_rate;
-    cmd_pub_->publish(twist);
-
-    geometry_msgs::msg::TwistStamped stamped;
-    stamped.header.stamp = rclcpp::Time(stamp_ns);
-    stamped.header.frame_id = "base_link";
-    stamped.twist = twist;
-    cmd_stamped_pub_->publish(stamped);
-
-    ExecutedCommandMsg executed;
-    executed.header = stamped.header;
-    executed.plan_id = plan_id;
-    executed.interval_index = static_cast<std::uint32_t>(command.action_index);
-    executed.trajectory_time = command.trajectory_time;
-    executed.vx = command.vx;
-    executed.vy = command.vy;
-    executed.yaw_rate = command.yaw_rate;
-    executed.planned_speed = command.planned_speed;
-    executed.planned_acceleration = command.planned_acceleration;
-    executed.planned_jerk = command.planned_jerk;
-    executed.motion_heading = command.motion_heading;
-    executed.motion_curvature = command.motion_curvature;
-    executed.motion_heading_rate = command.motion_heading_rate;
-    executed.motion_heading_acceleration = command.planned_heading_acceleration;
-    executed.beta = command.beta;
-    executed.beta_rate = command.beta_rate;
-    executed.yaw_acceleration = command.yaw_acceleration;
-    executed.segment_start_x = command.segment_start_x;
-    executed.segment_start_y = command.segment_start_y;
-    executed.segment_start_heading = command.segment_start_heading;
-    executed.segment_end_x = command.segment_end_x;
-    executed.segment_end_y = command.segment_end_y;
-    executed.segment_end_heading = command.segment_end_heading;
-    executed_pub_->publish(executed);
-  }
-
   static void advance_tracking_pose(
       simp_planner_msgs::msg::TrackingTrajectoryPoint& point, double dt) {
     const double yaw_mid = point.body_yaw + 0.5 * point.yaw_rate * dt;
@@ -1623,122 +1306,190 @@ class PlannerNodeCpp final : public rclcpp::Node {
     point.body_yaw = wrap_angle(point.body_yaw + point.yaw_rate * dt);
   }
 
-  void update_tracking_reference(const BodyCommand& command, std::int64_t stamp_ns) {
-    // 현재 실행 참조를 유지한다. 미래 handover 상태인 current_state_로 매번
-    // 재시작하지 않으며, 정지·회전에서는 직전 출력 명령으로 자세를 진행한다.
-    if (!tracking_reference_) {
-      std::lock_guard<std::mutex> lock(input_mutex_);
-      if (!received_odom_) return;
-      tracking_reference_.emplace();
-      tracking_reference_->x = current_state_.x;
-      tracking_reference_->y = current_state_.y;
-      tracking_reference_->body_yaw = current_body_yaw_;
-    } else {
-      advance_tracking_pose(*tracking_reference_,
-                            std::max(0.0, (stamp_ns - tracking_reference_ns_) * 1.0e-9));
-    }
-    auto& point = *tracking_reference_;
-    if (current_execution_state() == "ACTIVE_PLAN") {
-      point.x = command.segment_start_x;
-      point.y = command.segment_start_y;
-      point.body_yaw = wrap_angle(command.motion_heading - command.beta);
-    }
-    point.vx = command.vx;
-    point.vy = command.vy;
-    point.yaw_rate = command.yaw_rate;
-    tracking_reference_ns_ = stamp_ns;
-  }
-
   void tracking_callback() {
-    constexpr std::int64_t sample_ns = 10000000;  // 0.01초
-    constexpr double sample_dt = 0.01;
-    // 실행 콜백과 같은 그룹에서 동작한다. 입력·계획 무효화와 발행 사이의
-    // 순서를 유지하기 위해 31점 생성과 발행 동안 관련 상태를 잠근다.
-    std::scoped_lock lock(input_mutex_, execution_mutex_, terminal_hold_mutex_);
-    if (!tracking_reference_ || !mode_supervisor_.current_mode() ||
-        !mode_supervisor_.requested_mode()) return;
-    const auto stamp_ns = now_ns();
-    simp_planner_msgs::msg::TrackingTrajectory message;
-    message.header.stamp = rclcpp::Time(stamp_ns);
-    message.header.frame_id = received_path_ ? path_frame_ : odom_frame_;
-    message.sample_period.nanosec = static_cast<std::uint32_t>(sample_ns);
-    message.points.reserve(31);
-    auto point = *tracking_reference_;
-    advance_tracking_pose(point,
-                          std::max(0.0, (stamp_ns - tracking_reference_ns_) * 1.0e-9));
-    point.current_mode = static_cast<std::uint8_t>(*mode_supervisor_.current_mode());
-    point.requested_mode = static_cast<std::uint8_t>(*mode_supervisor_.requested_mode());
-    auto supervisor = mode_supervisor_;
-    auto maneuver = maneuver_;
-    const bool mode_ready = supervisor.ready();
-    const bool hold = terminal_hold_.active() &&
-        maneuver.state() == SpotTurnManeuverState::Inactive && mode_ready;
-    const double deceleration = std::min(std::abs(config_.constraints.a_min),
-                                         config_.longitudinal.service_deceleration);
-    const double jerk = std::min(config_.constraints.jerk_max,
-                                 config_.longitudinal.comfort_jerk);
-    std::optional<JerkLimitedSafetyStop> stop;
-    const bool stopping_for_mode = !mode_ready &&
-        supervisor.state(current_state_.speed, mode_change_stop_speed_) ==
-            DriveModeControlState::StoppingForChange;
-    if ((forced_safety_stop_ || stopping_for_mode || safety_stop_) && last_command_) {
-      stop = JerkLimitedSafetyStop::from_command(*last_command_, deceleration, jerk);
-    }
-    std::shared_ptr<const ExecutablePlan> previous_plan;
-    for (int i = 0; i <= 30; ++i) {
-      const auto target_ns = stamp_ns + i * sample_ns;
-      BodyCommand command;
-      if (spot_turn_waiting_clearance_ || hold) {
-        // 현재 확인된 정지 상태를 유지한다.
-      } else if (!mode_ready) {
-        if (stop) command = stop->sample_and_advance(sample_dt);
-      } else if (maneuver.state() != SpotTurnManeuverState::Inactive) {
-        // 복사본만 진행한다. 미래의 휠 정렬 완료는 가정하지 않는다.
-        if (supervisor.ready()) {
-          command = maneuver.sample(sample_dt, point.body_yaw, point.yaw_rate,
-                                    supervisor).value_or(BodyCommand{});
-        }
-      } else if (forced_safety_stop_) {
-        if (stop) command = stop->sample_and_advance(sample_dt);
-      } else {
-        auto plan = pending_plan_ && target_ns >= pending_plan_->start_ns
-            ? pending_plan_ : active_plan_;
-        if (plan && target_ns >= plan->start_ns) {
-          const double elapsed = (target_ns - plan->start_ns) * 1.0e-9;
-          const double end = plan->allocation.trajectory.t.back();
-          if (elapsed <= end + 1.0e-12) {
-            // ponytail: 기존 위치 선형 보간을 유지한다. 모델 통합은
-            // simp_tracker/TRACKING_TRAJECTORY_KR.md의 개선 조건을 따른다.
-            command = sample_body_command(plan->allocation,
-                plan->result.trajectory.actions, elapsed, sample_dt);
-            point.x = command.segment_start_x;
-            point.y = command.segment_start_y;
-            point.body_yaw = wrap_angle(command.motion_heading - command.beta);
-            stop.reset();
-          } else {
-            if (!stop || (previous_plan && previous_plan != plan)) {
-              const auto final_command = sample_body_command(plan->allocation,
-                  plan->result.trajectory.actions, end, sample_dt);
-              stop = JerkLimitedSafetyStop::from_command(final_command, deceleration, jerk);
-              // 샘플 시각이 계획 끝과 정확히 일치하지 않는 경우도 처리한다.
-              for (double remaining = elapsed - end; remaining > 1.0e-12;) {
-                const double dt = std::min(sample_dt, remaining);
-                stop->advance(dt);
-                remaining -= dt;
-              }
-            }
-            command = stop->sample_and_advance(sample_dt);
-          }
-          previous_plan = plan;
+    std::shared_ptr<const ExecutablePlan> activated;
+    ReferencePathMsg::SharedPtr deferred;
+    bool resumed_after_turn = false;
+    std::string reference_state;
+    {
+      // 계획 등록·무효화와 배열 발행 순서를 보호한다. 미리보기는 복사본만 진행한다.
+      std::scoped_lock lock(input_mutex_, execution_mutex_, terminal_hold_mutex_);
+      if (!received_odom_ || !mode_supervisor_.current_mode() ||
+          !mode_supervisor_.requested_mode()) return;
+      const auto stamp_ns = now_ns();
+      const double elapsed = last_tracking_ns_ == 0 ? 0.1 :
+          std::max(0.0, (stamp_ns - last_tracking_ns_) * 1.0e-9);
+      last_tracking_ns_ = stamp_ns;
+
+      if (reference_path_ && mode_supervisor_.current_mode() == reference_mode_) {
+        const auto projection = reference_path_->project(
+            current_state_.x, current_state_.y, current_state_.chi);
+        const double goal = std::max(reference_path_->s_max() - config_.simulation.path_end_margin,
+                                     reference_path_->s_min());
+        terminal_hold_.set_goal(goal, reference_mode_);
+        terminal_hold_.update(goal - projection.s, current_state_.speed,
+                              current_state_.acceleration);
+      }
+      if (maneuver_.on_mode_ready(mode_supervisor_)) {
+        reference_path_ = std::move(pending_post_turn_path_);
+        reference_mode_ = *pending_spot_turn_mode_;
+        pending_spot_turn_mode_.reset();
+        ++path_revision_;
+        ++command_revision_;
+        terminal_hold_.reset();
+        active_plan_.reset();
+        pending_plan_.reset();
+        deferred = std::move(deferred_reference_);
+        resumed_after_turn = true;
+      }
+      spot_turn_waiting_clearance_ = false;
+      if (mode_supervisor_.ready() &&
+          maneuver_.state() == SpotTurnManeuverState::Inactive &&
+          mode_supervisor_.current_mode() == reference_mode_ && received_costmap_ &&
+          current_state_.speed <= mode_change_stop_speed_ &&
+          (terminal_hold_.active() || !reference_path_) && pending_spot_turn_target_yaw_) {
+        if (spot_turn_feasible(*costmap_, current_state_, config_.vehicle,
+                               spot_turn_config_.safety_margin)) {
+          maneuver_.trigger(*pending_spot_turn_target_yaw_, *pending_spot_turn_mode_);
+          mode_supervisor_.set_requested_mode(DriveMode::SpotTurn);
+          pending_spot_turn_target_yaw_.reset();
+          ++command_revision_;
+        } else {
+          spot_turn_waiting_clearance_ = true;
         }
       }
-      point.vx = command.vx;
-      point.vy = command.vy;
-      point.yaw_rate = command.yaw_rate;
-      message.points.push_back(point);
-      advance_tracking_pose(point, sample_dt);
+
+      // 회전 진행/완료는 실제 피드백으로만 갱신한다. 미래 31점 계산으로
+      // 현재 자세나 실제 모드 준비 상태를 바꾸지 않는다.
+      std::optional<BodyCommand> rotation_now;
+      if (mode_supervisor_.ready() && elapsed > 0.0) {
+        const auto previous_request = mode_supervisor_.requested_mode();
+        rotation_now = maneuver_.sample(elapsed, current_body_yaw_,
+                                         current_body_yaw_rate_, mode_supervisor_);
+        if (mode_supervisor_.requested_mode() != previous_request) ++command_revision_;
+      }
+      const bool mode_ready = mode_supervisor_.ready();
+      const bool turning = maneuver_.state() != SpotTurnManeuverState::Inactive;
+      if (!mode_ready || turning || spot_turn_waiting_clearance_) {
+        pending_plan_.reset();
+        active_plan_.reset();
+      } else {
+        // 계획 시각에 따른 내부 handover이며 차량이 실행했다는 의미가 아니다.
+        activated = activate_pending_locked(stamp_ns);
+      }
+      const bool hold = mode_ready && !turning && terminal_hold_.active();
+      const bool stopping_for_mode = !mode_ready &&
+          mode_supervisor_.state(current_state_.speed, mode_change_stop_speed_) ==
+              DriveModeControlState::StoppingForChange;
+      const double deceleration = std::min(std::abs(config_.constraints.a_min),
+                                           config_.longitudinal.service_deceleration);
+      const double jerk = std::min(config_.constraints.jerk_max,
+                                   config_.longitudinal.comfort_jerk);
+      std::optional<JerkLimitedSafetyStop> stop;
+      if (stopping_for_mode || forced_safety_stop_) {
+        stop.emplace(current_state_.speed, current_state_.acceleration,
+            wrap_angle(current_state_.chi - current_body_yaw_), current_state_.chi,
+            current_state_.speed > kMotionThreshold
+                ? current_state_.motion_heading_rate / current_state_.speed : 0.0,
+            deceleration, jerk);
+      }
+
+      simp_planner_msgs::msg::TrackingTrajectory message;
+      message.header.stamp = rclcpp::Time(stamp_ns);
+      message.header.frame_id = received_path_ ? path_frame_ : odom_frame_;
+      message.sample_period.nanosec = 10000000;
+      message.points.reserve(31);
+      simp_planner_msgs::msg::TrackingTrajectoryPoint point;
+      point.x = current_state_.x;
+      point.y = current_state_.y;
+      point.body_yaw = current_body_yaw_;
+      point.yaw_rate = current_body_yaw_rate_;
+      point.current_mode = static_cast<std::uint8_t>(*mode_supervisor_.current_mode());
+      point.requested_mode = static_cast<std::uint8_t>(*mode_supervisor_.requested_mode());
+      auto supervisor = mode_supervisor_;
+      auto maneuver = maneuver_;
+      std::shared_ptr<const ExecutablePlan> previous_plan;
+      bool expired = false;
+      for (int i = 0; i <= 30; ++i) {
+        const auto target_ns = stamp_ns + i * std::int64_t{10000000};
+        BodyCommand command;
+        if (spot_turn_waiting_clearance_ || hold) {
+          // 확인된 정지/대기 상태의 위치를 유지한다.
+        } else if (!mode_ready) {
+          if (stopping_for_mode) command = stop->sample_and_advance(kTrackingSampleDt);
+        } else if (turning) {
+          if (i == 0) {
+            command = rotation_now.value_or(BodyCommand{});
+          } else if (supervisor.ready()) {
+            command = maneuver.sample(kTrackingSampleDt, point.body_yaw, point.yaw_rate,
+                                      supervisor).value_or(BodyCommand{});
+          }
+        } else if (forced_safety_stop_) {
+          command = stop->sample_and_advance(kTrackingSampleDt);
+        } else {
+          auto plan = pending_plan_ && target_ns >= pending_plan_->start_ns
+              ? pending_plan_ : active_plan_;
+          if (plan && target_ns >= plan->start_ns) {
+            const double time = (target_ns - plan->start_ns) * 1.0e-9;
+            const double end = plan->allocation.trajectory.t.back();
+            if (time <= end + 1.0e-12) {
+              // ponytail: 위치 선형 보간의 한계는 simp_tracker/TRACKING_TRAJECTORY_KR.md 참고.
+              command = sample_body_command(plan->allocation,
+                  plan->result.trajectory.actions, time, kTrackingSampleDt);
+              point.x = command.segment_start_x;
+              point.y = command.segment_start_y;
+              point.body_yaw = wrap_angle(command.motion_heading - command.beta);
+              stop.reset();
+            } else {
+              if (!stop || previous_plan != plan) {
+                const auto final_command = sample_body_command(plan->allocation,
+                    plan->result.trajectory.actions, end, kTrackingSampleDt);
+                point.x = final_command.segment_start_x;
+                point.y = final_command.segment_start_y;
+                point.body_yaw = wrap_angle(final_command.motion_heading - final_command.beta);
+                stop = JerkLimitedSafetyStop::from_command(final_command, deceleration, jerk);
+                // 끝점 이후도 절대 계획 시각에서 재구성한다. 이전 발행에 의존하지 않는다.
+                for (double remaining = time - end;
+                     remaining > 1.0e-12 && !stop->stopped();) {
+                  const double dt = std::min(kTrackingSampleDt, remaining);
+                  const auto tail = stop->sample();
+                  point.vx = tail.vx;
+                  point.vy = tail.vy;
+                  point.yaw_rate = tail.yaw_rate;
+                  advance_tracking_pose(point, dt);
+                  stop->advance(dt);
+                  remaining -= dt;
+                }
+              }
+              command = stop->sample_and_advance(kTrackingSampleDt);
+              if (i == 0) expired = true;
+            }
+            previous_plan = plan;
+          }
+        }
+        point.vx = command.vx;
+        point.vy = command.vy;
+        point.yaw_rate = command.yaw_rate;
+        message.points.push_back(point);
+        advance_tracking_pose(point, kTrackingSampleDt);
+      }
+      reference_state = spot_turn_waiting_clearance_ ? "SPOT_TURN_WAITING_CLEARANCE"
+          : (!mode_ready ? (stopping_for_mode ? "MODE_STOP" : "MODE_WAIT")
+          : (turning ? "SPOT_TURN_ROTATING"
+          : (hold ? "TERMINAL_HOLD"
+          : ((forced_safety_stop_ || expired) ? "SAFETY_STOP"
+          : (active_plan_ ? "ACTIVE_PLAN" : "IDLE")))));
+      tracking_pub_->publish(message);
     }
-    tracking_pub_->publish(message);
+    if (resumed_after_turn) {
+      if (deferred) path_callback(deferred);
+      request_replan("SPOT_TURN_COMPLETED", true);
+    }
+    if (activated) {
+      publish_trajectory(*activated);
+      publish_plan_status(*activated, activated->compute_ms);
+    }
+    publish_execution_state_if_changed(reference_state);
   }
 
   void publish_trajectory(const ExecutablePlan& plan) {
@@ -2049,39 +1800,28 @@ class PlannerNodeCpp final : public rclcpp::Node {
   int costmap_crop_height_{0};
   double costmap_crop_resolution_{0.0};
 
+  // 참조 생성과 handover용 계획 상태. Tracker의 실행/수락 상태가 아니다.
   std::shared_ptr<const ExecutablePlan> active_plan_;
   std::shared_ptr<const ExecutablePlan> pending_plan_;
-  std::optional<BodyCommand> last_command_;
-  std::optional<JerkLimitedSafetyStop> safety_stop_;
-  std::optional<JerkLimitedSafetyStop> mode_stop_;
   bool forced_safety_stop_{false};
   std::uint64_t plan_id_counter_{0};
   std::string execution_state_{"STARTUP"};
 
   double trajectory_knot_dt_{0.10};
-  double command_frequency_hz_{100.0};
   double scheduler_frequency_hz_{100.0};
   double costmap_update_period_sec_{0.20};
   double maximum_handover_lead_sec_{0.60};
-  double command_dt_{0.01};
   double mode_change_stop_speed_{0.03};
-  double mode_command_period_sec_{0.25};
   int footprint_circle_count_{3};
   double footprint_translation_step_m_{0.20};
   double footprint_yaw_step_deg_{2.0};
-  std::int64_t last_mode_command_ns_{0};
+  std::int64_t last_tracking_ns_{0};
 
-  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
-  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr cmd_stamped_pub_;
-  rclcpp::Publisher<ExecutedCommandMsg>::SharedPtr executed_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr execution_state_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr trajectory_pub_;
   rclcpp::Publisher<ReferencePathMsg>::SharedPtr trajectory_data_pub_;
   rclcpp::Publisher<simp_planner_msgs::msg::TrackingTrajectory>::SharedPtr tracking_pub_;
-  std::optional<simp_planner_msgs::msg::TrackingTrajectoryPoint> tracking_reference_;
-  std::int64_t tracking_reference_ns_{0};
-  rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr mode_command_pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<ReferencePathMsg>::SharedPtr path_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr costmap_sub_;
@@ -2089,7 +1829,6 @@ class PlannerNodeCpp final : public rclcpp::Node {
   rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr requested_mode_sub_;
   rclcpp::Subscription<DriveModeStateMsg>::SharedPtr vehicle_mode_sub_;
   rclcpp::TimerBase::SharedPtr planning_timer_;
-  rclcpp::TimerBase::SharedPtr command_timer_;
   rclcpp::TimerBase::SharedPtr tracking_timer_;
 };
 

@@ -26,9 +26,6 @@ def _resolved_nodes(context):
     mode_transition_duration = float(
         LaunchConfiguration("mode_transition_duration_sec").perform(context)
     )
-    command_frequency_hz = float(
-        LaunchConfiguration("command_frequency_hz").perform(context)
-    )
     requested_footprint_circle_count = int(
         LaunchConfiguration("oriented_footprint_circle_count").perform(context)
     )
@@ -111,7 +108,6 @@ def _resolved_nodes(context):
             output="screen",
             parameters=[
                 {
-                    "command_frequency_hz": command_frequency_hz,
                     "costmap_update_period_sec": 1.0 / costmap_publish_hz,
                     "oriented_footprint_circle_count": footprint_circle_count,
                     "oriented_footprint_translation_step_m": footprint_translation_step,
@@ -199,7 +195,6 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="2.0",
                 description="Vehicle-side drive-mode transition duration.",
             ),
-            DeclareLaunchArgument("command_frequency_hz", default_value="100.0"),
             DeclareLaunchArgument(
                 "oriented_footprint_circle_count", default_value="0",
                 description="0 uses the scenario-recommended footprint resolution.",
