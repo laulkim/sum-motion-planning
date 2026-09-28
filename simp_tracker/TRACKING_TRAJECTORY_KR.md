@@ -46,10 +46,22 @@
   전환 완료를 추측하지 않는다. 회전 완료 예측 뒤에는 정지해 기다린다.
 - Tracker는 가장 최신 배열 하나만 저장하고 새 배열 수신 시 교체한다.
   Tracker만 odometry를 지속 수신해 실제 위치·자세·속도 오차를 계산한다.
-  향후 100 Hz 제어 루프가 현재 시각의 참조점 선택, 추종 제어,
-  하위제어기로의 모드 요청과 차량 명령 발행을 담당한다. 배열의 최신 교체,
-  취소·만료와 모드 준비 상태 처리도 필요하다. 아직 Tracker는 구현하지
-  않았으므로 기존 시뮬레이션 launch만으로 차량은 움직이지 않는다.
+  `tracker_node`의 독립 100 Hz 타이머가 입력 둘을 잠금 아래 복사하고 즉시
+  잠금을 해제한다. trajectory는 `shared_ptr<const ...>`로 보관하므로
+  callback이 B를 등록해도 진행 중인 cycle은 A snapshot으로 끝난다.
+- point는 `ceil((now - header.stamp) / sample_period)`로 선택하며 보간하지 않는다.
+  pose와 속도, `requested_mode`는 같은 point를 사용한다. mode는 `UInt8`로
+  그대로 전달하며 Tracker에서 `current_mode`나 READY를 판단하지 않는다.
+- 제어식은 Fractal Fract. 2023, 7, 121, Section 4.1의 식 (10), (14)이다.
+  실제 body frame으로 위치 오차를 회전하고 yaw 오차를 [-pi, pi]로 감싼다.
+  gain parameter 기본값은 `kx=3.0, ky=4.0, ktheta=2.0`이며 런타임 조정 가능하다.
+  ETC/ETM, PID, 속도 제한은 추가하지 않았다. 입력 위치는 같은 좌표계여야 한다.
+- 입력 없음·빈 배열·잘못된 주기·시작 전·만료·NaN/Inf 입력/결과는 zero
+  `/cmd_vel`을 발행한다. 유효 point가 없으면 모드도 새로 발행하지 않는다.
+  유효 point가 있고 odometry가 없으면 모드는 전달하되 속도는 zero다.
+  양수가 아니거나 유한하지 않은 gain도 zero command로 처리한다.
+- `simulation.launch.py`는 Planner → TrackingTrajectory → Tracker → `/cmd_vel`
+  → simulator를 연결한다. 모드 명령은 reliable/transient-local QoS로 전달한다.
 
 ## 확인
 

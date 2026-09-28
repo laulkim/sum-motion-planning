@@ -116,6 +116,12 @@ def _resolved_nodes(context):
             ],
         ),
         Node(
+            package="simp_tracker",
+            executable="tracker_node",
+            name="simp_tracker",
+            output="screen",
+        ),
+        Node(
             package="simp_planner_tools",
             executable="debug_plot_node",
             name="debug_plot_node",

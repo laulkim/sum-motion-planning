@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>simp_tracker</name>
+  <version>1.0.0</version>
+  <description>100 Hz Lyapunov trajectory tracking controller.</description>
+  <maintainer email="ske03005@cbnu.ac.kr">Jaepoong Lee</maintainer>
+  <license>Proprietary</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>simp_planner_msgs</depend>
+  <test_depend>rclpy</test_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>
