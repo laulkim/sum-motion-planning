@@ -123,6 +123,13 @@ def _resolved_nodes(context):
         ),
         Node(
             package="simp_planner_tools",
+            executable="tracking_shutdown_plot",
+            name="tracking_shutdown_plot",
+            output="screen",
+            parameters=[{"output_dir": debug_output_dir}],
+        ),
+        Node(
+            package="simp_planner_tools",
             executable="debug_plot_node",
             name="debug_plot_node",
             output="screen",
@@ -224,7 +231,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("save_period", default_value="10.0"),
             DeclareLaunchArgument(
                 "debug_output_dir",
-                default_value="/home/sum/Desktop/simp_planner/simp_planner_debug",
+                default_value="/home/a/Desktop/simp_planner/simp_planner_debug",
             ),
             DeclareLaunchArgument(
                 "vehicle_length", default_value="3.0",

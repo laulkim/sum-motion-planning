@@ -22,6 +22,7 @@
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-matplotlib</exec_depend>
+  <exec_depend>python3-tk</exec_depend>
 
   <test_depend>ament_pytest</test_depend>
   <test_depend>python3-pytest</test_depend>
