@@ -389,15 +389,19 @@ def render_debug_snapshot(
     map_ax.grid(True)
     map_ax.legend(loc="upper left", ncol=2, fontsize=8.2)
 
+    rows = np.asarray(snapshot.get("tracking_rows", []), dtype=float)
     odom_time = _array(snapshot, "odom_time_history")
     cmd_time = _array(snapshot, "cmd_time_history")
     terminal_hold_time = first_true_time(odom_time, snapshot.get("terminal_hold_history", []))
     if odom_time.size:
-        speed_ax.plot(odom_time, _array(snapshot, "speed_history"), linewidth=1.8, label="Measured")
+        speed_ax.plot(odom_time, _array(snapshot, "speed_history"), linewidth=1.8, label="Actual")
         speed_ax.plot(odom_time, _array(snapshot, "target_history"), "--", label="Requested")
         speed_ax.plot(odom_time, _array(snapshot, "applied_target_history"), "-.", label="Feasible-speed upper bound")
     if cmd_time.size:
-        speed_ax.step(cmd_time, _array(snapshot, "command_speed_history"), where="post", linestyle=":", label="Body command magnitude")
+        speed_ax.step(cmd_time, _array(snapshot, "command_speed_history"), where="post", linestyle=":", label="Planner nominal speed")
+    if rows.size:
+        speed_ax.plot(rows[:, 0], np.hypot(rows[:, 13], rows[:, 14]), "--", label="Planner reference")
+        speed_ax.plot(rows[:, 0], np.hypot(rows[:, 16], rows[:, 17]), ":", label="Tracker command")
     if terminal_hold_time is not None:
         speed_ax.axvline(terminal_hold_time, linestyle="--", linewidth=1.0, alpha=0.65, label="Terminal hold")
     speed_ax.set_title("Timestamp-aligned requested, feasible, command, and measured speed")
@@ -428,16 +432,16 @@ def render_debug_snapshot(
         lateral_cm = 100.0 * _array(snapshot, "tracking_lateral_history")
         tracking_ax.plot(odom_time, lateral_cm, label="Lateral error [cm]")
         tracking_angle_ax = tracking_ax.twinx()
-        tracking_angle_ax.plot(odom_time, _array(snapshot, "tracking_motion_history"), "--", label="Direction error [deg]")
+        tracking_angle_ax.plot(odom_time, _array(snapshot, "tracking_motion_history"), "--", label="Body yaw error [deg]")
         tracking_ax.set_ylim(-symmetric_limit(lateral_cm, minimum=1.0), symmetric_limit(lateral_cm, minimum=1.0))
         angle_limit = symmetric_limit(snapshot.get("tracking_motion_history", []), minimum=0.25)
         tracking_angle_ax.set_ylim(-angle_limit, angle_limit)
         lines1, labels1 = tracking_ax.get_legend_handles_labels()
         lines2, labels2 = tracking_angle_ax.get_legend_handles_labels()
         tracking_ax.legend(lines1 + lines2, labels1 + labels2, loc="best", fontsize=7.7)
-        tracking_angle_ax.set_ylabel("direction error [deg]")
+        tracking_angle_ax.set_ylabel("body yaw error [deg]")
     add_zero_line(tracking_ax)
-    tracking_ax.set_title("Executed-command segment tracking error")
+    tracking_ax.set_title("Body-frame error (reference at odom timestamp)")
     tracking_ax.set_xlabel("time [s]")
     tracking_ax.set_ylabel("lateral error [cm]")
     tracking_ax.grid(True)
@@ -468,34 +472,27 @@ def render_debug_snapshot(
 
     if odom_time.size:
         curvature_ax.plot(odom_time, _array(snapshot, "reference_kappa_history"), label="Global reference")
-        curvature_ax.plot(odom_time, _array(snapshot, "executed_kappa_history"), "--", label="Executed trajectory")
+        curvature_ax.plot(odom_time, _array(snapshot, "executed_kappa_history"), "--", label="Planner nominal curvature")
         limit = max(0.22, symmetric_limit([*snapshot.get("reference_kappa_history", []), *snapshot.get("executed_kappa_history", [])], minimum=0.05))
         curvature_ax.set_ylim(-limit, limit)
     curvature_ax.axhline(0.20, linestyle=":", linewidth=1.0, label="Hard limit ±0.20")
     curvature_ax.axhline(-0.20, linestyle=":", linewidth=1.0)
     add_zero_line(curvature_ax)
-    curvature_ax.set_title("Reference and executed curvature")
+    curvature_ax.set_title("Global and nominal plan curvature")
     curvature_ax.set_xlabel("time [s]")
     curvature_ax.set_ylabel("curvature [1/m]")
     curvature_ax.grid(True)
     curvature_ax.legend(loc="best", fontsize=8.0)
 
-    # Allocation diagnostics use only direct ExecutedCommand fields and exact
-    # identities from the allocator: v=sqrt(vx^2+vy^2), chi_dot=r+beta_dot,
-    # and chi_ddot=psi_ddot+beta_ddot.  No finite differences are used.
-    if cmd_time.size:
-        allocation_velocity_ax.step(
-            cmd_time, _array(snapshot, "cmd_vx_history"), where="post", label="vx"
-        )
-        allocation_velocity_ax.step(
-            cmd_time, _array(snapshot, "cmd_vy_history"), where="post", label="vy"
-        )
-        allocation_velocity_ax.step(
-            cmd_time, _array(snapshot, "command_speed_history"), where="post",
-            linestyle=":", label="Planned speed"
-        )
+    # 속도 비교는 실제 세 토픽에서, allocation 항목은 nominal 진단에서 가져온다.
+    if rows.size:
+        for axis_index, component in enumerate(("vx", "vy")):
+            for offset, label, style in ((16, "Tracker command", ":"),
+                                         (10, "Actual", "-"), (13, "Planner reference", "--")):
+                allocation_velocity_ax.plot(rows[:, 0], rows[:, offset + axis_index],
+                                            style, label=f"{component} {label}")
     add_zero_line(allocation_velocity_ax)
-    allocation_velocity_ax.set_title("Allocation: body-frame velocity commands")
+    allocation_velocity_ax.set_title("Body-frame velocity: reference / command / actual")
     allocation_velocity_ax.set_xlabel("time [s]")
     allocation_velocity_ax.set_ylabel("velocity [m/s]")
     allocation_velocity_ax.grid(True)
@@ -514,6 +511,10 @@ def render_debug_snapshot(
             cmd_time, _array(snapshot, "command_beta_rate_history"),
             where="post", label="beta rate"
         )
+    if rows.size:
+        allocation_rate_ax.plot(rows[:, 0], np.degrees(rows[:, 18]), ":", label="Tracker omega")
+        allocation_rate_ax.plot(rows[:, 0], np.degrees(rows[:, 12]), alpha=0.6, label="Actual omega")
+        allocation_rate_ax.plot(rows[:, 0], np.degrees(rows[:, 15]), "--", label="Reference omega")
     add_zero_line(allocation_rate_ax)
     allocation_rate_ax.set_title("Allocation: chi_dot = psi_dot + beta_dot")
     allocation_rate_ax.set_xlabel("time [s]")
@@ -674,7 +675,7 @@ def render_debug_snapshot(
         *costmap_status, "",
         "[TIMESTAMP LOGGING]",
         f"odom samples {len(odom_time)}",
-        f"cmd samples  {len(cmd_time)}",
+        f"diagnostic samples {len(cmd_time)}",
         f"max odom callback delay {max_odom_delay:.3f} s",
         f"render mode worker process",
     ]
@@ -695,7 +696,7 @@ def render_debug_snapshot(
         f"global lat {_format_number(state.get('global_lateral'))} m",
         f"track lat  {_format_number(100.0 * float(state.get('tracking_lateral', math.nan)))} cm",
         f"track src  {state.get('tracking_source', 'N/A')}", "",
-        "[CURRENT ALLOCATION]",
+        "[TRACKER COMMAND / NOMINAL BETA]",
         f"vx/vy {_format_number(snapshot.get('latest_cmd_vx'))} / {_format_number(snapshot.get('latest_cmd_vy'))} m/s",
         f"yaw rate {_format_number(math.degrees(float(snapshot.get('latest_cmd_yaw_rate', math.nan))))} deg/s",
         f"beta {_format_number((snapshot.get('command_beta_history') or [math.nan])[-1])} deg",
@@ -709,6 +710,27 @@ def render_debug_snapshot(
     status_ax.text(0.01, 0.985, "\n".join(status_left), **text_style)
     status_ax.text(0.51, 0.985, "\n".join(status_right), **text_style)
     status_ax.set_title("Current state and timestamp diagnostics")
+
+    # 0 기준선만 남은 축을 정상 데이터처럼 보이지 않게 한다.
+    for axis, key in (
+        (tracking_ax, "tracking_lateral_history"),
+        (acceleration_ax, "command_acceleration_history"),
+        (jerk_ax, "command_jerk_history"),
+        (allocation_beta_ax, "command_beta_history"),
+        (allocation_accel_ax, "command_yaw_acceleration_history"),
+        (allocation_consistency_ax, "allocation_rate_split_residual_history"),
+        (continuity_ax, "n_target_history"),
+    ):
+        values = _array(snapshot, key)
+        if not np.any(np.isfinite(values)):
+            axis.text(0.5, 0.5, "NO DATA" if values.size == 0 else "N/A",
+                      transform=axis.transAxes, ha="center", va="center", color="darkred")
+    if not rows.size:
+        allocation_velocity_ax.text(0.5, 0.5, "NO DATA", transform=allocation_velocity_ax.transAxes,
+                                    ha="center", va="center", color="darkred")
+    if not cmd_time.size and not rows.size:
+        allocation_rate_ax.text(0.5, 0.5, "NO DATA", transform=allocation_rate_ax.transAxes,
+                                ha="center", va="center", color="darkred")
 
     figure.suptitle(f"SIMP Planner - {snapshot.get('scenario_name', 'N/A')} - {diagnosis}")
     snapshot_path = session_dir / f"snapshot_{int(elapsed_int):06d}.png"

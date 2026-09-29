@@ -10,6 +10,7 @@
 #include <simp_planner_msgs/msg/drive_mode_state.hpp>
 #include <simp_planner_msgs/msg/reference_path.hpp>
 #include <simp_planner_msgs/msg/tracking_trajectory.hpp>
+#include <simp_planner_msgs/msg/tracking_diagnostics.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/u_int8.hpp>
@@ -80,6 +81,7 @@ struct ExecutablePlan {
   std::uint64_t plan_id{0};
   std::uint64_t structural_revision{0};
   std::string frame_id;
+  double curvature_switch_jump{std::numeric_limits<double>::quiet_NaN()};
   double allocation_min_clearance{0.0};
   std::string allocation_profile{"LATERAL_PRIORITY"};
   int allocation_candidates_evaluated{1};
@@ -217,6 +219,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
     tracking_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
     auto static_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+    tracking_debug_pub_ = create_publisher<simp_planner_msgs::msg::TrackingDiagnostics>(
+        "/planner/tracking_diagnostics", 1);
     status_pub_ = create_publisher<std_msgs::msg::String>("/planner/status", static_qos);
     execution_state_pub_ = create_publisher<std_msgs::msg::String>(
         "/planner/execution_state", static_qos);
@@ -1243,6 +1247,17 @@ class PlannerNodeCpp final : public rclcpp::Node {
         registration_stale = registration_stale || now_ns() >= scheduled_start;
         if (!registration_stale && !registration_collision) {
           advance_nominal_state_locked(ready_ns);
+          // 새 계획 시작 시각에서 nominal 곡률을 비교한다. 실제 실행 상태와 무관하다.
+          if (predecessor) {
+            const double t = (scheduled_start - predecessor->start_ns) * 1.0e-9;
+            if (t >= 0.0 && t <= predecessor->allocation.trajectory.t.back()) {
+              const auto before = sample_body_command(predecessor->allocation,
+                  predecessor->result.trajectory.actions, t, kTrackingSampleDt);
+              const auto after = sample_body_command(executable->allocation,
+                  executable->result.trajectory.actions, 0.0, kTrackingSampleDt);
+              executable->curvature_switch_jump = after.motion_curvature - before.motion_curvature;
+            }
+          }
           previous_plan_ = predecessor;
           latest_plan_ = executable;
           nominal_stop_.reset();
@@ -1262,8 +1277,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       }
       publish_trajectory(*executable);
       publish_plan_status(*executable, executable->compute_ms);
-      publish_status("REFERENCE_PLAN_READY", elapsed_sec * 1000.0,
-                     executable->result.diagnostics.selected_candidate_id);
+
     } catch (const std::exception& error) {
       RCLCPP_ERROR(get_logger(), "Planning failed: %s", error.what());
       request_replan("PLANNING_RETRY", false);
@@ -1471,6 +1485,10 @@ class PlannerNodeCpp final : public rclcpp::Node {
       message.header.frame_id = received_path_ ? path_frame_ : odom_frame_;
       message.sample_period.nanosec = 10000000;
       message.points.reserve(31);
+      simp_planner_msgs::msg::TrackingDiagnostics debug;
+      debug.header = message.header;
+      debug.sample_period = message.sample_period;
+      debug.points.reserve(31);
       simp_planner_msgs::msg::TrackingTrajectoryPoint point;
       point.x = current_state_.x;
       point.y = current_state_.y;
@@ -1485,6 +1503,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       for (int i = 0; i <= 30; ++i) {
         const auto target_ns = stamp_ns + i * std::int64_t{10000000};
         BodyCommand command;
+        simp_planner_msgs::msg::TrackingDiagnosticsPoint diagnostic;
         if (spot_turn_waiting_clearance_ || hold) {
           // 확인된 정지/대기 상태의 위치를 유지한다.
         } else if (!mode_ready) {
@@ -1511,6 +1530,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
               point.x = command.segment_start_x;
               point.y = command.segment_start_y;
               point.body_yaw = wrap_angle(command.motion_heading - command.beta);
+              diagnostic.allocation_valid = true;
+              diagnostic.plan_id = plan->plan_id;
               stop.reset();
             } else {
               if (!stop || previous_plan != plan) {
@@ -1543,6 +1564,22 @@ class PlannerNodeCpp final : public rclcpp::Node {
         point.vy = command.vy;
         point.yaw_rate = command.yaw_rate;
         message.points.push_back(point);
+        diagnostic.vx = command.vx;
+        diagnostic.vy = command.vy;
+        diagnostic.yaw_rate = command.yaw_rate;
+        diagnostic.planned_speed = command.planned_speed;
+        diagnostic.planned_acceleration = command.planned_acceleration;
+        diagnostic.planned_jerk = command.planned_jerk;
+        diagnostic.motion_curvature = command.motion_curvature;
+        diagnostic.motion_heading_rate = command.motion_heading_rate;
+        diagnostic.beta = command.beta;
+        diagnostic.beta_rate = command.beta_rate;
+        diagnostic.yaw_acceleration = command.yaw_acceleration;
+        diagnostic.trajectory_time = command.trajectory_time;
+        diagnostic.motion_heading_acceleration = command.planned_heading_acceleration;
+        diagnostic.interval_index = command.action_index;
+        diagnostic.requested_mode = point.requested_mode;
+        debug.points.push_back(diagnostic);
         advance_tracking_pose(point, kTrackingSampleDt);
       }
       reference_state = spot_turn_waiting_clearance_ ? "SPOT_TURN_WAITING_CLEARANCE"
@@ -1552,6 +1589,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
           : ((forced_safety_stop_ || expired) ? "SAFETY_STOP"
           : (latest_plan_ ? "PLAN_REFERENCE" : "IDLE")))));
       tracking_pub_->publish(message);
+      tracking_debug_pub_->publish(debug);
     }
     if (resumed_after_turn) {
       if (deferred) path_callback(deferred);
@@ -1656,7 +1694,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
     stream << std::fixed << std::setprecision(6)
            << "{\"backend\":\"CPP_NATIVE\""
            << ",\"allocation_profile\":\"" << plan.allocation_profile << "\""
-           << ",\"state\":\"RUNNING\""
+           << ",\"state\":\"REFERENCE_PLAN_READY\""
            << ",\"block_reason\":\"NONE\""
            << ",\"mode_control\":{"
            << "\"requested_mode\":" << mode_status.requested_mode
@@ -1678,6 +1716,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
            << ",\"selected_candidate_id\":"
            << diagnostics.selected_candidate_id
            << ",\"selected_n_target\":" << selected_n_target
+           << ",\"curvature_switch_jump\":"
+           << (std::isfinite(plan.curvature_switch_jump)
+               ? std::to_string(plan.curvature_switch_jump) : "null")
            << ",\"lateral_selection_basis\":\""
            << diagnostics.lateral_selection_basis << "\""
            << ",\"reference_center_lock_active\":"
@@ -1893,6 +1934,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr trajectory_pub_;
   rclcpp::Publisher<ReferencePathMsg>::SharedPtr trajectory_data_pub_;
   rclcpp::Publisher<simp_planner_msgs::msg::TrackingTrajectory>::SharedPtr tracking_pub_;
+  rclcpp::Publisher<simp_planner_msgs::msg::TrackingDiagnostics>::SharedPtr tracking_debug_pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<ReferencePathMsg>::SharedPtr path_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr costmap_sub_;

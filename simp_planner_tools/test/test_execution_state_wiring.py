@@ -1,8 +1,9 @@
 from pathlib import Path
 
 
-def test_execution_state_is_used_to_avoid_selected_path_fallback_during_safety_stop():
+def test_debug_tracking_uses_timestamp_reference_without_execution_state_fallback():
     source = (Path(__file__).resolve().parents[1] / "simp_planner_tools" / "debug_plot_node.py").read_text(encoding="utf-8")
-    assert '"/planner/execution_state"' in source
-    assert 'self.execution_state in {"SAFETY_STOP", "MODE_STOP", "MODE_WAIT"}' in source
-    assert 'tracking_source = self.execution_state' in source
+    assert '"/planner/tracking_trajectory"' in source
+    assert 'sample_row(message, self.latest_trajectory' in source
+    assert 'SELECTED_PATH_FALLBACK' not in source
+    assert 'EXECUTED_COMMAND_SEGMENT' not in source

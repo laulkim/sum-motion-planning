@@ -76,12 +76,12 @@ def create_figures(data):
     states.suptitle("Vehicle states and body-frame velocity commands")
     for i, (state_label, input_label) in enumerate(zip(("x [m]", "y [m]", "yaw [deg]"), ("vx [m/s]", "vy [m/s]", "omega [deg/s]"))):
         scale = 180 / math.pi if i == 2 else 1
-        axes[i, 0].plot(time, data[:, 1 + i] * scale, label="actual")
-        axes[i, 0].plot(time, data[:, 4 + i] * scale, "--", label="reference")
+        axes[i, 0].plot(time, data[:, 1 + i] * scale, label="Actual")
+        axes[i, 0].plot(time, data[:, 4 + i] * scale, "--", label="Planner reference")
         axes[i, 0].set_ylabel(state_label)
-        axes[i, 1].plot(time, data[:, 16 + i] * scale, label="command")
-        axes[i, 1].plot(time, data[:, 10 + i] * scale, label="actual", alpha=0.7)
-        axes[i, 1].plot(time, data[:, 13 + i] * scale, "--", label="reference")
+        axes[i, 1].plot(time, data[:, 16 + i] * scale, label="Tracker command")
+        axes[i, 1].plot(time, data[:, 10 + i] * scale, label="Actual", alpha=0.7)
+        axes[i, 1].plot(time, data[:, 13 + i] * scale, "--", label="Planner reference")
         axes[i, 1].set_ylabel(input_label)
         for ax in axes[i]:
             ax.legend()

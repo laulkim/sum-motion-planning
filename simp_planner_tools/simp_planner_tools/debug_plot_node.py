@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import fields
 import csv
 import json
 import math
@@ -13,18 +14,20 @@ from typing import Optional
 import numpy as np
 import rclpy
 from ament_index_python.packages import get_package_share_directory
+from geometry_msgs.msg import Twist
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as PathMessage
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from simp_planner_msgs.msg import DriveModeState, ExecutedCommand
+from simp_planner_msgs.msg import DriveModeState, TrackingTrajectory, TrackingDiagnostics
 from simp_planner_msgs.msg import ReferencePath as ReferencePathMessage
 from std_msgs.msg import Float64, String, UInt8
 
-from .debug_allocation_metrics import compute_allocation_debug_sample
+from .debug_allocation_metrics import AllocationDebugSample, compute_allocation_debug_sample
 from .debug_plot_renderer import render_debug_snapshot
 from .debug_scenario_geometry import scenario_obstacle_polygons
 from .debug_signal_history import SourceTimeAligner
-from .diagnostic_metrics import OpenPathGeometry, tracking_error_to_executed_segment
+from .diagnostic_metrics import OpenPathGeometry
+from .tracking_shutdown_plot import reference_at, sample_row
 from .path_geometry import PathProjection, project_open_path, wrap_angle
 
 
@@ -129,13 +132,13 @@ class DebugPlotNode(Node):
                 "planner_state", "planner_block_reason", "diagnosis",
             ]
         )
-        self.command_csv_file = (self.session_dir / "command_history.csv").open(
+        self.command_csv_file = (self.session_dir / "planning_diagnostics.csv").open(
             "w", newline="", encoding="utf-8", buffering=1
         )
         self.command_csv_writer = csv.writer(self.command_csv_file)
         self.command_csv_writer.writerow(
             [
-                "publish_time", "receive_time", "callback_delay",
+                "odom_sample_time", "record_time", "record_delay",
                 "trajectory_time", "interval_index",
                 "vx", "vy", "yaw_rate", "planned_speed",
                 "planned_acceleration", "planned_jerk",
@@ -215,8 +218,8 @@ class DebugPlotNode(Node):
             static_qos,
         )
         self.create_subscription(
-            ExecutedCommand, "/planner/executed_command",
-            self.executed_command_callback, 500
+            TrackingTrajectory, "/planner/tracking_trajectory",
+            self.tracking_callback, 1
         )
         self.create_subscription(
             String, "/planner/status", self.planner_status_callback, static_qos
@@ -235,13 +238,20 @@ class DebugPlotNode(Node):
             static_qos,
         )
 
+        self.create_subscription(TrackingDiagnostics, "/planner/tracking_diagnostics",
+                                 self.diagnostics_callback, 1)
+        self.create_subscription(Twist, "/cmd_vel", self.command_callback, 50)
+        self.latest_trajectory = None
+        self.latest_diagnostics = None
+        self.latest_command = None
+        self.tracking_rows = []
         self.start_time = self.get_clock().now()
         self.last_seen: dict[str, Optional[float]] = {
             name: None
             for name in (
                 "odom", "reference", "selected_trajectory", "global_path",
                 "costmap", "target_speed", "requested_drive_mode",
-                "vehicle_mode", "cmd_vel",
+                "vehicle_mode", "cmd_vel", "tracking_trajectory", "tracking_diagnostics",
                 "planner_status", "execution_state", "scenario_status",
             )
         }
@@ -287,10 +297,7 @@ class DebugPlotNode(Node):
         self.cmd_vy = 0.0
         self.cmd_yaw_rate = 0.0
         self.latest_cmd_time = math.nan
-        self.latest_cmd_plan_id = 0
-        self.latest_command_segment: Optional[tuple[float, float, float, float, float, float]] = None
         self.odom_time_aligner = SourceTimeAligner()
-        self.cmd_time_aligner = SourceTimeAligner()
         self.planner_status: dict[str, object] = {}
         self.scenario_status: dict[str, object] = {}
         self.last_logged_plan_id = 0
@@ -312,7 +319,7 @@ class DebugPlotNode(Node):
         self.command_speed_history: list[float] = []
         self.command_acceleration_history: list[float] = []
         self.command_jerk_history: list[float] = []
-        # Direct allocator outputs.  These are copied from ExecutedCommand or
+        # Direct nominal allocator outputs. These are copied from TrackingDiagnostics or
         # formed from exact allocator identities; no signal is differentiated.
         self.command_motion_heading_rate_history: list[float] = []
         self.command_motion_heading_acceleration_history: list[float] = []
@@ -485,32 +492,57 @@ class DebugPlotNode(Node):
         self.mode = int(message.current_mode)
         self.vehicle_status = int(message.status)
 
-    def executed_command_callback(self, message: ExecutedCommand) -> None:
+    def tracking_callback(self, message: TrackingTrajectory) -> None:
+        old = self.latest_trajectory
+        if old is None or (message.header.stamp.sec, message.header.stamp.nanosec) > (old.header.stamp.sec, old.header.stamp.nanosec):
+            self.latest_trajectory = message
+            self.mark("tracking_trajectory")
+
+    def diagnostics_callback(self, message: TrackingDiagnostics) -> None:
+        old = self.latest_diagnostics
+        if old is None or (message.header.stamp.sec, message.header.stamp.nanosec) > (old.header.stamp.sec, old.header.stamp.nanosec):
+            self.latest_diagnostics = message
+            self.mark("tracking_diagnostics")
+
+    def command_callback(self, message: Twist) -> None:
         self.mark("cmd_vel")
+        self.latest_command = message
+        self.cmd_vx = message.linear.x
+        self.cmd_vy = message.linear.y
+        self.cmd_yaw_rate = message.angular.z
+        # Twist에는 stamp가 없으므로 관측 수신 시각만 기록한다.
+        self.latest_cmd_time = self.elapsed()
+
+    def record_diagnostics(self, message, publish_time: float) -> None:
+        # odom 시각에서 선택한 nominal 진단점이다. 실행 명령이 아니다.
         receive_time = self.elapsed()
-        publish_time = self.cmd_time_aligner.align(
-            message.header.stamp.sec,
-            message.header.stamp.nanosec,
-            receive_time,
-        )
+        if not message.allocation_valid:
+            message = copy.copy(message)
+            for field in ("motion_curvature", "motion_heading_rate",
+                          "motion_heading_acceleration", "beta", "beta_rate", "yaw_acceleration"):
+                setattr(message, field, math.nan)
         vx = float(message.vx)
         vy = float(message.vy)
         yaw_rate = float(message.yaw_rate)
         planned_speed = float(message.planned_speed)
         planned_acceleration = float(message.planned_acceleration)
         planned_jerk = float(message.planned_jerk)
-        allocation_debug = compute_allocation_debug_sample(
-            vx=vx,
-            vy=vy,
-            yaw_rate=yaw_rate,
-            planned_speed=planned_speed,
-            motion_heading_rate=float(message.motion_heading_rate),
-            motion_heading_acceleration=float(message.motion_heading_acceleration),
-            beta=float(message.beta),
-            beta_rate=float(message.beta_rate),
-            yaw_acceleration=float(message.yaw_acceleration),
-            mode=self.mode,
-        )
+        try:
+            allocation_debug = compute_allocation_debug_sample(
+                vx=vx,
+                vy=vy,
+                yaw_rate=yaw_rate,
+                planned_speed=planned_speed,
+                motion_heading_rate=float(message.motion_heading_rate),
+                motion_heading_acceleration=float(message.motion_heading_acceleration),
+                beta=float(message.beta),
+                beta_rate=float(message.beta_rate),
+                yaw_acceleration=float(message.yaw_acceleration),
+                mode=message.requested_mode,
+            )
+        except ValueError:
+            allocation_debug = AllocationDebugSample(**{
+                field.name: math.nan for field in fields(AllocationDebugSample)})
         motion_heading_rate_deg = allocation_debug.motion_heading_rate_degps
         motion_heading_acceleration_deg = (
             allocation_debug.motion_heading_acceleration_degps2
@@ -525,20 +557,6 @@ class DebugPlotNode(Node):
         speed_reconstruction_error = (
             allocation_debug.speed_reconstruction_error_mps
         )
-        self.cmd_vx = vx
-        self.cmd_vy = vy
-        self.cmd_yaw_rate = yaw_rate
-        self.latest_cmd_time = publish_time
-        self.latest_cmd_plan_id = int(message.plan_id)
-        segment = (
-            float(message.segment_start_x),
-            float(message.segment_start_y),
-            float(message.segment_start_heading),
-            float(message.segment_end_x),
-            float(message.segment_end_y),
-            float(message.segment_end_heading),
-        )
-        self.latest_command_segment = segment if all(math.isfinite(v) for v in segment) else None
         self.cmd_time_history.append(publish_time)
         self.cmd_receive_time_history.append(receive_time)
         self.cmd_callback_delay_history.append(max(0.0, receive_time - publish_time))
@@ -581,7 +599,7 @@ class DebugPlotNode(Node):
                 f"{yaw_acceleration_deg:.9f}",
                 f"{rate_split_residual_deg:.12f}",
                 f"{speed_reconstruction_error:.12f}",
-                "" if self.mode is None else self.mode, int(message.plan_id),
+                message.requested_mode, int(message.plan_id),
             ]
         )
 
@@ -593,7 +611,15 @@ class DebugPlotNode(Node):
         self.mark("planner_status")
         try:
             value = json.loads(message.data)
-            self.planner_status = value if isinstance(value, dict) else {}
+            if isinstance(value, dict):
+                old_id = self.planner_section("execution").get("current_plan_id")
+                new_id = value.get("execution", {}).get("current_plan_id")
+                if old_id == new_id:
+                    for section in ("plan", "timing"):
+                        value[section] = {**self.planner_section(section), **value.get(section, {})}
+                self.planner_status = value
+            else:
+                self.planner_status = {}
         except json.JSONDecodeError:
             self.planner_status = {"state": "INVALID_JSON"}
             return
@@ -611,13 +637,13 @@ class DebugPlotNode(Node):
             self.costmap_crop_height = plan.get("costmap_crop_height")
         timing = self.planner_section("timing")
         plan_id = int(execution.get("current_plan_id", 0) or 0)
-        if plan_id <= 0 or plan_id == self.last_logged_plan_id:
+        if "id" not in plan or plan_id <= 0 or plan_id == self.last_logged_plan_id:
             return
         self.last_logged_plan_id = plan_id
         now = self.elapsed()
         candidate = int(plan.get("selected_candidate_id", -1) or -1)
         n_target = float(plan.get("selected_n_target", math.nan))
-        curvature_jump = float(plan.get("curvature_switch_jump", math.nan))
+        curvature_jump = float(plan.get("curvature_switch_jump") if plan.get("curvature_switch_jump") is not None else math.nan)
         total_compute = float(plan.get("total_compute_time_ms", math.nan))
         deadline = float(timing.get("deadline_ms", self.planning_deadline_ms))
         deadline_missed = int(math.isfinite(total_compute) and total_compute > deadline)
@@ -744,62 +770,19 @@ class DebugPlotNode(Node):
         beta = float(wrap_angle(motion_direction - body_yaw))
         global_motion_error = float(wrap_angle(motion_direction - projection.yaw))
 
-        tracking_lateral = math.nan
-        tracking_motion = math.nan
-        tracking_source = "N/A"
-        command = self.planner_section("command")
-        terminal_hold = bool(
-            self.planner_section("terminal_hold").get("latched", False)
-        )
-        segment_values = self.latest_command_segment
-        command_age = (
-            math.inf if not math.isfinite(self.latest_cmd_time)
-            else max(0.0, elapsed - self.latest_cmd_time)
-        )
-        segment_valid = (
-            segment_values is not None
-            and command_age <= 0.05
-        )
-        if terminal_hold:
-            tracking_lateral = 0.0
-            tracking_motion = 0.0
-            tracking_source = "TERMINAL_HOLD"
-        elif segment_valid:
-            result = tracking_error_to_executed_segment(
-                x, y, motion_direction,
-                start_x=segment_values[0], start_y=segment_values[1],
-                start_heading=segment_values[2],
-                end_x=segment_values[3], end_y=segment_values[4],
-                end_heading=segment_values[5],
-            )
-            tracking_lateral = result.lateral_error
-            tracking_motion = result.motion_direction_error
-            tracking_source = "EXECUTED_COMMAND_SEGMENT"
-        elif (self.execution_state in {"ACTIVE_PLAN", "STARTUP", "UNKNOWN"}
-              and self.selected_geometry is not None):
-            # Startup fallback only. During normal execution the command segment
-            # above is used so plan replacement cannot create artificial spikes.
-            try:
-                result = self.selected_geometry.tracking_error(
-                    x, y, motion_direction,
-                    previous_segment=(
-                        None if self.selected_projection is None
-                        else self.selected_projection.segment_index
-                    ),
-                )
-                self.selected_projection = result.projection
-                tracking_lateral = result.lateral_error
-                tracking_motion = result.motion_direction_error
-                tracking_source = "SELECTED_PATH_FALLBACK"
-            except ValueError:
-                self.selected_projection = None
-        elif (self.execution_state in {"SAFETY_STOP", "MODE_STOP", "MODE_WAIT"}
-              or self.execution_state.startswith("SPOT_TURN_")):
-            tracking_source = self.execution_state
-
+        stamp_ns = message.header.stamp.sec * 1000000000 + message.header.stamp.nanosec
+        row = sample_row(message, self.latest_trajectory, self.latest_command,
+                         self.start_time.nanoseconds)
+        self.tracking_rows.append(row)
+        tracking_lateral, tracking_motion = row[8], row[9]
+        tracking_source = "ODOM_TIME_REFERENCE" if math.isfinite(tracking_lateral) else "N/A"
+        diagnostic = reference_at(self.latest_diagnostics, stamp_ns, message.header.frame_id)
+        if diagnostic is not None:
+            self.record_diagnostics(diagnostic, elapsed)
         plan = self.planner_section("plan")
         execution = self.planner_section("execution")
-        executed_kappa = float(command.get("motion_kappa", math.nan))
+        executed_kappa = (diagnostic.motion_curvature
+                          if diagnostic is not None and diagnostic.allocation_valid else math.nan)
         plan_id = int(execution.get("current_plan_id", 0) or 0)
 
 
@@ -869,7 +852,7 @@ class DebugPlotNode(Node):
                 f"{self.cmd_yaw_rate:.9f}", plan_id,
                 int(plan.get("selected_candidate_id", -1) or -1),
                 f"{float(plan.get('selected_n_target', math.nan)):.9f}",
-                f"{float(plan.get('curvature_switch_jump', math.nan)):.9f}",
+                f"{float(plan.get('curvature_switch_jump') if plan.get('curvature_switch_jump') is not None else math.nan):.9f}",
                 f"{float(plan.get('total_compute_time_ms', math.nan)):.6f}",
                 f"{float(plan.get('coarse_min_clearance', math.nan)):.9f}",
                 f"{float(plan.get('precise_min_clearance', math.nan)):.9f}",
@@ -903,6 +886,15 @@ class DebugPlotNode(Node):
         spot_turn = self.planner_section("spot_turn").get("state", "INACTIVE")
         if spot_turn not in {"INACTIVE", "SPOT_TURN_APPROACH"}:
             return str(spot_turn), "Spot-turn wheel alignment, rotation, or clearance wait is active."
+
+        for topic in ("tracking_trajectory", "tracking_diagnostics", "cmd_vel"):
+            if self.last_seen[topic] is None:
+                return "NO_DATA", f"No {topic} received."
+            if self.age(topic) > self.dynamic_topic_timeout:
+                return "NO_DATA", f"Stale {topic}."
+        if self.current_state is None or not all(math.isfinite(self.current_state[key])
+                for key in ("tracking_lateral", "tracking_motion_error")):
+            return "N/A", "No valid reference at odometry timestamp (check frame and horizon)."
 
         plan = self.planner_section("plan")
         selected_target = float(plan.get("selected_n_target", math.nan))
@@ -1006,7 +998,7 @@ class DebugPlotNode(Node):
                 return "MODE_COMMAND_SIGN_MISMATCH", "LEFT mode requires non-negative vy."
             if self.mode == 3 and self.cmd_vy > 1.0e-3:
                 return "MODE_COMMAND_SIGN_MISMATCH", "RIGHT mode requires non-positive vy."
-        return "OK", "Scenario, selected-trajectory tracking, continuity, and timing are consistent."
+        return "OK", "Available reference, odometry, command, and planning checks passed; N/A panels are not checked."
 
     def vehicle_polygon(self, x: float, y: float, yaw: float) -> np.ndarray:
         corners = np.asarray(
@@ -1073,6 +1065,7 @@ class DebugPlotNode(Node):
             "planner_state": self.planner_status.get("state", "N/A"),
             "hold_latched": bool(self.planner_status.get("terminal_hold", {}).get("latched", False)),
             "plan": plan, "timing": timing, "execution": execution,
+            "tracking_rows": list(self.tracking_rows),
             "odom_time_history": list(self.odom_time_history),
             "odom_receive_time_history": list(self.odom_receive_time_history),
             "odom_callback_delay_history": list(self.odom_callback_delay_history),
@@ -1152,7 +1145,7 @@ class DebugPlotNode(Node):
             "current_state": self.current_state,
             "timestamp_logging": {
                 "odom_samples": len(self.odom_time_history),
-                "command_samples": len(self.cmd_time_history),
+                "diagnostic_samples": len(self.cmd_time_history),
                 "render_skip_count": self.render_skip_count,
             },
         }
