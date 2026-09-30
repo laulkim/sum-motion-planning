@@ -110,13 +110,18 @@ class PlanarVelocitySimNode(Node):
             self.get_logger().error(f"Unsupported drive-mode command: {requested}")
             return
         speed = math.hypot(self.applied_vx, self.applied_vy)
+        previous_feedback = self.mode_model.feedback()
         accepted = self.mode_model.command(
             requested, measured_speed=speed, now_sec=self.now_seconds()
         )
         if not accepted:
             self.get_logger().warning(
-                f"Rejected mode command {requested}: vehicle speed={speed:.3f} m/s"
+                f"Rejected mode command {requested}: vehicle speed={speed:.3f} m/s",
+                throttle_duration_sec=1.0,
             )
+            return
+        # Tracker가 같은 모드 명령을 100 Hz로 반복하므로 상태가 바뀐 경우만 처리한다.
+        if self.mode_model.feedback() == previous_feedback:
             return
         if self.mode_model.transition_in_progress:
             self.command_vx = 0.0
