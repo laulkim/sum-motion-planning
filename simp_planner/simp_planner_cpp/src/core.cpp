@@ -625,11 +625,17 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
   {
     ScopedBlockTimer curvature_cartesian_timer(g_planning_block_timings.candidate_curvature_cartesian_ms);
     for (std::size_t i = 0; i < q.size(); ++i) s_query[i] = fr.s + q[i];
-    ref = evaluate_reference_with_virtual_extension(reference, s_query, real_end_s,
-                                                     cfg.simulation.virtual_extension_blend_length);
-    for (std::size_t i = 0; i < q.size(); ++i) {
-      x[i] = ref.x[i] - profile.p[i] * std::sin(ref.psi[i]);
-      y[i] = ref.y[i] + profile.p[i] * std::cos(ref.psi[i]);
+    {
+      ScopedBlockTimer reference_eval_timer(g_planning_block_timings.candidate_reference_eval_ms);
+      ref = evaluate_reference_with_virtual_extension(reference, s_query, real_end_s,
+                                                       cfg.simulation.virtual_extension_blend_length);
+    }
+    {
+      ScopedBlockTimer cartesian_xy_timer(g_planning_block_timings.candidate_cartesian_xy_ms);
+      for (std::size_t i = 0; i < q.size(); ++i) {
+        x[i] = ref.x[i] - profile.p[i] * std::sin(ref.psi[i]);
+        y[i] = ref.y[i] + profile.p[i] * std::cos(ref.psi[i]);
+      }
     }
   }
   {
@@ -651,14 +657,23 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
     ScopedBlockTimer curvature_cartesian_timer(g_planning_block_timings.candidate_curvature_cartesian_ms);
     s_query.resize(q.size());
     for (std::size_t i = 0; i < q.size(); ++i) s_query[i] = fr.s + q[i];
-    ref = evaluate_reference_with_virtual_extension(reference, s_query, real_end_s,
-                                                     cfg.simulation.virtual_extension_blend_length);
-    x.resize(q.size()); y.resize(q.size());
-    for (std::size_t i = 0; i < q.size(); ++i) {
-      x[i] = ref.x[i] - profile.p[i] * std::sin(ref.psi[i]);
-      y[i] = ref.y[i] + profile.p[i] * std::cos(ref.psi[i]);
+    {
+      ScopedBlockTimer reference_eval_timer(g_planning_block_timings.candidate_reference_eval_ms);
+      ref = evaluate_reference_with_virtual_extension(reference, s_query, real_end_s,
+                                                       cfg.simulation.virtual_extension_blend_length);
     }
-    arc = cumulative_arc_length(x, y);
+    x.resize(q.size()); y.resize(q.size());
+    {
+      ScopedBlockTimer cartesian_xy_timer(g_planning_block_timings.candidate_cartesian_xy_ms);
+      for (std::size_t i = 0; i < q.size(); ++i) {
+        x[i] = ref.x[i] - profile.p[i] * std::sin(ref.psi[i]);
+        y[i] = ref.y[i] + profile.p[i] * std::cos(ref.psi[i]);
+      }
+    }
+    {
+      ScopedBlockTimer heading_arclength_timer(g_planning_block_timings.candidate_heading_arclength_ms);
+      arc = cumulative_arc_length(x, y);
+    }
     std::vector<std::size_t> keep;
     keep.reserve(q.size());
     keep.push_back(0);
@@ -680,6 +695,7 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
       profile.p = select_double(profile.p); profile.dp = select_double(profile.dp); profile.ddp = select_double(profile.ddp);
       ref.psi = select_double(ref.psi); ref.kappa = select_double(ref.kappa); ref.kappa_s = select_double(ref.kappa_s);
       ref.is_virtual = select_byte(ref.is_virtual);
+      ScopedBlockTimer heading_arclength_timer(g_planning_block_timings.candidate_heading_arclength_ms);
       arc = cumulative_arc_length(x, y);
     }
   }
@@ -689,13 +705,17 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
   std::vector<double> kappa_l;
   {
     ScopedBlockTimer curvature_cartesian_timer(g_planning_block_timings.candidate_curvature_cartesian_ms);
-    for (std::size_t i = 0; i < arc.size(); ++i) {
-      const double A = 1.0 - ref.kappa[i] * profile.p[i];
-      psi[i] = ref.psi[i] + std::atan2(profile.dp[i], A);
+    {
+      ScopedBlockTimer heading_arclength_timer(g_planning_block_timings.candidate_heading_arclength_ms);
+      for (std::size_t i = 0; i < arc.size(); ++i) {
+        const double A = 1.0 - ref.kappa[i] * profile.p[i];
+        psi[i] = ref.psi[i] + std::atan2(profile.dp[i], A);
+      }
+      psi = unwrap_angles(psi);
+      const double branch_shift = 2.0 * kPi * std::round((state.chi - psi.front()) / (2.0 * kPi));
+      for (double& value : psi) value += branch_shift;
     }
-    psi = unwrap_angles(psi);
-    const double branch_shift = 2.0 * kPi * std::round((state.chi - psi.front()) / (2.0 * kPi));
-    for (double& value : psi) value += branch_shift;
+    ScopedBlockTimer kappa_timer(g_planning_block_timings.candidate_kappa_ms);
     for (std::size_t i = 0; i < arc.size(); ++i) {
       const double A = 1.0 - ref.kappa[i] * profile.p[i];
       const double D = std::max(A * A + profile.dp[i] * profile.dp[i], 1.0e-10);

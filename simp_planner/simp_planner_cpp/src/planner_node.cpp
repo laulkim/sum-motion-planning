@@ -109,6 +109,10 @@ struct ExecutablePlan {
   double candidate_polynomial_fit_ms{0.0};
   double candidate_sample_points_ms{0.0};
   double candidate_curvature_cartesian_ms{0.0};
+  double candidate_reference_eval_ms{0.0};
+  double candidate_cartesian_xy_ms{0.0};
+  double candidate_heading_arclength_ms{0.0};
+  double candidate_kappa_ms{0.0};
   double trajectory_generation_ms{0.0};
   double trajectory_initial_state_target_ms{0.0};
   double trajectory_longitudinal_profile_ms{0.0};
@@ -1238,6 +1242,10 @@ class PlannerNodeCpp final : public rclcpp::Node {
       executable->candidate_polynomial_fit_ms = block_timings.candidate_polynomial_fit_ms;
       executable->candidate_sample_points_ms = block_timings.candidate_sample_points_ms;
       executable->candidate_curvature_cartesian_ms = block_timings.candidate_curvature_cartesian_ms;
+      executable->candidate_reference_eval_ms = block_timings.candidate_reference_eval_ms;
+      executable->candidate_cartesian_xy_ms = block_timings.candidate_cartesian_xy_ms;
+      executable->candidate_heading_arclength_ms = block_timings.candidate_heading_arclength_ms;
+      executable->candidate_kappa_ms = block_timings.candidate_kappa_ms;
       executable->trajectory_generation_ms = block_timings.trajectory_generation_ms;
       executable->trajectory_initial_state_target_ms = block_timings.trajectory_initial_state_target_ms;
       executable->trajectory_longitudinal_profile_ms = block_timings.trajectory_longitudinal_profile_ms;
@@ -1798,6 +1806,10 @@ class PlannerNodeCpp final : public rclcpp::Node {
            << ",\"candidate_polynomial_fit_ms\":" << plan.candidate_polynomial_fit_ms
            << ",\"candidate_sample_points_ms\":" << plan.candidate_sample_points_ms
            << ",\"candidate_curvature_cartesian_ms\":" << plan.candidate_curvature_cartesian_ms
+           << ",\"candidate_reference_eval_ms\":" << plan.candidate_reference_eval_ms
+           << ",\"candidate_cartesian_xy_ms\":" << plan.candidate_cartesian_xy_ms
+           << ",\"candidate_heading_arclength_ms\":" << plan.candidate_heading_arclength_ms
+           << ",\"candidate_kappa_ms\":" << plan.candidate_kappa_ms
            << ",\"trajectory_generation_ms\":" << plan.trajectory_generation_ms
            << ",\"trajectory_initial_state_target_ms\":" << plan.trajectory_initial_state_target_ms
            << ",\"trajectory_longitudinal_profile_ms\":" << plan.trajectory_longitudinal_profile_ms

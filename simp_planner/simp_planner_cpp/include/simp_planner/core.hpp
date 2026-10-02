@@ -99,6 +99,23 @@ struct PlanningBlockTimings {
   double candidate_polynomial_fit_ms{0.0};
   double candidate_sample_points_ms{0.0};
   double candidate_curvature_cartesian_ms{0.0};
+  // Further breakdown of candidate_curvature_cartesian_ms into its four
+  // internal phases (nested inside it, so each is also counted there and
+  // they need not sum to it exactly). The reference-eval/Cartesian-xy pair
+  // runs twice per candidate -- once before and once after preview-length
+  // truncation -- so each of those two sums both passes.
+  // candidate_reference_eval_ms is evaluate_reference_with_virtual_
+  // extension() itself (the per-sample reference-path lookup).
+  // candidate_cartesian_xy_ms is the sin/cos offset from that reference
+  // pose (x = x_ref - p*sin(psi_ref), y = y_ref + p*cos(psi_ref)).
+  // candidate_heading_arclength_ms is the atan2-based heading (psi) loop
+  // plus every cumulative_arc_length() (hypot-based) call. candidate_
+  // kappa_ms is the closed-form curvature formula (sqrt + division) plus
+  // the kappa_l finite-difference gradient() derived from it.
+  double candidate_reference_eval_ms{0.0};
+  double candidate_cartesian_xy_ms{0.0};
+  double candidate_heading_arclength_ms{0.0};
+  double candidate_kappa_ms{0.0};
   // Breakdown of generate_open_loop_trajectory() into its conceptual stages.
   // trajectory_generation_ms is the total wall-clock time of the whole
   // function (wraps the entire body; the five entries below are nested

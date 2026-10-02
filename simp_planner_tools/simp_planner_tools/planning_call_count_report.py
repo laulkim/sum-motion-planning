@@ -151,6 +151,25 @@ PATH_BREAKDOWN_SERIES = (
     ("Candidate gen: Cartesian + curvature profile", (
         ("candidate_curvature_cartesian_ms", "curvature + Cartesian", "tab:olive"),
     )),
+    # Further split of the panel above into its four internal phases (see
+    # the matching comment on PlanningBlockTimings in core.hpp), each on its
+    # own panel rather than overlaid. The reference-eval/Cartesian-xy pair
+    # runs twice per candidate (once before and once after preview-length
+    # truncation), so each series here already sums both passes -- that
+    # duplication is why these are worth watching on their own rather than
+    # trusting the olive total above.
+    ("Candidate gen: curvature-profile -- reference eval", (
+        ("candidate_reference_eval_ms", "reference eval", "tab:cyan"),
+    )),
+    ("Candidate gen: curvature-profile -- Cartesian x/y", (
+        ("candidate_cartesian_xy_ms", "Cartesian x/y (sin/cos)", "tab:blue"),
+    )),
+    ("Candidate gen: curvature-profile -- heading + arc length", (
+        ("candidate_heading_arclength_ms", "heading + arc length (atan2/hypot)", "tab:green"),
+    )),
+    ("Candidate gen: curvature-profile -- kappa + kappa_l", (
+        ("candidate_kappa_ms", "kappa + kappa_l (sqrt/div/gradient)", "tab:olive"),
+    )),
     ("Collision check", (
         ("collision_check_ms", "collision check", "tab:red"),
     )),
