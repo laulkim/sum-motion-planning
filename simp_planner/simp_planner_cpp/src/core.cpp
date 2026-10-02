@@ -1570,7 +1570,7 @@ std::vector<std::tuple<std::string, double, double, bool>> lateral_length_option
   // transition than the minimum dynamic bound, especially at low speed where
   // the minimum bound becomes short.  Evaluate two deterministic longer
   // alternatives rather than forcing a full stop and replanning from rest.
-  if (std::abs(delta_n) >= 0.50) {
+  if (std::abs(delta_n) >= cfg.lateral.near_target_offset) {
     const double medium = clamp_value(
         std::max(1.35 * nominal, nominal + 3.0),
         cfg.lateral.min_length, cfg.lateral.max_length);
@@ -1584,7 +1584,8 @@ std::vector<std::tuple<std::string, double, double, bool>> lateral_length_option
       options.emplace_back("long_transition", longer, 0.0, false);
     }
   }
-  if (std::abs(delta_n) < 0.50 && v_scale > cfg.constraints.v_eff_min) {
+  if (std::abs(delta_n) < cfg.lateral.near_target_offset
+      && v_scale > cfg.constraints.v_eff_min) {
     const double omega = std::abs(state.motion_heading_rate);
     const double acceleration = std::abs(state.acceleration);
     const double jerk_available = std::max(
@@ -2752,7 +2753,7 @@ PlanResult PathVelocityPlanner::plan_at_speed(
     const bool same_maneuver = maneuver_profile_ && maneuver_start_s_
         && std::abs(maneuver_profile_->target - item.path.n_target) <= 1.0e-9;
     const bool transition_required = !item.short_path_stop && (same_maneuver
-        || std::abs(item.path.n_target - fr.n) >= 0.5);
+        || std::abs(item.path.n_target - fr.n) >= config_.lateral.near_target_offset);
     if (transition_required) {
       if (!same_maneuver) {
         const auto boundary = initial_spatial_boundaries(

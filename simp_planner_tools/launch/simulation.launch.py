@@ -167,6 +167,13 @@ def _resolved_nodes(context):
             ],
         ),
         Node(
+            package="simp_planner_tools",
+            executable="scenario_obstacle_visualizer_node",
+            name="scenario_obstacle_visualizer_node",
+            output="screen",
+            parameters=[{"scenario": scenario_name}],
+        ),
+        Node(
             package="rviz2",
             executable="rviz2",
             name="rviz2",

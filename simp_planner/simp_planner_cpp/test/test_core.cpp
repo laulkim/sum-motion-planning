@@ -123,12 +123,18 @@ void test_rotated_costmap_registration() {
 void test_nominal_planning_and_allocation() {
   simp_planner::EnvConfig config;
   require(config.lateral.n_targets.size() == 65, "lateral exploration count mismatch");
-  require(std::abs(config.lateral.n_targets.front() + 8.0) < 1e-12, "lateral minimum mismatch");
-  require(std::abs(config.lateral.n_targets.back() - 8.0) < 1e-12, "lateral maximum mismatch");
+  require(std::abs(config.lateral.n_targets.front() + 3.5) < 1e-12, "lateral minimum mismatch");
+  require(std::abs(config.lateral.n_targets.back() - 3.5) < 1e-12, "lateral maximum mismatch");
+  const double target_spacing = 7.0 / 64.0;
   for (std::size_t i = 1; i < config.lateral.n_targets.size(); ++i) {
-    require(std::abs(config.lateral.n_targets[i] - config.lateral.n_targets[i - 1] - 0.25) < 1e-12,
+    require(std::abs(config.lateral.n_targets[i] - config.lateral.n_targets[i - 1]
+                     - target_spacing) < 1e-12,
             "lateral target spacing mismatch");
   }
+  require(std::abs(config.lateral.near_target_offset - 2.0 * target_spacing) < 1e-12,
+          "near-target threshold must stay two target spacings");
+  require(config.adaptive_replan.maneuver_target_tolerance < config.lateral.near_target_offset,
+          "maneuver release tolerance must be inside the near-target threshold");
   simp_planner::PathVelocityPlanner planner(config, straight_path(), empty_costmap());
   const simp_planner::PlannerState initial{};
   const simp_planner::PlannerAction previous{};

@@ -1,11 +1,14 @@
 """차량 footprint 사각형 + 주행 궤적(odometry trail)을 RViz용으로 publish한다.
 
   /viz/vehicle_footprint  (visualization_msgs/MarkerArray)
-      /odom을 받을 때마다 차량 중심(x,y) + body yaw 기준으로 직사각형 2겹을
-      다시 그려서 publish한다: 채운 CUBE 몸체(진한 남색) + 위에 겹치는 굵은
+      /odom을 받을 때마다 차량 중심(x,y) + body yaw 기준으로 몸체 + footprint
+      테두리를 다시 그려서 publish한다: SIMP03 CAD 메시 몸체(바퀴 제외,
+      vehicle_mesh_resource; 빈 문자열이면 진한 남색 CUBE) + 위에 겹치는 굵은
       LINE_STRIP 테두리(검정에 가까운 진한 색). debug_plot_node.py의
       vehicle_polygon()과 동일한 규약: 위치는 차량 중심, 앞뒤/좌우 대칭
-      (vehicle_length x vehicle_width). 같은 MarkerArray에 차량↔플래너 사이
+      (vehicle_length x vehicle_width). 메시는 footprint가 1x1로 정규화돼
+      있어서 CUBE와 똑같이 scale.x/y = vehicle_length/width로 늘려 그리므로
+      항상 코드상의 차량 크기와 일치한다. 같은 MarkerArray에 차량↔플래너 사이
       드라이브 모드 상태 전이 값(아래 참고)을 보여주는 텍스트 마커도 함께
       publish한다.
   /viz/traveled_path      (nav_msgs/Path)
@@ -78,6 +81,9 @@ class VehicleVisualizerNode(Node):
         self.declare_parameter("max_path_points", 20000)
         self.declare_parameter("status_text_offset_m", 8.0)
         self.declare_parameter("status_text_scale", 2.5)
+        self.declare_parameter(
+            "vehicle_mesh_resource", "package://simp_planner_tools/meshes/simp03_body.dae"
+        )
 
         self.vehicle_length = float(self.get_parameter("vehicle_length").value)
         self.vehicle_width = float(self.get_parameter("vehicle_width").value)
@@ -85,6 +91,7 @@ class VehicleVisualizerNode(Node):
         self.max_path_points = int(self.get_parameter("max_path_points").value)
         self.status_text_offset_m = float(self.get_parameter("status_text_offset_m").value)
         self.status_text_scale = float(self.get_parameter("status_text_scale").value)
+        self.vehicle_mesh_resource = str(self.get_parameter("vehicle_mesh_resource").value)
 
         static_qos = QoSProfile(
             depth=1,
@@ -129,20 +136,28 @@ class VehicleVisualizerNode(Node):
         body.header.frame_id = frame_id
         body.ns = "vehicle_footprint"
         body.id = 0
-        body.type = Marker.CUBE
         body.action = Marker.ADD
         body.pose.position.x = x
         body.pose.position.y = y
-        body.pose.position.z = 0.15
         body.pose.orientation.z = math.sin(0.5 * yaw)
         body.pose.orientation.w = math.cos(0.5 * yaw)
         body.scale.x = self.vehicle_length
         body.scale.y = self.vehicle_width
-        body.scale.z = 0.3
-        body.color.r = 0.02
-        body.color.g = 0.08
-        body.color.b = 0.45
-        body.color.a = 0.95
+        if self.vehicle_mesh_resource:
+            # 메시는 x/y가 [-0.5, 0.5]로 정규화돼 있고 z는 실제 높이(m, 지면=0).
+            # color를 전부 0으로 두면 RViz가 메시에 내장된 부품별 색을 쓴다.
+            body.type = Marker.MESH_RESOURCE
+            body.mesh_resource = self.vehicle_mesh_resource
+            body.mesh_use_embedded_materials = True
+            body.scale.z = 1.0
+        else:
+            body.type = Marker.CUBE
+            body.pose.position.z = 0.15
+            body.scale.z = 0.3
+            body.color.r = 0.02
+            body.color.g = 0.08
+            body.color.b = 0.45
+            body.color.a = 0.95
 
         outline = Marker()
         outline.header = body.header
@@ -155,8 +170,9 @@ class VehicleVisualizerNode(Node):
         outline.color.g = 0.0
         outline.color.b = 0.0
         outline.color.a = 1.0
+        # 몸체 위(메시 최고점 ~0.48 m, CUBE 0.3 m)에 그려야 TopDown 뷰에서 가려지지 않는다.
         outline.points = [
-            Point(x=px, y=py, z=0.32)
+            Point(x=px, y=py, z=0.5)
             for px, py in vehicle_footprint_points(
                 x, y, yaw, self.vehicle_length, self.vehicle_width
             )

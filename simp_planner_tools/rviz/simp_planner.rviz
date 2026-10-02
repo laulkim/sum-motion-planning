@@ -49,6 +49,15 @@ Visualization Manager:
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
+      Name: Scenario obstacles
+      Topic:
+        Value: /viz/scenario_obstacles
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
       Name: Vehicle footprint
       Topic:
         Value: /viz/vehicle_footprint

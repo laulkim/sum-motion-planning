@@ -107,7 +107,8 @@ Body `vx`, `vy` 제약이 아니다.
 
 | 파라미터 | 기본값 | 단위 | 상태 및 의미 |
 |---|---:|---:|---|
-| `n_targets` | -8.0~+8.0, step 0.25 | m | 활성, Frenet lateral target 65개 |
+| `n_targets` | -3.5~+3.5, step 0.109375 | m | 활성, Frenet lateral target 65개 |
+| `near_target_offset` | 0.21875 | m | 활성, 이보다 가까운 target은 길이 후보 1개·기동 미고정 (target 간격 2칸) |
 | `min_length` | 3.0 | m | 활성, 새로 생성하는 nominal 횡 transition 최소 길이 |
 | `max_length` | 50.0 | m | 활성, 횡 transition 최대 길이; 기존 maneuver 재계획 시 남은 segment는 0.10 m까지 허용 |
 | `spatial_ds` | 0.25 | m | 활성, 공간 후보 sampling 간격 |
@@ -195,18 +196,18 @@ jerk:         min(jerk_max=3.0, comfort_jerk=0.8) = ±0.8 m/s³
 | `w_jerk` | 0.50 | 활성, longitudinal jerk cost |
 | `w_heading_accel` | 0.05 | 활성, motion-heading acceleration cost |
 | `w_lateral_jerk` | 0.10 | 활성, path-frame lateral jerk cost |
-| `w_lateral_offset` | 0.08 | 활성, 전체 lateral offset cost |
-| `w_terminal_offset` | 0.12 | 활성, 실제 path end lateral offset cost |
-| `w_offset_overshoot` | 2.0 | 활성, lateral target 범위 overshoot cost |
+| `w_lateral_offset` | 1.5 | 활성, 전체 lateral offset cost |
+| `w_terminal_offset` | 2.25 | 활성, 실제 path end lateral offset cost |
+| `w_offset_overshoot` | 15.0 | 활성, lateral target 범위 overshoot cost |
 | `w_curvature` | 8.0 | 활성, curvature cost |
 | `w_curvature_rate` | 1.2 | 활성, curvature 공간미분 cost |
 | `w_real_end_offset` | 90.0 | 미사용 |
 | `w_real_end_heading` | 45.0 | 미사용 |
-| `w_obstacle` | 110.0 | 활성, 평균 soft-clearance 부족 cost |
-| `w_min_clearance` | 380.0 | 활성, 최대 clearance 부족 cost |
+| `w_obstacle` | 20.0 | 활성, 평균 soft-clearance 부족 cost |
+| `w_min_clearance` | 60.0 | 활성, 최대 clearance 부족 cost |
 | `w_collision` | 200000 | 활성, collision sample penalty |
-| `obstacle_soft_margin` | 0.10 m | 활성, soft-clearance 기본 추가량 |
-| `obstacle_time_headway` | 0.20 s | 활성, 속도 비례 soft-clearance |
+| `obstacle_soft_margin` | 0.05 m | 활성, soft-clearance 기본 추가량 |
+| `obstacle_time_headway` | 0.05 s | 활성, 속도 비례 soft-clearance |
 | `obstacle_soft_margin_max` | 1.25 m | 활성, soft-clearance 상한 |
 | `hard_clearance_margin_low_speed` | 0.10 m | 미사용 |
 | `hard_clearance_margin` | 0.10 m | 활성, 모든 속도에서 동일한 hard margin |
@@ -223,6 +224,9 @@ min(hard_clearance_margin
 
 `effective_hard_clearance_margin()`은 속도를 사용하지 않으므로 low-speed/full-speed
 두 필드는 현재 효과가 없다.
+
+장애물 비용은 완화하고 레퍼런스 비용은 강화한 값이다. 1.5 m/s에서 soft-clearance 목표는
+0.225 m(이전 0.50 m)이고, hard margin(0.10 m)과 collision 판정은 바꾸지 않았다.
 
 ### 3.6 TerminalConstraintConfig
 
@@ -288,7 +292,7 @@ max(minimum_activation_distance,
 | `minimum_reference_scale` | 0.35 | ratio | 미사용 |
 | `failed_target_weight` | 80.0 | cost | dormant allocation-failure branch |
 | `failed_target_sigma` | 0.75 | m | dormant allocation-failure branch |
-| `maneuver_target_tolerance` | 0.30 | m | 활성, latched maneuver 완료 판단 |
+| `maneuver_target_tolerance` | 0.13125 | m | 활성, latched maneuver 완료 판단 |
 | `maneuver_release_progress_margin` | 0.50 | m | 활성, maneuver release 판단 |
 
 Allocation-failure 기반 weight scheduler는 현재 production 경로에서

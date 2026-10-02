@@ -179,16 +179,20 @@ struct ConstraintConfig {
 };
 
 struct LateralPathConfig {
+  // ±3.5 m를 65개로 등분 (간격 7/64 = 0.109375 m, 0.0 포함). 개수는 이전 ±8 m 설정과 같다.
   std::vector<double> n_targets{
-      -8.0, -7.75, -7.5, -7.25, -7.0, -6.75, -6.5, -6.25,
-      -6.0, -5.75, -5.5, -5.25, -5.0, -4.75, -4.5, -4.25,
-      -4.0, -3.75, -3.5, -3.25, -3.0, -2.75, -2.5, -2.25,
-      -2.0, -1.75, -1.5, -1.25, -1.0, -0.75, -0.5, -0.25,
-      0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75,
-      2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75,
-      4.0, 4.25, 4.5, 4.75, 5.0, 5.25, 5.5, 5.75,
-      6.0, 6.25, 6.5, 6.75, 7.0, 7.25, 7.5, 7.75,
-      8.0};
+      -3.5, -3.390625, -3.28125, -3.171875, -3.0625, -2.953125, -2.84375, -2.734375,
+      -2.625, -2.515625, -2.40625, -2.296875, -2.1875, -2.078125, -1.96875, -1.859375,
+      -1.75, -1.640625, -1.53125, -1.421875, -1.3125, -1.203125, -1.09375, -0.984375,
+      -0.875, -0.765625, -0.65625, -0.546875, -0.4375, -0.328125, -0.21875, -0.109375,
+      0.0, 0.109375, 0.21875, 0.328125, 0.4375, 0.546875, 0.65625, 0.765625,
+      0.875, 0.984375, 1.09375, 1.203125, 1.3125, 1.421875, 1.53125, 1.640625,
+      1.75, 1.859375, 1.96875, 2.078125, 2.1875, 2.296875, 2.40625, 2.515625,
+      2.625, 2.734375, 2.84375, 2.953125, 3.0625, 3.171875, 3.28125, 3.390625,
+      3.5};
+  // 현재 오프셋과 목표 차이가 이 값보다 작으면 "가까운 목표": 길이 후보를 1개만 만들고
+  // 횡이동 기동으로 고정하지 않는다. 목표 간격의 2칸(이전 0.25 m 간격일 때 0.50 m).
+  double near_target_offset{0.21875};
   double min_length{3.0};
   double max_length{32.0};
   double spatial_ds{0.5};
@@ -243,18 +247,19 @@ struct CostConfig {
   double w_jerk{0.50};
   double w_heading_accel{0.05};
   double w_lateral_jerk{0.10};
-  double w_lateral_offset{0.08};
-  double w_terminal_offset{0.12};
-  double w_offset_overshoot{2.0};
+  // 레퍼런스 추종을 장애물 회피 여유보다 우선한다 (hard margin/collision 판정은 그대로).
+  double w_lateral_offset{1.5};
+  double w_terminal_offset{2.25};
+  double w_offset_overshoot{15.0};
   double w_curvature{8.0};
   double w_curvature_rate{1.2};
   double w_real_end_offset{90.0};
   double w_real_end_heading{45.0};
-  double w_obstacle{110.0};
-  double w_min_clearance{380.0};
+  double w_obstacle{20.0};
+  double w_min_clearance{60.0};
   double w_collision{2.0e5};
-  double obstacle_soft_margin{0.10};
-  double obstacle_time_headway{0.20};
+  double obstacle_soft_margin{0.05};
+  double obstacle_time_headway{0.05};
   double obstacle_soft_margin_max{1.25};
   double hard_clearance_margin_low_speed{0.10};
   double hard_clearance_margin{0.10};
@@ -317,7 +322,9 @@ struct AdaptiveReplanConfig {
   // Keep an active lateral maneuver tied to a fixed reference-path end
   // position so frequent replanning does not repeatedly restart the first
   // infinitesimal portion of a seventh-order profile.
-  double maneuver_target_tolerance{0.30};
+  // 고정된 기동 해제 허용치. near_target_offset보다 작아야 해제 후 남은 차이가 다시
+  // 새 기동으로 잡히지 않는다 (목표 범위 축소 비율 3.5/8을 그대로 적용: 0.30 -> 0.13125).
+  double maneuver_target_tolerance{0.13125};
   double maneuver_release_progress_margin{0.50};
 };
 
