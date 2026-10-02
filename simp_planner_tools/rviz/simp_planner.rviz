@@ -56,6 +56,15 @@ Visualization Manager:
         Durability Policy: Transient Local
         Reliability Policy: Reliable
       Value: true
+    - Class: rviz_2d_overlay_plugins/TextOverlay
+      Enabled: true
+      Name: Drive mode status
+      Topic:
+        Value: /viz/drive_mode_status_overlay
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Name: Vehicle footprint

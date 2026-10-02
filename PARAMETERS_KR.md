@@ -117,7 +117,7 @@ Body `vx`, `vy` 제약이 아니다.
 | `normal_shortlist_size` | 9 | count | 활성, 일반 첫 time-rollout batch |
 | `terminal_shortlist_size` | 3 | count | 활성, terminal 첫 time-rollout batch |
 | `normal_fallback_batch_size` | 4 | count | 활성, 첫 batch 실패 후 batch 크기 |
-| `target_continuity_weight` | 3.0 | cost | 조건부, 이전 lateral target 유지 비용 |
+| `target_continuity_weight` | 15.7 | cost | 조건부, 이전 lateral target 유지 비용 |
 | `reference_center_lock_enabled` | true | bool | 활성, 완전히 안전한 center path 고정 |
 | `reference_center_lock_obstacle_cost_tolerance` | 1e-12 | cost | 활성, center-lock obstacle cost 허용치 |
 | `short_path_fallback_enabled` | true | bool | 활성, 정지 가능한 짧은 path fallback |
@@ -235,6 +235,8 @@ min(hard_clearance_margin
 | `activation_margin` | 3.0 | m | 활성, stopping distance 추가량 |
 | `minimum_activation_distance` | 1.0 | m | 활성, terminal 제약 최소 활성 거리 |
 | `safe_region_planning_buffer` | 12.0 | m | 활성, terminal safe-region 조기 탐색 buffer |
+| `reference_tracking_distance` | 22.0 | m | 목표점까지 이 거리 이내의 저속 접근은 실행 가능한 최소 종단 횡오차 후보 우선. 0이면 비활성 |
+| `reference_tracking_speed_max` | 1.1 | m/s | 위 우선순위 적용 시 현재 속력과 목표 속도의 상한. 실제 차체 충돌검사/회피 fallback 유지 |
 | `safe_region_settle_distance` | 4.0 | m | 활성, endpoint 전 lateral settle 거리 |
 | `longitudinal_tolerance` | 0.20 | m | 활성, terminal 위치 허용치 |
 | `speed_tolerance` | 0.03 | m/s | 활성, auxiliary terminal stop 판정 |

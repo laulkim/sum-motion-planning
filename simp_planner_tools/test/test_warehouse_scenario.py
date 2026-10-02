@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from simp_planner_tools.models import MODE_BETA_CENTER, DriveMode
@@ -138,3 +139,41 @@ def test_floor_and_walls_render_as_rviz_markers(scenario) -> None:
              if marker.ns == "obstacle_walls"]
     assert len(walls) == sum(obstacle.kind == "wall" for obstacle in scenario.obstacles)
     assert all(marker.type == Marker.CUBE for marker in walls)
+
+
+def test_ramps_run_slower_than_the_aisle_and_docking_is_slowest(scenario) -> None:
+    ramp_speed, drive_speed, docking_speed = 2.3, 2.8, 0.9
+    entry, exit_route = scenario.phases[0], scenario.phases[-1]
+    for phase in (entry, exit_route):
+        speeds = [phase.cruise_speed_at(float(s)) for s in phase.path.s]
+        curved = [abs(k) > 1.0e-6 for k in phase.path.kappa]
+        assert all(v == ramp_speed for v, c in zip(speeds, curved) if c), phase.name
+        assert drive_speed in speeds, phase.name   # 통로 직선 구간
+    # 진출 감속 구간은 마지막 회피 장애물을 지난 뒤에 시작한다
+    last_obstacle_x = scenario.obstacles[-1].x
+    zone_start = exit_route.speed_zones[0][0]
+    zone_start_x = float(np.interp(zone_start, exit_route.path.s, exit_route.path.x))
+    assert zone_start_x > last_obstacle_x + 3.0
+    assert scenario.phases[3].cruise_speed == drive_speed
+    assert all(phase.cruise_speed == docking_speed and not phase.speed_zones
+               for phase in (scenario.phases[1], scenario.phases[2],
+                             scenario.phases[4], scenario.phases[5]))
+
+
+def test_scenario_manager_publishes_the_speed_of_the_current_zone(scenario) -> None:
+    from types import SimpleNamespace
+
+    from simp_planner_tools.scenario_manager_node import ScenarioManagerNode
+
+    entry = scenario.phases[0]
+    zone_end = entry.speed_zones[0][1]
+
+    def speed(s, override=None):
+        manager = SimpleNamespace(target_override=override, active_phase=entry,
+                                  last_projection=None if s is None else SimpleNamespace(s=s))
+        return ScenarioManagerNode.active_cruise_speed(manager)
+
+    assert speed(None) == 2.3                    # 출발 직후 (투영 전) = 램프
+    assert speed(0.5 * zone_end) == 2.3
+    assert speed(zone_end + 5.0) == 2.8
+    assert speed(zone_end + 5.0, override=1.2) == 1.2   # target_speed 지정 시 우선

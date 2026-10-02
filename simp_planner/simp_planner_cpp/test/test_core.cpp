@@ -754,6 +754,68 @@ void test_terminal_safe_region_keeps_center_when_clear() {
           "clear terminal region reported a nonzero goal offset");
 }
 
+void test_low_speed_docking_reference_priority() {
+  constexpr int width = 500, height = 200;
+  constexpr double resolution = 0.1;
+  std::vector<std::int8_t> data(width * height, 0);
+  // Safe alongside the forward-oriented vehicle, but inside the external
+  // circle's preferred clearance: the old cost ranking pushes away.
+  for (int iy = 119; iy <= 123; ++iy) {
+    for (int ix = 0; ix < width; ++ix) data[iy * width + ix] = 100;
+  }
+  const simp_planner::Costmap2D map(data, width, height, resolution, -10.0, -10.0);
+  simp_planner::EnvConfig config;
+  simp_planner::PlannerState state;
+  state.x = 5.0;
+  state.speed = 0.5;
+  const simp_planner::PlanningCommand command{0.5, simp_planner::DriveMode::Forward};
+  auto old_config = config;
+  old_config.terminal.reference_tracking_distance = 0.0;
+  simp_planner::PathVelocityPlanner old_planner(old_config, straight_path(15.0), map);
+  const auto old_plan = old_planner.plan(state, {}, command);
+  require(std::abs(old_plan.diagnostics.selected_n_target) > 0.01,
+          "docking fixture did not reproduce the soft-cost reference deviation");
+
+  simp_planner::PathVelocityPlanner planner(config, straight_path(15.0), map);
+  const auto result = planner.plan(state, {}, command);
+  require(result.trajectory.safe(), "reference docking plan is infeasible");
+  require(result.diagnostics.lateral_selection_basis == "DOCKING_REFERENCE_MIN_OFFSET",
+          "low-speed docking did not activate reference priority");
+  require(std::abs(result.diagnostics.selected_n_target) < 1e-9,
+          "safe docking reference was displaced by obstacle cost");
+  require(simp_planner::allocate_with_oriented_collision_search(
+              result.motion, map, config.vehicle, config.cost).collision.collision_free,
+          "reference preference selected an unsafe allocated docking trajectory");
+  // Final allocation may reject the nominal reference in another orientation.
+  // Exclusion must still permit a non-center fallback (no hard center lock).
+  planner.set_one_shot_excluded_paths({}, {0.0});
+  const auto fallback = planner.plan(state, {}, command);
+  require(fallback.trajectory.safe() && std::abs(fallback.diagnostics.selected_n_target) > 1e-9,
+          "docking reference priority prevented excluded-center fallback");
+
+  simp_planner::PathVelocityPlanner cruise(config, straight_path(90.0), map);
+  require(cruise.plan(state, {}, command).diagnostics.lateral_selection_basis == "SPATIAL_ONLY",
+          "docking priority leaked outside the approach distance");
+  simp_planner::PathVelocityPlanner fast(config, straight_path(15.0), map);
+  require(fast.plan(state, {}, {2.0, simp_planner::DriveMode::Forward})
+              .diagnostics.lateral_selection_basis == "SPATIAL_ONLY",
+          "docking priority activated for a high requested speed");
+
+  // A lateral docking approach can safely stop closer to a wall in front of
+  // the motion direction than the external circle suggests.
+  const auto dock_map = blocking_wall_costmap(16.5);
+  for (auto mode : {simp_planner::DriveMode::Left, simp_planner::DriveMode::Right}) {
+    simp_planner::PathVelocityPlanner crab(config, straight_path(15.0), dock_map);
+    state.x = 13.0;
+    const auto plan = crab.plan(state, {}, {0.5, mode});
+    require(plan.trajectory.safe() && std::abs(plan.diagnostics.selected_n_target) < 1e-9,
+            "crab docking did not preserve the reference");
+    require(simp_planner::allocate_with_oriented_collision_search(
+                plan.motion, dock_map, config.vehicle, config.cost).collision.collision_free,
+            "crab docking reference failed the actual body collision check");
+  }
+}
+
 void test_terminal_braking_fallback_recovers_from_early_stop() {
   simp_planner::EnvConfig config;
   const std::vector<double> accelerations{-0.10, 0.0, 0.05, 0.10};
@@ -801,6 +863,31 @@ void test_terminal_virtual_extension_within_tolerance() {
   require(result.trajectory.predicted_stop_error
               <= config.terminal.longitudinal_tolerance + 1.0e-9,
           "terminal virtual extension exceeded longitudinal tolerance");
+}
+
+void test_blocked_path_end_starts_terminal_stop_within_horizon() {
+  // 도크처럼 경로 끝 3 m 앞이 벽이면, 정지거리보다 먼 곳에서도 시야(속도 x horizon) 안이면
+  // 종단 정지가 켜져 궤적이 경로 끝을 넘어 벽으로 연장되지 않아야 한다.
+  simp_planner::EnvConfig config;
+  simp_planner::PlannerState state;
+  state.x = 12.0;
+  state.speed = 1.0;
+  const simp_planner::PlanningCommand command{1.0, simp_planner::DriveMode::Forward};
+
+  simp_planner::PathVelocityPlanner open_end(config, straight_path(15.0), empty_costmap());
+  require(!open_end.plan(state, {}, command).diagnostics.terminal_constraint_active,
+          "open path end activated terminal stop beyond the stopping distance");
+
+  simp_planner::PathVelocityPlanner docking(
+      config, straight_path(15.0), blocking_wall_costmap(18.0));
+  const auto result = docking.plan(state, {}, command);
+  require(result.diagnostics.terminal_constraint_active,
+          "blocked path end did not start terminal stop within the planning horizon");
+  require(result.trajectory.safe(), "blocked path end approach was not feasible");
+  for (const auto& planned : result.trajectory.states) {
+    require(planned.x <= 15.0 + config.terminal.longitudinal_tolerance,
+            "trajectory ran past a blocked path end toward the wall");
+  }
 }
 
 void test_scheduler_and_safety_tail() {
@@ -851,8 +938,10 @@ int main() {
     test_short_path_stop_fallback();
     test_terminal_safe_region_prefers_minimum_safe_offset();
     test_terminal_safe_region_keeps_center_when_clear();
+    test_low_speed_docking_reference_priority();
     test_terminal_braking_fallback_recovers_from_early_stop();
     test_terminal_virtual_extension_within_tolerance();
+    test_blocked_path_end_starts_terminal_stop_within_horizon();
     test_scheduler_and_safety_tail();
     std::cout << "all standalone C++ core tests passed\n";
     return 0;

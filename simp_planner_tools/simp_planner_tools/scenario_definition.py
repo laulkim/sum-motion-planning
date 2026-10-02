@@ -35,6 +35,15 @@ class ScenarioPhase:
     path: ScenarioPath
     cruise_speed: float
     switch_s: float | None = None
+    # 경로 거리 구간별 목표 속도 ((s_start, s_end, speed), ...). 구간 밖은 cruise_speed.
+    # 단계를 나누면 경계마다 정지하므로, 한 단계 안에서 속도만 바꿀 때 쓴다 (예: 램프 감속).
+    speed_zones: tuple[tuple[float, float, float], ...] = ()
+
+    def cruise_speed_at(self, s: float) -> float:
+        for start, end, speed in self.speed_zones:
+            if start <= s <= end:
+                return float(speed)
+        return float(self.cruise_speed)
 
     @property
     def mode(self) -> int:
@@ -549,8 +558,9 @@ def build_warehouse_logistics_scenario() -> "ScenarioDefinition":
     track_half_width = -0.5 * float(half_turn.y[-1])  # 트랙 중심 -> 동/서 직선 주행선
     track_reach = float(np.max(half_turn.x))         # 직선 끝 -> 꼭대기(바닥) 주행선
     # 꼭대기 90도 회전은 좌우 대칭이라 전진량 = 횡이동량
-    quarter_turn_offset = float(_clothoid_turn_segment(
-        0.0, 0.0, 0.0, -0.5 * math.pi, ramp_radius, ramp_transition, 0).x[-1])
+    quarter_turn = _clothoid_turn_segment(
+        0.0, 0.0, 0.0, -0.5 * math.pi, ramp_radius, ramp_transition, 0)
+    quarter_turn_offset = float(quarter_turn.x[-1])
     ramp_half_width = track_half_width + outer_face + wall
 
     ramp_center_y = 0.5 * ramp_straight + track_reach + outer_face + wall + 0.5
@@ -619,18 +629,29 @@ def build_warehouse_logistics_scenario() -> "ScenarioDefinition":
          ("turn", -180.0, ramp_radius, ramp_transition),
          ("line", 0.5 * ramp_straight)), 0))
 
-    def phase(name: str, path: ScenarioPath, speed: float, last: bool = False) -> ScenarioPhase:
+    # 목표 속도 (m/s): 일반 주행 / 램프 / 도킹(진입·복귀)
+    drive_speed, ramp_speed, docking_speed = 2.8, 2.3, 0.9
+    ramp_slowdown_lead = 5.0                         # 진출램프 회전 시작 전 미리 감속하는 거리
+    ramp_length = (0.5 * ramp_straight + half_turn.total_length + ramp_straight
+                   + quarter_turn.total_length)      # 램프 동쪽 직선 중간 ~ 꼭대기 90도 회전 끝
+    exit_turn_s = exit_center[0] - merge_dx - second_dock_x
+    entry_ramp_zone = ((0.0, ramp_length, ramp_speed),)
+    exit_ramp_zone = ((exit_turn_s - ramp_slowdown_lead, exit_route.total_length, ramp_speed),)
+
+    def phase(name: str, path: ScenarioPath, speed: float, last: bool = False,
+              zones: tuple[tuple[float, float, float], ...] = ()) -> ScenarioPhase:
         return ScenarioPhase(name=name, path=path, cruise_speed=speed,
-                             switch_s=None if last else path.total_length)
+                             switch_s=None if last else path.total_length, speed_zones=zones)
 
     phases = (
-        phase("entry_ramp_to_dock_d4", entry_route, 1.5),
-        phase("dock_d4_in", dock_in(first_dock_x), 1.0),
-        phase("dock_d4_out_reverse", dock_out(first_dock_x), 1.0),
-        phase("aisle_to_dock_d7", aisle_to_second_dock, 1.5),
-        phase("crab_dock_d7_in_right", crab_in, 1.0),
-        phase("crab_dock_d7_out_left", crab_out, 1.0),
-        phase("aisle_obstacles_to_exit_ramp", exit_route, 1.5, last=True),
+        phase("entry_ramp_to_dock_d4", entry_route, drive_speed, zones=entry_ramp_zone),
+        phase("dock_d4_in", dock_in(first_dock_x), docking_speed),
+        phase("dock_d4_out_reverse", dock_out(first_dock_x), docking_speed),
+        phase("aisle_to_dock_d7", aisle_to_second_dock, drive_speed),
+        phase("crab_dock_d7_in_right", crab_in, docking_speed),
+        phase("crab_dock_d7_out_left", crab_out, docking_speed),
+        phase("aisle_obstacles_to_exit_ramp", exit_route, drive_speed, last=True,
+              zones=exit_ramp_zone),
     )
 
     def junction(loop: ScenarioPath, s_start: float, s_end: float) -> tuple[float, float]:
@@ -719,9 +740,10 @@ def build_warehouse_logistics_scenario() -> "ScenarioDefinition":
         return ScenarioObstacle(x=x, y=aisle_y + side * (circle_reach - intrusion + half_y),
                                 length=length, width=width, yaw=yaw)
 
-    # 마지막 phase 회피 대상: 북 - 남 - 북 순서라 차량이 남/북/남으로 번갈아 비켜 간다
+    # 마지막 phase 회피 대상: 북 - 남 - 북 순서라 차량이 남/북/남으로 번갈아 비켜 간다.
+    # 첫 번째는 진로를 조금만(0.3 m) 막아 여유 있게 비켜 가도록 한다.
     avoidance = [
-        blocking(second_dock_x + 14.0, +1.0, 3.0, 2.4, 12.0, intrusion=0.8),
+        blocking(second_dock_x + 14.0, +1.0, 3.0, 2.4, 12.0, intrusion=0.3),
         blocking(second_dock_x + 28.0, -1.0, 4.2, 2.4, -18.0, intrusion=0.3),
         blocking(second_dock_x + 42.0, +1.0, 3.0, 3.0, 25.0, intrusion=0.8),
     ]

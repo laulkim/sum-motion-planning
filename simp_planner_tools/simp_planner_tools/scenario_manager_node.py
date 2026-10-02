@@ -221,7 +221,8 @@ class ScenarioManagerNode(Node):
     def active_cruise_speed(self) -> float:
         if self.target_override is not None:
             return float(self.target_override)
-        return float(self.active_phase.cruise_speed)
+        s = 0.0 if self.last_projection is None else float(self.last_projection.s)
+        return self.active_phase.cruise_speed_at(s)
 
     def current_target_speed(self) -> float:
         if self.state == ScenarioState.COMPLETE:

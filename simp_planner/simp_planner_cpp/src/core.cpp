@@ -2328,8 +2328,26 @@ PlanResult PathVelocityPlanner::plan_at_speed(
   const double activation_acceleration = std::max(state.acceleration, 0.0);
   const double required_stop_distance = terminal_controller.required_stopping_distance(
       activation_speed, activation_acceleration, false);
-  const double activation = std::max(config_.terminal.minimum_activation_distance,
-                                     required_stop_distance);
+  double activation = std::max(config_.terminal.minimum_activation_distance,
+                               required_stop_distance);
+  // 경로 끝 너머가 막혀 있으면(도크 면에 붙여 세우는 도킹 등) 종단 정지 전의 순항 궤적이
+  // 시야 안에서 가상 연장선으로 넘어가 벽을 뚫는 것으로 계산되고, 그 결과 정중앙 경로가
+  // 차체 충돌검사에서 떨어져 옆으로 비키는 경로가 선택된다. 그런 끝은 시야가 끝을 넘기
+  // 시작하는 거리부터 종단 정지로 다뤄 궤적이 경로 끝을 넘지 않게 한다.
+  if (costmap_) {
+    const double horizon_reach = activation_speed * std::max(config_.longitudinal.horizon, 0.0);
+    double end_x = 0.0, end_y = 0.0, end_psi = 0.0, end_kappa = 0.0, end_kappa_s = 0.0;
+    path_.evaluate(real_end_s, end_x, end_y, end_psi, end_kappa, end_kappa_s);
+    const double radius = 0.5 * config_.vehicle.width + config_.vehicle.footprint_margin;
+    const double hard_margin = effective_hard_clearance_margin(activation_speed, config_.cost);
+    const double check_length = horizon_reach + 0.5 * config_.vehicle.length;
+    bool end_blocked = false;
+    for (double d = 0.0; d <= check_length + 1.0e-9 && !end_blocked; d += 0.20) {
+      end_blocked = costmap_->clearance_single_circle(
+          end_x + d * std::cos(end_psi), end_y + d * std::sin(end_psi), radius) <= hard_margin;
+    }
+    if (end_blocked) activation = std::max(activation, horizon_reach);
+  }
   const bool terminal_constraint_active = remaining_to_goal <= activation + 1.0e-9;
   // Select a collision-free terminal lateral region before longitudinal braking
   // becomes mandatory.  This prevents high-speed approaches from discovering
@@ -2631,6 +2649,15 @@ PlanResult PathVelocityPlanner::plan_at_speed(
       entry.screen.screening_cost += entry.screen.continuity_cost;
     }
   }
+  // Docking should not move away from a feasible reference solely to improve
+  // the circumscribed-circle soft cost. Keep all candidates for dynamic and
+  // post-allocation collision fallbacks; this is a preference, not a lock.
+  const bool docking_reference_priority = !terminal_safe_region_active
+      && !short_path_fallback_active
+      && config_.terminal.reference_tracking_distance > 0.0
+      && remaining_to_goal <= config_.terminal.reference_tracking_distance
+      && std::max(std::abs(state.speed), target_speed)
+          <= config_.terminal.reference_tracking_speed_max;
   const auto terminal_candidate_key = [&](double n_target,
                                           double terminal_goal_offset,
                                           double cost,
@@ -2661,7 +2688,7 @@ PlanResult PathVelocityPlanner::plan_at_speed(
     ScopedBlockTimer ranking_timer(g_planning_block_timings.ranking_ms);
     std::sort(entries.begin(), entries.end(),
         [&](const Entry& a, const Entry& b) {
-      if (terminal_safe_region_active) {
+      if (terminal_safe_region_active || docking_reference_priority) {
         return terminal_candidate_key(
                    a.path.n_target, a.screen.terminal_goal_offset,
                    a.screen.screening_cost, a.path.candidate_id)
@@ -2720,7 +2747,7 @@ PlanResult PathVelocityPlanner::plan_at_speed(
         continue;
       }
       const auto& current = full[static_cast<std::size_t>(selected)];
-      if (terminal_safe_region_active) {
+      if (terminal_safe_region_active || docking_reference_priority) {
         const auto key = terminal_candidate_key(
             full[i].path.n_target, full[i].screen.terminal_goal_offset,
             full[i].total_cost, full[i].path.candidate_id);
@@ -2798,7 +2825,7 @@ PlanResult PathVelocityPlanner::plan_at_speed(
         ScopedBlockTimer ranking_timer(g_planning_block_timings.ranking_ms);
         best = std::min_element(full.begin(), full.end(),
             [&](const FullCandidate& a, const FullCandidate& b) {
-          if (terminal_safe_region_active) {
+          if (terminal_safe_region_active || docking_reference_priority) {
             return terminal_candidate_key(
                        a.path.n_target, a.screen.terminal_goal_offset,
                        a.total_cost, a.path.candidate_id)
@@ -2892,7 +2919,8 @@ PlanResult PathVelocityPlanner::plan_at_speed(
   result.diagnostics.terminal_constraint_active = terminal_constraint_active;
   result.diagnostics.terminal_safe_region_active = terminal_safe_region_active;
   result.diagnostics.lateral_selection_basis = terminal_safe_region_active
-      ? "TERMINAL_SAFE_REGION_MIN_OFFSET" : "SPATIAL_ONLY";
+      ? "TERMINAL_SAFE_REGION_MIN_OFFSET"
+      : (docking_reference_priority ? "DOCKING_REFERENCE_MIN_OFFSET" : "SPATIAL_ONLY");
   result.diagnostics.reference_center_lock_active = reference_center_lock_active;
   result.diagnostics.adaptive_replan_active = adaptive_replan_active;
   result.diagnostics.allocation_failure_severity = allocation_failure_severity_;

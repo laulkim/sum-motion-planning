@@ -201,7 +201,8 @@ struct LateralPathConfig {
   int normal_shortlist_size{9};
   int terminal_shortlist_size{3};
   int normal_fallback_batch_size{4};
-  double target_continuity_weight{3.0};
+  // 목표 1칸 이동당 억제력을 이전 0.25 m 간격일 때(3.0 x 0.25^2)와 같게: 3.0 x (0.25/0.109375)^2
+  double target_continuity_weight{15.7};
   bool reference_center_lock_enabled{true};
   double reference_center_lock_obstacle_cost_tolerance{1.0e-12};
   bool short_path_fallback_enabled{true};
@@ -271,6 +272,10 @@ struct TerminalConstraintConfig {
   double minimum_activation_distance{1.0};
   double safe_region_planning_buffer{12.0};
   double safe_region_settle_distance{4.0};
+  // Prefer minimum terminal reference offset on deliberate low-speed approaches.
+  // Set distance to zero to disable; final allocated collision checks still apply.
+  double reference_tracking_distance{22.0};
+  double reference_tracking_speed_max{1.1};
   double longitudinal_tolerance{0.20};
   double speed_tolerance{0.03};
   double acceleration_tolerance{0.10};
