@@ -83,6 +83,10 @@ class ScenarioDefinition:
     costmap_resolution: float = 0.20
     footprint_circle_count: int = 3
     markings: tuple[FloorMarking, ...] = tuple()
+    start_delay: float = 0.0     # 첫 odom 수신 후 정지 상태로 기다렸다가 출발하는 시간 (s)
+    # 플래너 allocation 1순위 profile (충돌 시 MINIMUM_VY로 재시도). VX_PRIORITY는
+    # LATERAL_PRIORITY보다 slip(beta)을 작게 잡아 vx가 더 나온다.
+    allocation_profile: str = "LATERAL_PRIORITY"
 
     @property
     def default_speed(self) -> float:
@@ -523,11 +527,12 @@ def build_warehouse_logistics_scenario() -> "ScenarioDefinition":
     기둥 11 m 간격 10칸, 깊이 12 m) / 창고(10 m) / 진출램프가 서->동으로 놓이고, 북쪽 일방통로
     (폭 17 m)가 두 램프를 잇는다. 램프 바깥벽이 곧 건물 벽이다. 글자/화살표 표시는 두지 않는다.
 
-    램프: 세로로 긴 타원 트랙(직선 - 완화곡선 - 원호 - 완화곡선), 2차선, 시계 방향. 차량은 바깥
-    차선(바깥벽 쪽 가깝게, 안쪽 코어벽 쪽 멀게)을 달린다. 램프 꼭대기의 90도 회전이 끝나는
-    높이가 곧 통로 주행선이라 통로 구간은 일자로 곧다. 램프 꼭대기는 북쪽 벽보다 낮으므로,
-    통로 반대쪽 위 사분면의 바깥벽만 북쪽 벽 높이까지 끌어올려(직선 연장 + 같은 곡선) 북쪽
-    벽과 이어 붙였다. 통로 쪽 옆면은 통로 남쪽 벽(사무실/창고 윗벽)에 닿을 때까지 이어진다.
+    램프: 세로로 긴 타원 트랙(직선 - 완화곡선 - 원호 - 완화곡선) 모양의 단일 차선(폭 6 m), 시계
+    방향. 차량은 차선 가운데를 달리고, 양쪽 벽은 주행선에서 차선 폭 절반만큼 떨어져 램프를
+    돌아 통로 입구까지 곧게 이어진다. 램프 꼭대기의 90도 회전이 끝나는 높이가 곧 통로
+    주행선이라 통로 구간은 일자로 곧다. 입구 위쪽 벽은 북쪽 벽에, 입구 아래쪽 벽은 사무실/
+    창고 벽에 붙어 램프-통로가 하나의 닫힌 벽으로 둘러싸인다. 램프 차선의 반대쪽 끝(직선
+    가운데에서 위)은 아래층과 이어지는 자리라 직선 위끝에서 막고, 그 위 빈 공간은 막힌 구역이다.
 
       1 FORWARD  진입램프 동쪽 직선에서 출발, 270도 돌아 통로로 곧게 -> 도크 D4 앞
       2 FORWARD  제자리턴(동->남) -> 하역장을 가로질러 D4 도크 면까지 19 m 정면 도킹
@@ -535,21 +540,20 @@ def build_warehouse_logistics_scenario() -> "ScenarioDefinition":
       4 FORWARD  제자리턴(남->동) -> D7 앞까지 33 m
       5 RIGHT    크랩(차체는 동쪽 그대로)으로 D7 도크 면까지 측면 도킹
       6 LEFT     크랩으로 통로 복귀
-      7 FORWARD  통로 장애물 3개(북-남-북) 회피 -> 진출램프 바깥 차선으로 270도
+      7 FORWARD  통로 장애물 3개(북-남-북) 회피 -> 진출램프로 270도
 
     경로 곡률은 전 구간 연속이다(직선과 회전 사이마다 완화곡선). 제자리턴은 phase 경계에서만
-    일어난다. 여유거리(차량 충돌원 3개, 반경 1.118 m 기준): 램프 바깥벽 0.88 m, 코어벽 약 4.9 m,
+    일어난다. 여유거리(차량 충돌원 3개, 반경 1.118 m 기준): 램프 바깥벽·코어벽 각 1.13 m,
     도킹 정지 시 도크 면 0.88 m. 회피 대상은 마지막 phase의 통로 장애물 3개뿐이다.
     """
     north, south, east = 0.5 * math.pi, -0.5 * math.pi, 0.0
     circle_reach = math.hypot(0.5, 1.0)              # 플래너 충돌원 반경 (3원, 3.0 x 2.0 m)
 
-    # 램프 트랙 치수는 "바깥 차선 중심 = 주행선" 기준이다.
-    lane_width = 4.0
+    # 램프 트랙 치수는 "단일 차선 중심 = 주행선" 기준이다.
+    lane_width = 6.0
     ramp_radius, ramp_transition, ramp_straight = 16.0, 8.0, 8.0
     outer_face = 0.5 * lane_width                    # 주행선 -> 바깥벽 안쪽면 (왼쪽)
-    divider = -0.5 * lane_width                      # 주행선 -> 차선 경계 점선
-    core_face = -1.5 * lane_width                    # 주행선 -> 코어벽 바깥면
+    core_face = -0.5 * lane_width                    # 주행선 -> 코어벽 바깥면 (오른쪽)
     wall = 0.3
     aisle_north_gap, aisle_south_gap = 7.0, 10.0     # 통로 주행선 -> 북쪽 벽 / 남쪽 경계
     bay_pitch, bay_count, loading_depth = 11.0, 10, 12.0   # 기둥 간격 / 도크 칸 수 / 하역장 깊이
@@ -570,9 +574,6 @@ def build_warehouse_logistics_scenario() -> "ScenarioDefinition":
     dock_face_y = aisle_bottom_y - loading_depth
     dock_stop_y = dock_face_y + 3.0                  # 정면 도킹: 앞 충돌원 ~ 도크 면 0.88 m
     crab_stop_y = dock_face_y + 2.0                  # 크랩 도킹: 옆 충돌원 ~ 도크 면 0.88 m
-    wall_lift = height - (ramp_center_y + 0.5 * ramp_straight + track_reach + outer_face)
-    if wall_lift <= 0.0:
-        raise ValueError("Ramp top must stay below the aisle north wall")
 
     entry_center = (ramp_half_width + 0.5, ramp_center_y)
     room_left_x = entry_center[0] + ramp_half_width + wall    # 사무실 서쪽 벽
@@ -654,66 +655,83 @@ def build_warehouse_logistics_scenario() -> "ScenarioDefinition":
               zones=exit_ramp_zone),
     )
 
-    def junction(loop: ScenarioPath, s_start: float, s_end: float) -> tuple[float, float]:
-        """[s_start, s_end]에서 바깥벽 안쪽면이 통로 남쪽 벽 높이를 지나는 (s, x)."""
-        face = _offset_points(loop, outer_face, s_start, s_end, step=0.05)
-        index = int(np.argmin([abs(y - aisle_bottom_y) for _, y in face]))
-        return s_start + (s_end - s_start) * index / (len(face) - 1), face[index][0]
+    def ramp_structure(route: ScenarioPath, s_from: float, s_to: float,
+                       center: tuple[float, float], dead_end_x: float) -> tuple[list, list, float]:
+        """단일 차선 램프 하나의 벽과 바닥 표시, 통로 입구 x를 돌려준다.
 
-    walls = []
-    markings = []
-    junctions = {}
-    for name, center in (("entry", entry_center), ("exit", exit_center)):
+        route[s_from, s_to]가 램프 안 주행선(통로 입구까지)이다. 차선의 반대쪽 끝은 직선
+        가운데(center[1], x = dead_end_x)이고, 차선은 그 위로 직선 위끝까지 이어진 뒤 막힌다.
+        입구는 dead_end 쪽(통로 쪽) 바깥면에 있다.
+        """
+        side = 1.0 if dead_end_x > center[0] else -1.0          # +1: 통로가 동쪽(진입램프)
+        outer_x = dead_end_x + side * outer_face                # 통로 쪽 차선 바깥면
+        inner_x = dead_end_x - side * outer_face                # 코어 쪽 차선 면
+        mouth_x = outer_x + side * wall                         # 입구 = 램프 바깥벽 바깥면
+        straight_top = center[1] + 0.5 * ramp_straight
+
+        def box(x_a, y_a, x_b, y_b):
+            return _box(min(x_a, x_b), min(y_a, y_b), max(x_a, x_b), max(y_a, y_b), "wall")
+
+        ramp_walls = (
+            wall_segments_along_path(route, s_from, s_to, lateral_offset=outer_face + 0.15,
+                                     thickness=wall)
+            + wall_segments_along_path(route, s_from, s_to, lateral_offset=core_face - 0.15,
+                                       thickness=wall)
+            + [
+                # 통로 쪽 바깥벽: 직선 가운데부터 입구 아래까지 곧게 (막힌 구역의 바깥 경계)
+                box(outer_x, center[1] - 0.6, mouth_x, aisle_y + core_face),
+                # 코어 쪽 벽: 직선 가운데부터 위끝까지
+                box(inner_x - side * wall, center[1] - 0.6, inner_x, straight_top),
+                # 차선 끝 막음벽
+                box(inner_x - side * wall, straight_top, mouth_x, straight_top + wall),
+                # 입구 위쪽: 입구 북쪽 벽 ~ 통로 북쪽 벽
+                box(outer_x, aisle_y + outer_face, mouth_x, height + wall),
+            ]
+        )
         loop = track_loop(center)
-        lifted = loop.translated(0.0, wall_lift)
-        total = loop.total_length
-        apex_s = float(loop.s[int(np.argmax(loop.y))])
-        west_top_s = 0.5 * ramp_straight + half_turn.total_length + ramp_straight
-        east_top_s = total - 0.5 * ramp_straight
-        if name == "entry":   # 통로는 동쪽: 동쪽 위 사분면이 열리고 서쪽 위 사분면을 들어 올린다
-            junction_s, junctions[name] = junction(loop, apex_s, total)
-            walled = ((0.0, west_top_s), (junction_s, total))
-            lifted_range = (west_top_s, apex_s)
-            lane_edges = ((0.0, apex_s), (junction_s, total))
-            corner_x = center[0] - track_half_width - outer_face - 0.5 * wall
-        else:                 # 통로는 서쪽: 서쪽 위 사분면이 열리고 동쪽 위 사분면을 들어 올린다
-            junction_s, junctions[name] = junction(loop, west_top_s, apex_s)
-            walled = ((0.0, junction_s), (east_top_s, total))
-            lifted_range = (apex_s, east_top_s)
-            lane_edges = ((0.0, junction_s), (apex_s, total))
-            corner_x = center[0] + track_half_width + outer_face + 0.5 * wall
-        for start, end in walled:
-            walls += wall_segments_along_path(loop, start, end, lateral_offset=outer_face + 0.15,
-                                              thickness=wall)
-        walls += wall_segments_along_path(lifted, *lifted_range,
-                                          lateral_offset=outer_face + 0.15, thickness=wall)
-        straight_top_y = center[1] + 0.5 * ramp_straight
-        walls.append(_box(corner_x - 0.5 * wall, straight_top_y - 0.6,
-                          corner_x + 0.5 * wall, straight_top_y + wall_lift + 0.6, "wall"))
-        walls += wall_segments_along_path(loop, 0.0, total,
-                                          lateral_offset=core_face - 0.15, thickness=wall)
-
-        markings += [
+        far_side_core = [point for point in _offset_points(route, core_face, s_from, s_to)
+                         if side * (point[0] - center[0]) <= 0.0]
+        ramp_markings = [
             FloorMarking("area", _convex_hull(
-                _offset_points(loop, outer_face + wall, 0.0, total)
-                + _offset_points(lifted, outer_face + wall, *lifted_range)), "floor"),
-            FloorMarking("line", _offset_points(loop, divider, 0.0, total, close=True),
-                         "ramp", 2.0 * lane_width),
-            FloorMarking("area", _offset_points(loop, core_face, 0.0, total), "core"),
-            FloorMarking("line", _offset_points(loop, core_face + 0.25, 0.0, total, close=True),
-                         "white"),
-            FloorMarking("dashed", _offset_points(loop, divider, 0.0, total, close=True), "white"),
+                _offset_points(route, outer_face + wall, s_from, s_to)
+                + _offset_points(route, core_face - wall, s_from, s_to)
+                + ((mouth_x, center[1]), (mouth_x, straight_top + wall),
+                   (inner_x - side * wall, straight_top + wall))), "floor"),
+            FloorMarking("line", _offset_points(route, 0.0, s_from, s_to), "ramp", lane_width),
+            FloorMarking("area", _rect_points(min(inner_x, outer_x), center[1],
+                                              max(inner_x, outer_x), straight_top), "ramp"),
+            FloorMarking("area", _convex_hull(
+                _offset_points(loop, core_face, 0.0, loop.total_length) + tuple(far_side_core)),
+                "core"),
+            # 차선 끝 위의 막힌 구역
+            FloorMarking("area", _rect_points(min(center[0], outer_x), straight_top + wall,
+                                              max(center[0], outer_x), aisle_y + core_face),
+                         "core"),
         ]
-        markings += [FloorMarking("line", _offset_points(loop, outer_face - 0.25, start, end),
-                                  "white") for start, end in lane_edges]
+        for offset in (outer_face - 0.25, core_face + 0.25):
+            ramp_markings.append(FloorMarking(
+                "line", _offset_points(route, offset, s_from, s_to), "white"))
+            x = dead_end_x + side * offset     # 직선 가운데에서 위로: 왼쪽 = 통로 쪽
+            ramp_markings.append(FloorMarking(
+                "line", ((x, center[1]), (x, straight_top)), "white"))
+        return ramp_walls, ramp_markings, mouth_x
+
+    entry_open_s = ramp_length + (entry_center[0] + ramp_half_width
+                                  - (entry_center[0] + merge_dx))
+    exit_open_s = exit_turn_s - ((exit_center[0] - merge_dx) - (exit_center[0] - ramp_half_width))
+    walls, markings, entry_mouth_x = ramp_structure(
+        entry_route, 0.0, entry_open_s, entry_center, entry_center[0] + track_half_width)
+    exit_walls, exit_markings, exit_mouth_x = ramp_structure(
+        exit_route, exit_open_s, exit_route.total_length, exit_center,
+        exit_center[0] - track_half_width)
+    walls += exit_walls
+    markings += exit_markings
 
     walls += [
-        _box(entry_center[0] - 0.5, height, exit_center[0] + 0.5, height + wall, "wall"),  # 북
-        # 통로 남쪽 벽: 램프 바깥벽 끝 ~ 사무실 윗벽 / 창고 윗벽 ~ 진출램프 바깥벽 끝
-        _box(junctions["entry"] - wall, aisle_bottom_y - wall, loading_x0, aisle_bottom_y,
-             "wall"),
-        _box(loading_x1, aisle_bottom_y - wall, junctions["exit"] + wall, aisle_bottom_y,
-             "wall"),
+        _box(entry_mouth_x - wall, height, exit_mouth_x + wall, height + wall, "wall"),  # 북
+        # 통로 남쪽 벽: 진입램프 입구 ~ 사무실 윗벽 / 창고 윗벽 ~ 진출램프 입구
+        _box(entry_mouth_x - wall, aisle_bottom_y - wall, loading_x0, aisle_bottom_y, "wall"),
+        _box(loading_x1, aisle_bottom_y - wall, exit_mouth_x + wall, aisle_bottom_y, "wall"),
         _box(room_left_x - wall, dock_face_y - 0.4, room_left_x, aisle_bottom_y, "wall"),
         _box(room_right_x, dock_face_y - 0.4, room_right_x + wall, aisle_bottom_y, "wall"),
         _box(room_left_x - wall, dock_face_y - 0.4, room_right_x + wall, dock_face_y,
@@ -743,14 +761,15 @@ def build_warehouse_logistics_scenario() -> "ScenarioDefinition":
     # 마지막 phase 회피 대상: 북 - 남 - 북 순서라 차량이 남/북/남으로 번갈아 비켜 간다.
     # 첫 번째는 진로를 조금만(0.3 m) 막아 여유 있게 비켜 가도록 한다.
     avoidance = [
+        # 진출램프 입구(폭 6 m) 앞에서 다시 차선 가운데로 들어올 거리를 남긴다
         blocking(second_dock_x + 14.0, +1.0, 3.0, 2.4, 12.0, intrusion=0.3),
-        blocking(second_dock_x + 28.0, -1.0, 4.2, 2.4, -18.0, intrusion=0.3),
-        blocking(second_dock_x + 42.0, +1.0, 3.0, 3.0, 25.0, intrusion=0.8),
+        blocking(second_dock_x + 25.0, -1.0, 4.2, 2.4, -18.0, intrusion=0.3),
+        blocking(second_dock_x + 36.0, +1.0, 3.0, 3.0, 25.0, intrusion=0.8),
     ]
 
     markings += [
-        FloorMarking("area", _rect_points(entry_center[0], aisle_bottom_y,
-                                          exit_center[0], height), "floor"),
+        FloorMarking("area", _rect_points(entry_mouth_x, aisle_bottom_y,
+                                          exit_mouth_x, height), "floor"),
         FloorMarking("area", _rect_points(room_left_x, dock_face_y, room_right_x, aisle_bottom_y),
                      "floor"),
         FloorMarking("area", _rect_points(loading_x0, dock_face_y, loading_x1, aisle_bottom_y),
@@ -772,6 +791,7 @@ def build_warehouse_logistics_scenario() -> "ScenarioDefinition":
         terminal_margin=3.0,
         costmap_resolution=0.1,
         markings=tuple(markings),
+        allocation_profile="VX_PRIORITY",
     )
 
 

@@ -94,13 +94,45 @@ def test_reference_curvature_is_continuous(scenario) -> None:
         assert max(abs(b - a) for a, b in zip(kappa, kappa[1:])) < 0.003, phase.name
 
 
-def test_ramp_outer_walls_continue_into_the_aisle_walls(scenario) -> None:
+def test_ramps_and_aisle_form_one_closed_enclosure(scenario) -> None:
+    # 출발점에서 빈칸을 퍼뜨려도 맵 가장자리에 닿지 않아야 하고(벽 틈 없음), 전체 경로가
+    # 같은 닫힌 공간 안에 있어야 한다.
+    from collections import deque
+
+    from simp_planner_tools.scenario_definition import rasterize_scenario_costmap
+
+    resolution = 0.2
+    grid, origin_x, origin_y = rasterize_scenario_costmap(
+        scenario, resolution=resolution, margin=10.0)
+    height, width = grid.shape
+
+    def cell(x: float, y: float) -> tuple[int, int]:
+        return int((y - origin_y) / resolution), int((x - origin_x) / resolution)
+
+    start = cell(scenario.phases[0].path.x[0], scenario.phases[0].path.y[0])
+    reached = np.zeros(grid.shape, dtype=bool)
+    reached[start] = True
+    queue = deque([start])
+    while queue:
+        row, col = queue.popleft()
+        assert 0 < row < height - 1 and 0 < col < width - 1, "enclosure leaks to the map border"
+        for d_row, d_col in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nxt = (row + d_row, col + d_col)
+            if not reached[nxt] and grid[nxt] == 0:
+                reached[nxt] = True
+                queue.append(nxt)
+    for phase in scenario.phases:
+        assert all(reached[cell(x, y)] for x, y in zip(phase.path.x, phase.path.y)), phase.name
+
+
+def test_single_lane_ramp_walls_are_half_a_lane_from_the_route(scenario) -> None:
+    lane_half_width = 3.0      # 단일 차선 6.0 m
     walls = [obstacle for obstacle in scenario.obstacles if obstacle.kind == "wall"]
-    north = max(walls, key=lambda wall: wall.length)
-    north_ends = ((north.x - 0.5 * north.length, north.y), (north.x + 0.5 * north.length, north.y))
-    curved = [wall for wall in walls if abs(math.remainder(wall.yaw, 0.5 * math.pi)) > 1.0e-6]
-    for x, y in north_ends:
-        assert min(math.hypot(wall.x - x, wall.y - y) for wall in curved) < 1.0
+    entry = scenario.phases[0].path
+    ramp_end = int(np.argmax(np.abs(entry.kappa) > 1.0e-6)) + 40   # 첫 회전 안쪽 샘플
+    x, y = entry.x[ramp_end], entry.y[ramp_end]
+    nearest = sorted(_rect_distance(x, y, wall) for wall in walls)[:2]
+    assert nearest == pytest.approx([lane_half_width, lane_half_width], abs=0.05)
 
 
 def test_floor_has_no_labels_or_arrows(scenario) -> None:
@@ -177,3 +209,33 @@ def test_scenario_manager_publishes_the_speed_of_the_current_zone(scenario) -> N
     assert speed(0.5 * zone_end) == 2.3
     assert speed(zone_end + 5.0) == 2.8
     assert speed(zone_end + 5.0, override=1.2) == 1.2   # target_speed 지정 시 우선
+
+
+def test_scenario_starts_immediately_and_start_delay_still_holds(scenario) -> None:
+    from types import SimpleNamespace
+
+    from simp_planner_tools.scenario_manager_node import ScenarioManagerNode, ScenarioState
+
+    assert scenario.start_delay == 0.0           # 창고 시나리오는 바로 출발
+    now = {"ns": 0}
+    manager = SimpleNamespace(                   # start_delay_sec:=10 으로 실행한 경우
+        start_delay=10.0, start_release_ns=None, start_released=False,
+        received_odom=False, state=ScenarioState.RUNNING, target_override=None,
+        active_phase=scenario.phases[0], last_projection=None,
+        get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=now["ns"])),
+        get_logger=lambda: SimpleNamespace(info=lambda *_: None))
+    for name in ("start_hold_remaining", "update_start_hold", "active_cruise_speed"):
+        setattr(manager, name, getattr(ScenarioManagerNode, name).__get__(manager))
+
+    def speed() -> float:
+        manager.update_start_hold()
+        return ScenarioManagerNode.current_target_speed(manager)
+
+    assert speed() == 0.0                       # 첫 odom 전
+    manager.received_odom = True
+    assert speed() == 0.0                       # 대기 시작
+    now["ns"] = int(9.9e9)
+    assert speed() == 0.0
+    now["ns"] = int(10.1e9)
+    assert speed() == scenario.phases[0].cruise_speed_at(0.0)
+    assert manager.start_released

@@ -567,9 +567,14 @@ enum class AllocationProfile : std::uint8_t {
   Balanced = 1,
   YawPriority = 2,
   MinimumVy = 3,
+  // LateralPriority보다 차체가 진행 방향을 더 따라 돌아 slip(beta)이 작고 vx가 크다.
+  // MinimumVy만큼 극단적이지는 않아 횡 기동 여유를 남긴다.
+  VxPriority = 4,
 };
 
 const char* allocation_profile_name(AllocationProfile profile);
+// "LATERAL_PRIORITY" 등 allocation_profile_name()과 같은 이름 -> profile. 모르는 이름은 nullopt.
+std::optional<AllocationProfile> allocation_profile_from_name(const std::string& name);
 
 struct OrientedFootprintConfig {
   int circle_count{3};
@@ -659,7 +664,8 @@ AllocationSelectionResult allocate_with_oriented_collision_search(
     const VehicleConfig& vehicle,
     const CostConfig& cost,
     std::optional<AllocatorInitialState> initial_state = std::nullopt,
-    const OrientedFootprintConfig& footprint = OrientedFootprintConfig{});
+    const OrientedFootprintConfig& footprint = OrientedFootprintConfig{},
+    AllocationProfile primary_profile = AllocationProfile::LateralPriority);
 
 class PathVelocityPlanner {
  public:

@@ -107,7 +107,7 @@ class VehicleVisualizerNode(Node):
         self.declare_parameter("min_recorded_distance", 0.10)
         self.declare_parameter("max_path_points", 20000)
         self.declare_parameter("status_text_offset_m", 8.0)
-        self.declare_parameter("status_text_scale", 3.5)
+        self.declare_parameter("status_text_scale", 2.8)
         self.declare_parameter(
             "vehicle_mesh_resource", "package://simp_planner_tools/meshes/cargo_body.dae"
         )
@@ -163,9 +163,9 @@ class VehicleVisualizerNode(Node):
         overlay.vertical_alignment = OverlayText.TOP
         overlay.horizontal_distance = 10
         overlay.vertical_distance = 10
-        overlay.width = 640
-        overlay.height = 190
-        overlay.text_size = 22.0
+        overlay.width = 470
+        overlay.height = 140
+        overlay.text_size = 16.0
         overlay.line_width = 2
         overlay.font = "DejaVu Sans Mono"
         overlay.bg_color = ColorRGBA(r=0.0, g=0.0, b=0.0, a=0.0)  # 배경 없음 (투명)

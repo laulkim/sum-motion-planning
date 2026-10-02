@@ -919,6 +919,35 @@ void test_scheduler_and_safety_tail() {
 
 }  // namespace
 
+void test_vx_priority_profile_sits_between_lateral_and_minimum_vy() {
+  using simp_planner::AllocationProfile;
+  for (const auto profile : {AllocationProfile::LateralPriority, AllocationProfile::Balanced,
+                             AllocationProfile::YawPriority, AllocationProfile::MinimumVy,
+                             AllocationProfile::VxPriority}) {
+    const auto parsed = simp_planner::allocation_profile_from_name(
+        simp_planner::allocation_profile_name(profile));
+    require(parsed && *parsed == profile, "allocation profile name round trip failed");
+  }
+  require(!simp_planner::allocation_profile_from_name("NOT_A_PROFILE"),
+          "unknown allocation profile name was accepted");
+  const auto lateral = simp_planner::allocation_limits_for_profile(AllocationProfile::LateralPriority);
+  const auto vx = simp_planner::allocation_limits_for_profile(AllocationProfile::VxPriority);
+  const auto minimum_vy = simp_planner::allocation_limits_for_profile(AllocationProfile::MinimumVy);
+  for (int mode = 0; mode < 2; ++mode) {   // Forward, Reverse
+    require(lateral.beta_max_deviation[mode] > vx.beta_max_deviation[mode] &&
+                vx.beta_max_deviation[mode] > minimum_vy.beta_max_deviation[mode],
+            "vx-priority slip envelope must sit between lateral-priority and minimum-vy");
+    require(lateral.body_yaw_fraction[mode] < vx.body_yaw_fraction[mode] &&
+                vx.body_yaw_fraction[mode] < minimum_vy.body_yaw_fraction[mode],
+            "vx-priority body yaw share must sit between lateral-priority and minimum-vy");
+  }
+  for (int mode = 2; mode < 4; ++mode) {   // Left, Right: crab limits are shared
+    require(vx.beta_max_deviation[mode] == lateral.beta_max_deviation[mode] &&
+                vx.body_yaw_fraction[mode] == lateral.body_yaw_fraction[mode],
+            "vx-priority must not change crab allocation limits");
+  }
+}
+
 int main() {
   try {
     test_math_and_projection();
@@ -942,6 +971,7 @@ int main() {
     test_terminal_braking_fallback_recovers_from_early_stop();
     test_terminal_virtual_extension_within_tolerance();
     test_blocked_path_end_starts_terminal_stop_within_horizon();
+    test_vx_priority_profile_sits_between_lateral_and_minimum_vy();
     test_scheduler_and_safety_tail();
     std::cout << "all standalone C++ core tests passed\n";
     return 0;

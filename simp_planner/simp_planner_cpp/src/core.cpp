@@ -3198,8 +3198,18 @@ const char* allocation_profile_name(AllocationProfile profile) {
     case AllocationProfile::Balanced: return "BALANCED";
     case AllocationProfile::YawPriority: return "YAW_PRIORITY";
     case AllocationProfile::MinimumVy: return "MINIMUM_VY";
+    case AllocationProfile::VxPriority: return "VX_PRIORITY";
   }
   return "UNKNOWN";
+}
+
+std::optional<AllocationProfile> allocation_profile_from_name(const std::string& name) {
+  for (const auto profile : {AllocationProfile::LateralPriority, AllocationProfile::Balanced,
+                             AllocationProfile::YawPriority, AllocationProfile::MinimumVy,
+                             AllocationProfile::VxPriority}) {
+    if (name == allocation_profile_name(profile)) return profile;
+  }
+  return std::nullopt;
 }
 
 AllocationLimits allocation_limits_for_profile(AllocationProfile profile) {
@@ -3230,6 +3240,14 @@ AllocationLimits allocation_limits_for_profile(AllocationProfile profile) {
       limits.beta_return_gain[1] = 1.20;
       limits.beta_max_deviation[0] = 12.0 * kPi / 180.0;
       limits.beta_max_deviation[1] = 12.0 * kPi / 180.0;
+      break;
+    case AllocationProfile::VxPriority:
+      limits.body_yaw_fraction[0] = 0.65;
+      limits.body_yaw_fraction[1] = 0.70;
+      limits.beta_return_gain[0] = 0.80;
+      limits.beta_return_gain[1] = 0.85;
+      limits.beta_max_deviation[0] = 25.0 * kPi / 180.0;
+      limits.beta_max_deviation[1] = 22.0 * kPi / 180.0;
       break;
   }
   return limits;
@@ -3306,23 +3324,28 @@ AllocationSelectionResult allocate_with_oriented_collision_search(
     const VehicleConfig& vehicle,
     const CostConfig& cost,
     std::optional<AllocatorInitialState> initial_state,
-    const OrientedFootprintConfig& footprint) {
+    const OrientedFootprintConfig& footprint,
+    AllocationProfile primary_profile) {
   ++g_planning_call_counts.allocation;
   ScopedBlockTimer allocation_block_timer(g_planning_block_timings.allocation_ms);
   const bool crab_mode = std::any_of(
       trajectory.drive_mode.begin(), trajectory.drive_mode.end(),
       [](DriveMode mode) { return mode == DriveMode::Left || mode == DriveMode::Right; });
-  // Evaluate the nominal lateral-priority allocation first.  Only when its
-  // complete four-second trajectory collides, retry the same motion trajectory
-  // once with the minimum-vy profile.  Spatial replanning is intentionally
-  // left to the caller after both profiles fail.
-  const std::array<AllocationProfile, 2> profiles{{
-      AllocationProfile::LateralPriority,
-      AllocationProfile::MinimumVy}};
+  // Evaluate the primary profile (default lateral-priority) first.  Only when
+  // its complete four-second trajectory collides, retry the same motion
+  // trajectory once with the minimum-vy profile.  Spatial replanning is
+  // intentionally left to the caller after both profiles fail.  Crab (left/
+  // right) limits are identical in every profile, so crab evaluates only the
+  // primary profile.
+  std::vector<AllocationProfile> profiles{primary_profile};
+  if (primary_profile != AllocationProfile::MinimumVy) {
+    profiles.push_back(AllocationProfile::MinimumVy);
+  }
   std::optional<AllocationSelectionResult> best_failed;
   int evaluated = 0;
-  for (const auto profile : profiles) {
-    if (crab_mode && profile != AllocationProfile::LateralPriority) break;
+  for (std::size_t index = 0; index < profiles.size(); ++index) {
+    const auto profile = profiles[index];
+    if (crab_mode && index > 0) break;
     auto allocation = allocate_trajectory(
         trajectory, allocation_limits_for_profile(profile), initial_state);
     if (std::any_of(allocation.fallback_used.begin(), allocation.fallback_used.end(),

@@ -26,6 +26,7 @@ from .debug_scenario_geometry import scenario_obstacle_polygons
 from .debug_signal_history import SourceTimeAligner
 from .diagnostic_metrics import OpenPathGeometry, tracking_error_to_executed_segment
 from .path_geometry import PathProjection, project_open_path, wrap_angle
+from .profile_plots import render_profile_plots
 
 
 MODE_NAMES = {0: "FORWARD", 1: "REVERSE", 2: "LEFT", 3: "RIGHT", 4: "SPOT_TURN"}
@@ -351,6 +352,7 @@ class DebugPlotNode(Node):
         )
         self.render_future: Optional[Future[str]] = None
         self.render_skip_count = 0
+        self.profile_plots_saved = False
         self.save_timer = self.create_timer(self.save_period, self.save_output)
         self.get_logger().info(f"Debug output: {self.session_dir}")
 
@@ -680,6 +682,24 @@ class DebugPlotNode(Node):
             self.scenario_status = value if isinstance(value, dict) else {}
         except json.JSONDecodeError:
             self.scenario_status = {"state": "INVALID_JSON"}
+        if self.scenario_status.get("state") == "COMPLETE":
+            self.save_profile_plots()
+
+    def save_profile_plots(self) -> None:
+        """시나리오 종료 시(또는 그 전에 노드가 꺼질 때) 속도/각속도 프로필을 한 번 저장한다."""
+        if self.profile_plots_saved:
+            return
+        self.profile_plots_saved = True
+        for file in (self.csv_file, self.command_csv_file):
+            if not file.closed:
+                file.flush()
+        try:
+            saved = render_profile_plots(self.session_dir)
+        except Exception as exc:  # pragma: no cover - ROS runtime path
+            self.get_logger().error(f"Profile plot rendering failed: {exc}")
+            return
+        for path in saved:
+            self.get_logger().info(f"Saved {path}")
 
     def planner_section(self, name: str) -> dict[str, object]:
         value = self.planner_status.get(name, {})
@@ -1172,6 +1192,7 @@ class DebugPlotNode(Node):
         )
 
     def destroy_node(self) -> bool:
+        self.save_profile_plots()
         self.check_render_future()
         if self.render_future is not None:
             try:

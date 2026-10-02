@@ -26,3 +26,9 @@ ros2 launch simp_planner_tools simulation.launch.py \
 ros2 launch simp_planner_tools simulation.launch.py \
   scenario:=warehouse_logistics use_rviz:=true \
   target_speed:=3.5
+
+  ros2 launch simp_planner_tools simulation.launch.py scenario:=warehouse_logistics use_rviz:=true
+
+ros2 launch simp_planner_tools simulation.launch.py scenario:=warehouse_logistics use_rviz:=true start_delay_sec:=110
+
+

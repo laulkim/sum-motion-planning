@@ -211,6 +211,13 @@ class PlannerNodeCpp final : public rclcpp::Node {
     footprint_circle_count_ = declare_parameter<int>("oriented_footprint_circle_count", 3);
     footprint_translation_step_m_ = declare_parameter<double>("oriented_footprint_translation_step_m", 0.20);
     footprint_yaw_step_deg_ = declare_parameter<double>("oriented_footprint_yaw_step_deg", 2.0);
+    const auto primary_profile_name =
+        declare_parameter<std::string>("allocation_primary_profile", "LATERAL_PRIORITY");
+    const auto primary_profile = allocation_profile_from_name(primary_profile_name);
+    if (!primary_profile) {
+      throw std::invalid_argument("unknown allocation_primary_profile: " + primary_profile_name);
+    }
+    allocation_primary_profile_ = *primary_profile;
     if (footprint_circle_count_ < 1 || footprint_translation_step_m_ <= 0.0 ||
         footprint_yaw_step_deg_ <= 0.0) {
       throw std::invalid_argument("invalid oriented footprint parameters");
@@ -1075,7 +1082,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       if (!infeasible) {
         auto allocation_selection = allocate_with_oriented_collision_search(
             attempt_result.motion, *input->costmap, config_.vehicle, config_.cost,
-            handover.allocator_state, footprint_config);
+            handover.allocator_state, footprint_config, allocation_primary_profile_);
         std::vector<int> excluded_candidate_ids;
         std::vector<double> excluded_lateral_targets;
         const int maximum_path_replans = std::max(
@@ -1100,7 +1107,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
           auto replanned_allocation = allocate_with_oriented_collision_search(
               replanned_result.motion, *input->costmap,
               config_.vehicle, config_.cost,
-              handover.allocator_state, footprint_config);
+              handover.allocator_state, footprint_config, allocation_primary_profile_);
           attempt_result = std::move(replanned_result);
           allocation_selection = std::move(replanned_allocation);
         }
@@ -1793,7 +1800,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
     std::ostringstream stream;
     stream << std::fixed << std::setprecision(3)
            << "{\"backend\":\"CPP_NATIVE\""
-           << ",\"allocation_profile\":\"LATERAL_PRIORITY\""
+           << ",\"allocation_profile\":\""
+           << allocation_profile_name(allocation_primary_profile_) << "\""
            << ",\"state\":\"" << status << "\""
            << ",\"block_reason\":\"" << status << "\""
            << ",\"mode_control\":{"
@@ -1901,6 +1909,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
   int footprint_circle_count_{3};
   double footprint_translation_step_m_{0.20};
   double footprint_yaw_step_deg_{2.0};
+  AllocationProfile allocation_primary_profile_{AllocationProfile::LateralPriority};
   std::int64_t last_mode_command_ns_{0};
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;

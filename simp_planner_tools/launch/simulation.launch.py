@@ -57,6 +57,10 @@ def _resolved_nodes(context):
         if requested_footprint_circle_count <= 0
         else requested_footprint_circle_count
     )
+    allocation_profile = (
+        LaunchConfiguration("allocation_profile").perform(context).strip().upper()
+        or scenario.allocation_profile
+    )
     costmap_resolution = (
         float(scenario.costmap_resolution)
         if requested_costmap_resolution <= 0.0
@@ -97,6 +101,9 @@ def _resolved_nodes(context):
                 {
                     "scenario": scenario_name,
                     "target_speed": target_speed,
+                    "start_delay_sec": float(
+                        LaunchConfiguration("start_delay_sec").perform(context)
+                    ),
                     "path_update_distance": path_update_distance,
                     "costmap_resolution": costmap_resolution,
                     "costmap_size_m": costmap_size_m,
@@ -116,6 +123,7 @@ def _resolved_nodes(context):
                     "oriented_footprint_circle_count": footprint_circle_count,
                     "oriented_footprint_translation_step_m": footprint_translation_step,
                     "oriented_footprint_yaw_step_deg": footprint_yaw_step,
+                    "allocation_primary_profile": allocation_profile,
                 }
             ],
         ),
@@ -199,6 +207,18 @@ def generate_launch_description() -> LaunchDescription:
                 "target_speed",
                 default_value="-1.0",
                 description="Negative value uses the scenario default speed.",
+            ),
+            DeclareLaunchArgument(
+                "start_delay_sec",
+                default_value="-1.0",
+                description="Seconds to hold still after the first odometry before starting "
+                            "(negative uses the scenario default, 0 s for every scenario).",
+            ),
+            DeclareLaunchArgument(
+                "allocation_profile",
+                default_value="",
+                description="Primary allocation profile: LATERAL_PRIORITY, VX_PRIORITY, BALANCED, "
+                            "YAW_PRIORITY or MINIMUM_VY (empty uses the scenario default).",
             ),
             DeclareLaunchArgument("path_update_distance", default_value="1.0"),
             DeclareLaunchArgument(
