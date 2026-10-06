@@ -31,6 +31,7 @@ struct Tracking {
   std::int64_t reference_ns{0};
   Pose predicted{0.0, 0.0, 0.0};
   Error error{0.0, 0.0, 0.0};
+  Point reference;
 };
 struct Control {
   geometry_msgs::msg::Twist velocity;
@@ -137,7 +138,7 @@ inline Control control_cycle(const Inputs& snapshot, std::int64_t now_ns,
   if (std::isfinite(command.linear.x) && std::isfinite(command.linear.y) &&
       std::isfinite(command.angular.z)) {
     output.velocity = command;
-    output.tracking = {true, odom_ns + static_cast<std::int64_t>(prediction_ns), *pose, error};
+    output.tracking = {true, odom_ns + static_cast<std::int64_t>(prediction_ns), *pose, error, reference};
   }
   return output;
 }

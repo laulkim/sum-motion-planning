@@ -1,6 +1,7 @@
 #include "simp_controller/control.hpp"
 
 #include <geometry_msgs/msg/twist_stamped.hpp>
+#include <simp_planner_msgs/msg/tracking_control.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/u_int8.hpp>
 
@@ -38,6 +39,8 @@ class TrackingControllerNode final : public rclcpp::Node {
     cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
     cmd_stamped_pub_ = create_publisher<geometry_msgs::msg::TwistStamped>(
         "/planner/cmd_vel_stamped", 200);
+    tracking_control_pub_ = create_publisher<simp_planner_msgs::msg::TrackingControl>(
+        "/tracker/control", rclcpp::QoS(10).best_effort());
     mode_command_pub_ = create_publisher<std_msgs::msg::UInt8>(
         "/vehicle/drive_mode_command", static_qos);
     trajectory_sub_ = create_subscription<Trajectory>(
@@ -99,6 +102,26 @@ class TrackingControllerNode final : public rclcpp::Node {
     stamped.header.frame_id = parameters[3].as_string();
     stamped.twist = output.velocity;
     cmd_stamped_pub_->publish(stamped);
+    // Publish the exact snapshot used above; the plotter never reselects a point.
+    simp_planner_msgs::msg::TrackingControl diagnostic;
+    diagnostic.header.stamp = stamped.header.stamp;
+    diagnostic.command = output.velocity;
+    diagnostic.valid = output.tracking.valid;
+    if (diagnostic.valid) {
+      const auto& tracking = output.tracking;
+      diagnostic.header.frame_id = snapshot.trajectory->header.frame_id;
+      diagnostic.odom_stamp = snapshot.odom->header.stamp;
+      diagnostic.reference_stamp = rclcpp::Time(tracking.reference_ns, get_clock()->get_clock_type());
+      diagnostic.reference = tracking.reference;
+      diagnostic.predicted_x = tracking.predicted.x;
+      diagnostic.predicted_y = tracking.predicted.y;
+      diagnostic.predicted_yaw = tracking.predicted.yaw;
+      diagnostic.ex = tracking.error.ex;
+      diagnostic.ey = tracking.error.ey;
+      diagnostic.etheta = tracking.error.etheta;
+      diagnostic.measured_velocity = snapshot.odom->twist.twist;
+    }
+    tracking_control_pub_->publish(diagnostic);
   }
 
   std::int64_t period_ns_{10000000};
@@ -109,6 +132,7 @@ class TrackingControllerNode final : public rclcpp::Node {
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
   rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr cmd_stamped_pub_;
   rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr mode_command_pub_;
+  rclcpp::Publisher<simp_planner_msgs::msg::TrackingControl>::SharedPtr tracking_control_pub_;
   rclcpp::CallbackGroup::SharedPtr control_group_;
   rclcpp::TimerBase::SharedPtr timer_;
 };

@@ -128,6 +128,13 @@ def _resolved_nodes(context):
         ),
         Node(
             package="simp_planner_tools",
+            executable="tracking_shutdown_plot",
+            name="tracking_shutdown_plot",
+            output="screen",
+            parameters=[{"output_dir": debug_output_dir}],
+        ),
+        Node(
+            package="simp_planner_tools",
             executable="debug_plot_node",
             name="debug_plot_node",
             output="screen",

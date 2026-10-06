@@ -160,6 +160,7 @@ int main() {
       const auto output = cycle(prediction, 1014000000);
       require(output.tracking.valid, "missing control snapshot");
       require(output.tracking.reference_ns == 1020000000, "reference timestamp");
+      require(output.tracking.reference == target, "diagnostic must keep the selected reference");
       near(output.tracking.predicted.x, target.x);
       near(output.tracking.predicted.y, target.y);
       near(output.tracking.error.ex, 0.0);

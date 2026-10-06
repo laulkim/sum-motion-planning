@@ -5,6 +5,7 @@ import csv
 import json
 import math
 import multiprocessing
+import signal
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import fields
 from datetime import datetime
@@ -15,6 +16,7 @@ import numpy as np
 import rclpy
 from ament_index_python.packages import get_package_share_directory
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as PathMessage
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from simp_planner_msgs.msg import DriveModeState, TrackingDiagnostics, TrackingTrajectory
@@ -364,6 +366,8 @@ class DebugPlotNode(Node):
         self.render_executor = ProcessPoolExecutor(
             max_workers=1,
             mp_context=multiprocessing.get_context("spawn"),
+            initializer=signal.signal,
+            initargs=(signal.SIGINT, signal.SIG_IGN),
         )
         self.render_future: Optional[Future[str]] = None
         self.render_skip_count = 0
@@ -1300,11 +1304,13 @@ def main(args=None) -> None:
     node = DebugPlotNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
