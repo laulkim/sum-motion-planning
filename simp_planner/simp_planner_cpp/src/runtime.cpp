@@ -473,10 +473,8 @@ BodyCommand YawRotationProfile::sample(double dt) {
 
 SpotTurnManeuver::SpotTurnManeuver(const SpotTurnConfig& config) : rotation_(config) {}
 
-void SpotTurnManeuver::trigger(double start_body_yaw, double target_body_yaw,
-                               DriveMode external_mode) {
+void SpotTurnManeuver::trigger(double target_body_yaw, DriveMode external_mode) {
   if (state_ != SpotTurnManeuverState::Inactive) throw std::logic_error("spot turn already active");
-  start_yaw_ = start_body_yaw;
   target_yaw_ = target_body_yaw;
   external_mode_ = external_mode;
   returning_ = false;
@@ -486,7 +484,6 @@ void SpotTurnManeuver::trigger(double start_body_yaw, double target_body_yaw,
 bool SpotTurnManeuver::on_mode_ready(const DriveModeSupervisor& supervisor) {
   if (!supervisor.ready() || state_ != SpotTurnManeuverState::AligningWheels) return false;
   if (!returning_ && supervisor.requested_mode() == DriveMode::SpotTurn) {
-    rotation_.engage(start_yaw_, target_yaw_);
     state_ = SpotTurnManeuverState::Rotating;
   } else if (returning_ && supervisor.requested_mode() == external_mode_) {
     state_ = SpotTurnManeuverState::Inactive;
@@ -495,15 +492,25 @@ bool SpotTurnManeuver::on_mode_ready(const DriveModeSupervisor& supervisor) {
   return false;
 }
 
-std::optional<BodyCommand> SpotTurnManeuver::sample(double dt, DriveModeSupervisor& supervisor) {
-  if (state_ != SpotTurnManeuverState::Rotating) return std::nullopt;
-  const auto command = rotation_.sample(dt);
-  if (rotation_.done()) {
-    supervisor.set_requested_mode(external_mode_);
-    returning_ = true;
-    state_ = SpotTurnManeuverState::AligningWheels;
-  }
-  return command;
+std::vector<BodyCommand> SpotTurnManeuver::rotation_commands(double start_yaw, double dt) {
+  if (state_ != SpotTurnManeuverState::Rotating) throw std::logic_error("spot turn is not rotating");
+  if (!std::isfinite(dt) || dt <= 0.0) throw std::invalid_argument("invalid rotation dt");
+  rotation_.engage(start_yaw, target_yaw_);
+  // Guard only: a half turn at the default limits settles in about 12 s.
+  const auto limit = static_cast<std::size_t>(std::ceil(600.0 / dt));
+  std::vector<BodyCommand> commands;
+  do {
+    commands.push_back(rotation_.sample(dt));
+  } while (!rotation_.done() && commands.size() < limit);
+  if (!rotation_.done()) throw std::runtime_error("spot turn rotation did not settle");
+  return commands;
+}
+
+void SpotTurnManeuver::finish_rotation(DriveModeSupervisor& supervisor) {
+  if (state_ != SpotTurnManeuverState::Rotating) throw std::logic_error("spot turn is not rotating");
+  supervisor.set_requested_mode(external_mode_);
+  returning_ = true;
+  state_ = SpotTurnManeuverState::AligningWheels;
 }
 
 bool SpotTurnManeuver::set_external_requested_mode(DriveMode mode, DriveModeSupervisor& supervisor) {
@@ -517,6 +524,117 @@ const char* SpotTurnManeuver::state_name() const {
   if (state_ == SpotTurnManeuverState::Inactive) return "INACTIVE";
   if (state_ == SpotTurnManeuverState::Rotating) return "SPOT_TURN_ROTATING";
   return returning_ ? "SPOT_TURN_ALIGNING_REGULAR" : "SPOT_TURN_ALIGNING_WHEELS";
+}
+
+const char* execution_state_name(ExecutionState state) {
+  switch (state) {
+    case ExecutionState::Idle: return "IDLE";
+    case ExecutionState::ActivePlan: return "ACTIVE_PLAN";
+    case ExecutionState::SafetyStop: return "SAFETY_STOP";
+    case ExecutionState::TerminalHold: return "TERMINAL_HOLD";
+    case ExecutionState::ModeStop: return "MODE_STOP";
+    case ExecutionState::ModeWait: return "MODE_WAIT";
+    case ExecutionState::SpotTurnRotating: return "SPOT_TURN_ROTATING";
+    case ExecutionState::SpotTurnWaitingClearance: return "SPOT_TURN_WAITING_CLEARANCE";
+  }
+  return "UNKNOWN";
+}
+
+std::size_t TrackingTrajectory::index_at(std::int64_t time_ns) const {
+  if (points.empty()) throw std::logic_error("empty tracking trajectory");
+  if (time_ns <= stamp_ns) return 0;
+  const auto index = static_cast<std::size_t>((time_ns - stamp_ns) / period_ns);
+  return std::min(index, points.size() - 1);
+}
+
+const TrackingPoint& TrackingTrajectory::at(std::int64_t time_ns) const {
+  return points[index_at(time_ns)];
+}
+
+BodyCommand hold_command(const BodyCommand& previous, DriveMode previous_mode,
+                         DriveMode mode, double body_yaw) {
+  BodyCommand hold{};
+  hold.beta = mode == previous_mode || mode == DriveMode::SpotTurn
+      ? previous.beta : drive_mode_heading_offset(mode);
+  hold.motion_heading = wrap_angle(body_yaw + hold.beta);
+  hold.segment_start_heading = hold.segment_end_heading = hold.motion_heading;
+  hold.trajectory_time = previous.trajectory_time;
+  return hold;
+}
+
+PredictedHandoverState handover_from_point(const TrackingPoint& point) {
+  const auto& command = point.command;
+  PlannerState state;
+  state.x = point.x;
+  state.y = point.y;
+  state.chi = wrap_angle(point.body_yaw + command.beta);
+  state.speed = command.planned_speed;
+  state.acceleration = command.planned_acceleration;
+  state.motion_heading_rate = command.motion_heading_rate;
+  PlannerAction last_action{command.planned_jerk, command.planned_heading_acceleration};
+  AllocatorInitialState allocator_state{command.beta, command.beta_rate,
+                                         command.yaw_rate, command.yaw_acceleration};
+  return {state, point.body_yaw, last_action, allocator_state, command};
+}
+
+TrackingTrajectoryBuilder::TrackingTrajectoryBuilder(std::int64_t stamp_ns,
+                                                     std::int64_t period_ns)
+    : dt_(1.0e-9 * static_cast<double>(period_ns)) {
+  if (period_ns <= 0) throw std::invalid_argument("tracking period must be positive");
+  trajectory_.stamp_ns = stamp_ns;
+  trajectory_.period_ns = period_ns;
+}
+
+std::int64_t TrackingTrajectoryBuilder::next_time_ns() const {
+  return trajectory_.stamp_ns +
+         static_cast<std::int64_t>(trajectory_.points.size()) * trajectory_.period_ns;
+}
+
+void TrackingTrajectoryBuilder::push(TrackingPoint point) {
+  // Same midpoint-yaw body-velocity integration as the vehicle simulator.
+  const auto& c = point.command;
+  const double yaw_mid = point.body_yaw + 0.5 * c.yaw_rate * dt_;
+  x_ = point.x + (std::cos(yaw_mid) * c.vx - std::sin(yaw_mid) * c.vy) * dt_;
+  y_ = point.y + (std::sin(yaw_mid) * c.vx + std::cos(yaw_mid) * c.vy) * dt_;
+  body_yaw_ = wrap_angle(point.body_yaw + c.yaw_rate * dt_);
+  trajectory_.points.push_back(std::move(point));
+}
+
+void TrackingTrajectoryBuilder::copy_prefix(const TrackingTrajectory& previous,
+                                            std::int64_t until_ns) {
+  if (previous.period_ns != trajectory_.period_ns)
+    throw std::invalid_argument("tracking period changed between trajectories");
+  while (next_time_ns() < until_ns) push(previous.at(next_time_ns()));
+}
+
+void TrackingTrajectoryBuilder::hold_prefix(const TrackingPoint& point, std::int64_t until_ns) {
+  TrackingPoint hold = point;
+  hold.command = hold_command(point.command, point.mode, point.mode, point.body_yaw);
+  hold.segment = TrajectorySegment::Hold;
+  while (next_time_ns() < until_ns) push(hold);
+}
+
+void TrackingTrajectoryBuilder::append(const BodyCommand& command, DriveMode mode,
+                                       TrajectorySegment segment, ExecutionState execution,
+                                       std::uint64_t plan_id) {
+  if (trajectory_.points.empty()) throw std::logic_error("tracking trajectory has no start pose");
+  push({x_, y_, body_yaw_, command, mode, segment, execution, plan_id});
+}
+
+void TrackingTrajectoryBuilder::append_stop(JerkLimitedSafetyStop stop, DriveMode mode,
+                                            ExecutionState execution, std::uint64_t plan_id) {
+  while (!stop.stopped()) {
+    append(stop.sample_and_advance(dt_), mode, TrajectorySegment::Stop, execution, plan_id);
+  }
+  append(stop.sample(), mode, TrajectorySegment::Stop, execution, plan_id);
+}
+
+void TrackingTrajectoryBuilder::append_hold(DriveMode mode, ExecutionState execution,
+                                            std::uint64_t plan_id) {
+  if (trajectory_.points.empty()) throw std::logic_error("tracking trajectory has no start pose");
+  const auto& last = trajectory_.points.back();
+  append(hold_command(last.command, last.mode, mode, body_yaw_), mode,
+         TrajectorySegment::Hold, execution, plan_id);
 }
 
 LatestOnlyPlanningScheduler::LatestOnlyPlanningScheduler(

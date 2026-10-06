@@ -120,6 +120,13 @@ def _resolved_nodes(context):
             ],
         ),
         Node(
+            package="simp_controller",
+            executable="tracking_controller_node",
+            name="tracking_controller_node",
+            output="screen",
+            parameters=[{"command_frequency_hz": command_frequency_hz}],
+        ),
+        Node(
             package="simp_planner_tools",
             executable="debug_plot_node",
             name="debug_plot_node",

@@ -222,22 +222,104 @@ enum class SpotTurnManeuverState { Inactive, AligningWheels, Rotating };
 class SpotTurnManeuver {
  public:
   explicit SpotTurnManeuver(const SpotTurnConfig& config = {});
-  // `start_body_yaw` is the trajectory point the turn begins from (the last
-  // point of the trajectory that brought the vehicle to rest).
-  void trigger(double start_body_yaw, double target_body_yaw, DriveMode external_mode);
+  void trigger(double target_body_yaw, DriveMode external_mode);
   bool on_mode_ready(const DriveModeSupervisor& supervisor);
-  std::optional<BodyCommand> sample(double dt, DriveModeSupervisor& supervisor);
+  // Rotating only: the whole rotation as one command per dt, starting from
+  // the trajectory point whose body yaw is `start_yaw` and ending at rest.
+  std::vector<BodyCommand> rotation_commands(double start_yaw, double dt);
+  // Rotating -> return alignment: request the external mode again.
+  void finish_rotation(DriveModeSupervisor& supervisor);
   bool set_external_requested_mode(DriveMode mode, DriveModeSupervisor& supervisor);
   SpotTurnManeuverState state() const { return state_; }
+  DriveMode external_mode() const { return external_mode_; }
   const char* state_name() const;
 
  private:
   SpotTurnManeuverState state_{SpotTurnManeuverState::Inactive};
   bool returning_{false};
-  double start_yaw_{0.0};
   double target_yaw_{0.0};
   DriveMode external_mode_{DriveMode::Forward};
   YawRotationProfile rotation_;
+};
+
+// Tracking trajectory: the time-indexed array the planner hands to the
+// controller. points[i] is the vehicle state at stamp + i * period and the
+// command held from that instant until the next point. Past the last point
+// the last point is held, so every trajectory must end at rest.
+enum class TrajectorySegment : std::uint8_t { Drive = 0, Stop = 1, Turn = 2, Hold = 3 };
+
+enum class ExecutionState : std::uint8_t {
+  Idle,
+  ActivePlan,
+  SafetyStop,
+  TerminalHold,
+  ModeStop,
+  ModeWait,
+  SpotTurnRotating,
+  SpotTurnWaitingClearance,
+};
+
+const char* execution_state_name(ExecutionState state);
+
+struct TrackingPoint {
+  double x{0.0};
+  double y{0.0};
+  double body_yaw{0.0};
+  BodyCommand command;
+  DriveMode mode{DriveMode::Forward};
+  TrajectorySegment segment{TrajectorySegment::Hold};
+  ExecutionState execution{ExecutionState::Idle};
+  std::uint64_t plan_id{0};
+};
+
+struct TrackingTrajectory {
+  std::int64_t stamp_ns{0};
+  std::int64_t period_ns{10000000};
+  std::vector<TrackingPoint> points;
+
+  // Floor index of the point governing time_ns, clamped to the array.
+  std::size_t index_at(std::int64_t time_ns) const;
+  const TrackingPoint& at(std::int64_t time_ns) const;
+};
+
+// Zero-motion command that keeps the previous command's slip angle, or the
+// mode's nominal one when the hold is in a different mode.
+BodyCommand hold_command(const BodyCommand& previous, DriveMode previous_mode,
+                         DriveMode mode, double body_yaw);
+
+// The handover state a new plan starts from when it begins at `point`.
+PredictedHandoverState handover_from_point(const TrackingPoint& point);
+
+// Builds a TrackingTrajectory point by point. The pose of each new point is
+// integrated from the previous one with the same body-velocity kinematics the
+// vehicle executes, so the array is what the vehicle does under ideal tracking.
+class TrackingTrajectoryBuilder {
+ public:
+  TrackingTrajectoryBuilder(std::int64_t stamp_ns, std::int64_t period_ns);
+  // Copies `previous` unchanged for every grid time in [stamp, until_ns).
+  void copy_prefix(const TrackingTrajectory& previous, std::int64_t until_ns);
+  // Repeats `point` as a hold for every grid time in [next time, until_ns).
+  void hold_prefix(const TrackingPoint& point, std::int64_t until_ns);
+  void append(const BodyCommand& command, DriveMode mode, TrajectorySegment segment,
+              ExecutionState execution, std::uint64_t plan_id);
+  // Appends the stop's samples until it is stopped, including the final
+  // stationary sample.
+  void append_stop(JerkLimitedSafetyStop stop, DriveMode mode,
+                   ExecutionState execution, std::uint64_t plan_id);
+  void append_hold(DriveMode mode, ExecutionState execution, std::uint64_t plan_id);
+  std::int64_t next_time_ns() const;
+  bool empty() const { return trajectory_.points.empty(); }
+  const TrackingPoint& back() const { return trajectory_.points.back(); }
+  TrackingTrajectory take() { return std::move(trajectory_); }
+
+ private:
+  void push(TrackingPoint point);
+
+  TrackingTrajectory trajectory_;
+  double dt_{0.01};
+  double x_{0.0};
+  double y_{0.0};
+  double body_yaw_{0.0};
 };
 
 struct PlanningRequestToken {

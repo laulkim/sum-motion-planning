@@ -480,7 +480,7 @@ def render_debug_snapshot(
     curvature_ax.grid(True)
     curvature_ax.legend(loc="best", fontsize=8.0)
 
-    # Allocation diagnostics use only direct ExecutedCommand fields and exact
+    # Allocation diagnostics use only direct tracking-diagnostics fields and exact
     # identities from the allocator: v=sqrt(vx^2+vy^2), chi_dot=r+beta_dot,
     # and chi_ddot=psi_ddot+beta_ddot.  No finite differences are used.
     if cmd_time.size:

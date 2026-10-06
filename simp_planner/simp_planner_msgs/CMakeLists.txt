@@ -9,6 +9,10 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ReferencePath.msg"
   "msg/ExecutedCommand.msg"
   "msg/DriveModeState.msg"
+  "msg/TrackingTrajectoryPoint.msg"
+  "msg/TrackingTrajectory.msg"
+  "msg/TrackingDiagnosticsPoint.msg"
+  "msg/TrackingDiagnostics.msg"
   DEPENDENCIES std_msgs
 )
 

@@ -6,6 +6,7 @@ import json
 import math
 import multiprocessing
 from concurrent.futures import Future, ProcessPoolExecutor
+from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -16,16 +17,17 @@ from ament_index_python.packages import get_package_share_directory
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as PathMessage
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from simp_planner_msgs.msg import DriveModeState, ExecutedCommand
+from simp_planner_msgs.msg import DriveModeState, TrackingDiagnostics, TrackingTrajectory
 from simp_planner_msgs.msg import ReferencePath as ReferencePathMessage
 from std_msgs.msg import Float64, String, UInt8
 
-from .debug_allocation_metrics import compute_allocation_debug_sample
+from .debug_allocation_metrics import AllocationDebugSample, compute_allocation_debug_sample
 from .debug_plot_renderer import render_debug_snapshot
 from .debug_scenario_geometry import scenario_obstacle_polygons
 from .debug_signal_history import SourceTimeAligner
 from .diagnostic_metrics import OpenPathGeometry, tracking_error_to_executed_segment
 from .path_geometry import PathProjection, project_open_path, wrap_angle
+from .tracking_history import TrackingPlayback
 
 
 MODE_NAMES = {0: "FORWARD", 1: "REVERSE", 2: "LEFT", 3: "RIGHT", 4: "SPOT_TURN"}
@@ -62,6 +64,8 @@ class DebugPlotNode(Node):
         self.declare_parameter("tracking_motion_limit_deg", 3.0)
         self.declare_parameter("planning_deadline_ms", 100.0)
         self.declare_parameter("dynamic_topic_timeout", 2.0)
+        # Tracking-trajectory points are one controller command period apart.
+        self.declare_parameter("command_frequency_hz", 100.0)
 
         self.scenario_name = str(self.get_parameter("scenario").value)
         self.costmap_vehicle_centered = (
@@ -92,6 +96,11 @@ class DebugPlotNode(Node):
         self.dynamic_topic_timeout = float(
             self.get_parameter("dynamic_topic_timeout").value
         )
+        command_frequency_hz = float(self.get_parameter("command_frequency_hz").value)
+        if not math.isfinite(command_frequency_hz) or command_frequency_hz <= 0.0:
+            raise ValueError("command_frequency_hz must be finite and positive")
+        self.tracking_playback = TrackingPlayback(round(1.0e9 / command_frequency_hz))
+        self.tracking_diagnostics: dict[int, TrackingDiagnostics] = {}
 
         self.scenario_obstacle_polygons = scenario_obstacle_polygons(
             Path(get_package_share_directory("simp_planner_tools")),
@@ -214,9 +223,16 @@ class DebugPlotNode(Node):
             self.vehicle_mode_callback,
             static_qos,
         )
+        # Every trajectory is needed to rebuild the command history, so keep a
+        # queue instead of the latest-only static QoS.
+        tracking_qos = QoSProfile(depth=50, reliability=ReliabilityPolicy.RELIABLE)
         self.create_subscription(
-            ExecutedCommand, "/planner/executed_command",
-            self.executed_command_callback, 500
+            TrackingTrajectory, "/planner/tracking_trajectory",
+            self.tracking_trajectory_callback, tracking_qos
+        )
+        self.create_subscription(
+            TrackingDiagnostics, "/planner/tracking_diagnostics",
+            self.tracking_diagnostics_callback, tracking_qos
         )
         self.create_subscription(
             String, "/planner/status", self.planner_status_callback, static_qos
@@ -312,7 +328,7 @@ class DebugPlotNode(Node):
         self.command_speed_history: list[float] = []
         self.command_acceleration_history: list[float] = []
         self.command_jerk_history: list[float] = []
-        # Direct allocator outputs.  These are copied from ExecutedCommand or
+        # Direct allocator outputs.  These are copied from the tracking diagnostics or
         # formed from exact allocator identities; no signal is differentiated.
         self.command_motion_heading_rate_history: list[float] = []
         self.command_motion_heading_acceleration_history: list[float] = []
@@ -485,32 +501,131 @@ class DebugPlotNode(Node):
         self.mode = int(message.current_mode)
         self.vehicle_status = int(message.status)
 
-    def executed_command_callback(self, message: ExecutedCommand) -> None:
+    @staticmethod
+    def stamp_ns(stamp) -> int:
+        return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
+    def tracking_diagnostics_callback(self, message: TrackingDiagnostics) -> None:
+        self.tracking_diagnostics[self.stamp_ns(message.header.stamp)] = message
+        while len(self.tracking_diagnostics) > 16:
+            self.tracking_diagnostics.pop(min(self.tracking_diagnostics))
+
+    def tracking_trajectory_callback(self, message: TrackingTrajectory) -> None:
         self.mark("cmd_vel")
-        receive_time = self.elapsed()
+        if not message.points:
+            return
+        self.record_tracking_points(
+            self.tracking_playback.add(
+                self.stamp_ns(message.header.stamp),
+                len(message.points),
+                (message, self.elapsed()),
+            )
+        )
+
+    def flush_tracking_history(self) -> None:
+        self.record_tracking_points(
+            self.tracking_playback.flush(self.get_clock().now().nanoseconds)
+        )
+
+    def record_tracking_points(self, emitted: list) -> None:
+        """Record what the controller sent, rebuilt from the tracking trajectories."""
+        for (trajectory, receive_time), index, time_ns in emitted:
+            stamp_ns = self.stamp_ns(trajectory.header.stamp)
+            diagnostics = self.tracking_diagnostics.get(stamp_ns)
+            if diagnostics is not None and len(diagnostics.points) != len(trajectory.points):
+                diagnostics = None
+            point = trajectory.points[index]
+            following = trajectory.points[min(index + 1, len(trajectory.points) - 1)]
+            plan = diagnostics.points[index] if diagnostics is not None else None
+            following_plan = (
+                diagnostics.points[min(index + 1, len(diagnostics.points) - 1)]
+                if diagnostics is not None else None
+            )
+
+            def planned(field: str) -> float:
+                return float(getattr(plan, field)) if plan is not None else math.nan
+
+            beta = planned("beta")
+            following_beta = (
+                float(following_plan.beta) if following_plan is not None else math.nan
+            )
+            self.record_command(
+                stamp_sec=time_ns // 1_000_000_000,
+                stamp_nanosec=time_ns % 1_000_000_000,
+                receive_time=receive_time,
+                plan_id=int(plan.plan_id) if plan is not None else 0,
+                interval_index=int(plan.interval_index) if plan is not None else 0,
+                trajectory_time=planned("trajectory_time"),
+                vx=float(point.vx),
+                vy=float(point.vy),
+                yaw_rate=float(point.yaw_rate),
+                planned_speed=planned("planned_speed"),
+                planned_acceleration=planned("planned_acceleration"),
+                planned_jerk=planned("planned_jerk"),
+                motion_curvature=planned("motion_curvature"),
+                motion_heading_rate=planned("motion_heading_rate"),
+                motion_heading_acceleration=planned("motion_heading_acceleration"),
+                beta=beta,
+                beta_rate=planned("beta_rate"),
+                yaw_acceleration=planned("yaw_acceleration"),
+                # Segment headings are motion directions: body yaw plus slip angle.
+                segment=(
+                    float(point.x), float(point.y),
+                    float(wrap_angle(float(point.body_yaw) + beta)),
+                    float(following.x), float(following.y),
+                    float(wrap_angle(float(following.body_yaw) + following_beta)),
+                ),
+            )
+
+    def record_command(
+        self,
+        *,
+        stamp_sec: int,
+        stamp_nanosec: int,
+        receive_time: float,
+        plan_id: int,
+        interval_index: int,
+        trajectory_time: float,
+        vx: float,
+        vy: float,
+        yaw_rate: float,
+        planned_speed: float,
+        planned_acceleration: float,
+        planned_jerk: float,
+        motion_curvature: float,
+        motion_heading_rate: float,
+        motion_heading_acceleration: float,
+        beta: float,
+        beta_rate: float,
+        yaw_acceleration: float,
+        segment: tuple[float, float, float, float, float, float],
+    ) -> None:
         publish_time = self.cmd_time_aligner.align(
-            message.header.stamp.sec,
-            message.header.stamp.nanosec,
+            stamp_sec,
+            stamp_nanosec,
             receive_time,
         )
-        vx = float(message.vx)
-        vy = float(message.vy)
-        yaw_rate = float(message.yaw_rate)
-        planned_speed = float(message.planned_speed)
-        planned_acceleration = float(message.planned_acceleration)
-        planned_jerk = float(message.planned_jerk)
-        allocation_debug = compute_allocation_debug_sample(
+        allocation_inputs = dict(
             vx=vx,
             vy=vy,
             yaw_rate=yaw_rate,
             planned_speed=planned_speed,
-            motion_heading_rate=float(message.motion_heading_rate),
-            motion_heading_acceleration=float(message.motion_heading_acceleration),
-            beta=float(message.beta),
-            beta_rate=float(message.beta_rate),
-            yaw_acceleration=float(message.yaw_acceleration),
-            mode=self.mode,
+            motion_heading_rate=motion_heading_rate,
+            motion_heading_acceleration=motion_heading_acceleration,
+            beta=beta,
+            beta_rate=beta_rate,
+            yaw_acceleration=yaw_acceleration,
         )
+        if all(math.isfinite(value) for value in allocation_inputs.values()):
+            allocation_debug = compute_allocation_debug_sample(
+                **allocation_inputs, mode=self.mode
+            )
+        else:
+            # The diagnostics for this trajectory were not received (they are
+            # a separate topic), so only the commanded velocity is known.
+            allocation_debug = AllocationDebugSample(
+                *([math.nan] * len(fields(AllocationDebugSample)))
+            )
         motion_heading_rate_deg = allocation_debug.motion_heading_rate_degps
         motion_heading_acceleration_deg = (
             allocation_debug.motion_heading_acceleration_degps2
@@ -529,15 +644,7 @@ class DebugPlotNode(Node):
         self.cmd_vy = vy
         self.cmd_yaw_rate = yaw_rate
         self.latest_cmd_time = publish_time
-        self.latest_cmd_plan_id = int(message.plan_id)
-        segment = (
-            float(message.segment_start_x),
-            float(message.segment_start_y),
-            float(message.segment_start_heading),
-            float(message.segment_end_x),
-            float(message.segment_end_y),
-            float(message.segment_end_heading),
-        )
+        self.latest_cmd_plan_id = plan_id
         self.latest_command_segment = segment if all(math.isfinite(v) for v in segment) else None
         self.cmd_time_history.append(publish_time)
         self.cmd_receive_time_history.append(receive_time)
@@ -568,11 +675,11 @@ class DebugPlotNode(Node):
             [
                 f"{publish_time:.6f}", f"{receive_time:.6f}",
                 f"{max(0.0, receive_time - publish_time):.6f}",
-                f"{float(message.trajectory_time):.6f}",
-                int(message.interval_index),
+                f"{trajectory_time:.6f}",
+                interval_index,
                 f"{vx:.9f}", f"{vy:.9f}", f"{yaw_rate:.9f}",
                 f"{planned_speed:.9f}", f"{planned_acceleration:.9f}",
-                f"{planned_jerk:.9f}", f"{float(message.motion_curvature):.9f}",
+                f"{planned_jerk:.9f}", f"{motion_curvature:.9f}",
                 f"{motion_heading_rate_deg:.9f}",
                 f"{motion_heading_acceleration_deg:.9f}",
                 f"{beta_deg:.9f}", f"{beta_center_deg:.9f}",
@@ -581,7 +688,7 @@ class DebugPlotNode(Node):
                 f"{yaw_acceleration_deg:.9f}",
                 f"{rate_split_residual_deg:.12f}",
                 f"{speed_reconstruction_error:.12f}",
-                "" if self.mode is None else self.mode, int(message.plan_id),
+                "" if self.mode is None else self.mode, plan_id,
             ]
         )
 
@@ -1143,6 +1250,7 @@ class DebugPlotNode(Node):
 
     def save_output(self) -> None:
         self.check_render_future()
+        self.flush_tracking_history()
         diagnosis, detail = self.diagnose()
         payload = {
             "diagnosis": diagnosis,
@@ -1172,6 +1280,7 @@ class DebugPlotNode(Node):
         )
 
     def destroy_node(self) -> bool:
+        self.flush_tracking_history()
         self.check_render_future()
         if self.render_future is not None:
             try:

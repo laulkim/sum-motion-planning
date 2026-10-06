@@ -162,32 +162,120 @@ void test_rotation_follows_previous_trajectory_point_and_accepts_new_return_mode
   // 170 deg -> -150 deg: the short way is +40 deg across +-pi.
   const double start = 170 * kPi / 180;
   const double target = -150 * kPi / 180;
-  maneuver.trigger(start, target, DriveMode::Forward);
+  maneuver.trigger(target, DriveMode::Forward);
   supervisor.set_requested_mode(DriveMode::SpotTurn);
   supervisor.update_vehicle_feedback(DriveMode::SpotTurn, DriveMode::SpotTurn, VehicleModeStatus::Ready);
   maneuver.on_mode_ready(supervisor);
+  require(maneuver.state() == SpotTurnManeuverState::Rotating, "ready SpotTurn mode did not start rotating");
+  const auto commands = maneuver.rotation_commands(start, 0.01);
   double yaw = start, previous_rate = 0;
-  for (int i = 0; i < 2500 && maneuver.state() == SpotTurnManeuverState::Rotating; ++i) {
-    auto cmd = maneuver.sample(0.01, supervisor);
-    require(cmd && cmd->vx == 0 && cmd->vy == 0, "rotation moved vehicle laterally");
-    require(std::abs(cmd->yaw_rate - previous_rate) <= config.yaw_rate_accel_max * 0.01 + 1.0e-9,
+  for (const auto& cmd : commands) {
+    require(cmd.vx == 0 && cmd.vy == 0, "rotation moved vehicle laterally");
+    require(std::abs(cmd.yaw_rate - previous_rate) <= config.yaw_rate_accel_max * 0.01 + 1.0e-9,
             "yaw acceleration limit exceeded");
-    require(cmd->yaw_rate >= 0.0, "rotation reversed or took the long way around");
+    require(cmd.yaw_rate >= 0.0, "rotation reversed or took the long way around");
     // Every point must continue from the previous trajectory point, and its
     // end must be exactly where holding yaw_rate for dt puts the vehicle.
-    require(std::abs(wrap_angle(cmd->segment_start_heading - yaw)) < 1.0e-12,
+    require(std::abs(wrap_angle(cmd.segment_start_heading - yaw)) < 1.0e-12,
             "trajectory point did not start from the previous point");
-    require(std::abs(wrap_angle(cmd->segment_end_heading - (yaw + cmd->yaw_rate * 0.01))) < 1.0e-12,
+    require(std::abs(wrap_angle(cmd.segment_end_heading - (yaw + cmd.yaw_rate * 0.01))) < 1.0e-12,
             "segment end heading does not match the held yaw rate");
-    previous_rate = cmd->yaw_rate;
-    yaw = cmd->segment_end_heading;
+    previous_rate = cmd.yaw_rate;
+    yaw = cmd.segment_end_heading;
   }
-  require(maneuver.state() == SpotTurnManeuverState::AligningWheels, "rotation did not converge");
+  require(commands.size() < 1000, "40 degree rotation took implausibly long");
   require(previous_rate == 0.0, "trajectory did not come to rest");
   require(std::abs(wrap_angle(target - yaw)) <= config.yaw_tolerance_rad, "trajectory heading off target");
+  maneuver.finish_rotation(supervisor);
+  require(maneuver.state() == SpotTurnManeuverState::AligningWheels, "finished rotation did not return");
+  require(supervisor.requested_mode() == DriveMode::Forward, "external mode not requested after rotation");
   require(maneuver.set_external_requested_mode(DriveMode::Left, supervisor), "return request not retargeted");
   supervisor.update_vehicle_feedback(DriveMode::Left, DriveMode::Left, VehicleModeStatus::Ready);
   require(maneuver.on_mode_ready(supervisor), "return alignment stuck after new request");
+}
+
+TrackingPoint at_rest_point(double x, double y, double yaw, DriveMode mode) {
+  TrackingPoint point;
+  point.x = x;
+  point.y = y;
+  point.body_yaw = yaw;
+  point.mode = mode;
+  return point;
+}
+
+void test_tracking_index_is_floor_and_holds_last_point() {
+  TrackingTrajectoryBuilder builder(1'000'000'000, 10'000'000);
+  builder.hold_prefix(at_rest_point(0, 0, 0, DriveMode::Forward), 1'050'000'000);
+  auto trajectory = builder.take();
+  require(trajectory.points.size() == 5, "hold prefix did not fill up to its end time");
+  require(trajectory.index_at(999'000'000) == 0, "time before the stamp did not use the first point");
+  require(trajectory.index_at(1'019'999'999) == 1, "index was not the floor");
+  require(trajectory.index_at(1'020'000'000) == 2, "exact grid time used the previous point");
+  require(trajectory.index_at(5'000'000'000) == 4, "time past the end did not hold the last point");
+}
+
+void test_stop_tail_integrates_pose_and_ends_at_rest() {
+  BodyCommand moving{};
+  moving.vx = moving.planned_speed = 3.0;
+  moving.motion_heading = 0.0;
+  TrackingTrajectoryBuilder builder(0, 10'000'000);
+  builder.hold_prefix(at_rest_point(0, 0, 0, DriveMode::Forward), 10'000'000);
+  builder.append_stop(JerkLimitedSafetyStop::from_command(moving, 1.0, 0.8),
+                      DriveMode::Forward, ExecutionState::SafetyStop, 7);
+  auto trajectory = builder.take();
+  const auto& last = trajectory.points.back();
+  require(last.command.vx == 0.0 && last.command.planned_speed == 0.0, "stop tail did not end at rest");
+  require(last.segment == TrajectorySegment::Stop && last.plan_id == 7, "stop tail lost its labels");
+  // v / A + A / J = 3 / 1 + 1 / 0.8 = 4.25 s, distance v * T / 2 = 6.375 m.
+  const double duration = 0.01 * static_cast<double>(trajectory.points.size() - 2);
+  require(std::abs(duration - 4.25) < 0.05, "stop tail duration does not match the jerk-limited profile");
+  require(std::abs(last.x - 6.375) < 0.05, "stop tail pose was not integrated from its commands");
+  for (std::size_t i = 1; i < trajectory.points.size(); ++i) {
+    require(trajectory.points[i].x >= trajectory.points[i - 1].x, "stop tail moved backwards");
+  }
+}
+
+void test_copy_prefix_repeats_previous_points_and_continues_pose() {
+  BodyCommand cruise{};
+  cruise.vx = cruise.planned_speed = 2.0;
+  cruise.yaw_rate = 0.1;
+  TrackingTrajectoryBuilder first(0, 10'000'000);
+  first.hold_prefix(at_rest_point(1, 2, 0.3, DriveMode::Forward), 10'000'000);
+  for (int i = 0; i < 100; ++i) {
+    first.append(cruise, DriveMode::Forward, TrajectorySegment::Drive, ExecutionState::ActivePlan, 1);
+  }
+  const auto previous = first.take();
+
+  // Next cycle: stamp 0.1 s later, new content from t0 = 0.3 s.
+  TrackingTrajectoryBuilder next(100'000'000, 10'000'000);
+  next.copy_prefix(previous, 300'000'000);
+  next.append(cruise, DriveMode::Forward, TrajectorySegment::Drive, ExecutionState::ActivePlan, 2);
+  const auto stitched = next.take();
+  for (std::int64_t t = 100'000'000; t < 300'000'000; t += 10'000'000) {
+    const auto& a = previous.at(t);
+    const auto& b = stitched.at(t);
+    require(a.x == b.x && a.y == b.y && a.body_yaw == b.body_yaw && a.plan_id == b.plan_id,
+            "prefix before t0 differs from the trajectory already sent");
+  }
+  const auto& old_t0 = previous.at(300'000'000);
+  const auto& new_t0 = stitched.at(300'000'000);
+  require(std::abs(old_t0.x - new_t0.x) < 1.0e-12 && std::abs(old_t0.y - new_t0.y) < 1.0e-12 &&
+          std::abs(old_t0.body_yaw - new_t0.body_yaw) < 1.0e-12,
+          "new content does not start at the previous trajectory's pose at t0");
+  require(new_t0.plan_id == 2, "handover point is not labelled with the new plan");
+}
+
+void test_hold_in_new_mode_uses_that_modes_slip_angle() {
+  TrackingTrajectoryBuilder builder(0, 10'000'000);
+  builder.hold_prefix(at_rest_point(0, 0, 0.5, DriveMode::Forward), 10'000'000);
+  builder.append_hold(DriveMode::Left, ExecutionState::ModeWait, 3);
+  const auto trajectory = builder.take();
+  const auto& hold = trajectory.points.back();
+  require(hold.mode == DriveMode::Left, "hold did not carry the requested mode");
+  require(std::abs(hold.command.beta - 0.5 * kPi) < 1.0e-12, "hold kept the old mode's slip angle");
+  const auto handover = handover_from_point(hold);
+  require(std::abs(wrap_angle(handover.state.chi - (0.5 + 0.5 * kPi))) < 1.0e-12,
+          "handover motion direction does not follow the held mode");
 }
 
 void test_clearance_gate() {
@@ -207,6 +295,10 @@ int main() {
     test_split_reference_path_at_interior_corner();
     test_invalid_reference_arrays_are_rejected();
     test_rotation_follows_previous_trajectory_point_and_accepts_new_return_mode();
+    test_tracking_index_is_floor_and_holds_last_point();
+    test_stop_tail_integrates_pose_and_ends_at_rest();
+    test_copy_prefix_repeats_previous_points_and_continues_pose();
+    test_hold_in_new_mode_uses_that_modes_slip_angle();
     test_clearance_gate();
     std::cout << "all spot-turn integration tests passed\n";
   } catch (const std::exception& error) {

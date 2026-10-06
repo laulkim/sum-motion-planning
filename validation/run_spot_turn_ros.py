@@ -107,6 +107,7 @@ def main() -> int:
             "scenario": "spot_turn_course", "target_speed": args.speed,
             "costmap_resolution": 0.1, "costmap_size_m": 60.0, "costmap_publish_hz": 5.0}),
         ("simp_planner_cpp", "planner_node_cpp", {}),
+        ("simp_controller", "tracking_controller_node", {}),
     ]
     processes, logs = [], []
     started = time.monotonic()
