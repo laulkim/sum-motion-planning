@@ -151,6 +151,11 @@ struct PlannerAction {
   double motion_heading_acceleration{0.0};
 };
 
+// Exact planar motion for constant longitudinal jerk and curvature over one interval.
+// Stops at the first zero of speed; never integrates backwards after braking.
+PlannerState integrate_motion(const PlannerState& state, double jerk,
+                              double curvature, double duration);
+
 struct AllocatorInitialState {
   double beta{0.0};
   double beta_rate{0.0};
@@ -209,7 +214,7 @@ struct LateralPathConfig {
 
 struct LongitudinalConfig {
   double horizon{4.0};
-  double dt{0.1};
+  double dt{0.01};
   double execution_dt{0.01};
   double speed_time_constant{1.6};
   double acceleration_response_time{0.9};

@@ -8,6 +8,7 @@
 #include <geometry_msgs/msg/twist.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <simp_planner_msgs/msg/tracking_trajectory.hpp>
+#include <simp_planner_msgs/msg/tracking_control.hpp>
 
 namespace simp_tracker {
 using Trajectory = simp_planner_msgs::msg::TrackingTrajectory;
@@ -19,12 +20,12 @@ struct Gains { double kx{3.0}, ky{4.0}, ktheta{2.0}; };
 struct Error { double ex, ey, etheta; };
 struct Inputs {
   Trajectory::ConstSharedPtr trajectory;
-  std::optional<Pose> pose;
-  std::string odom_frame;
+  nav_msgs::msg::Odometry::ConstSharedPtr odom;
 };
 struct Control {
   geometry_msgs::msg::Twist velocity;
   std::optional<std::uint8_t> requested_mode;
+  simp_planner_msgs::msg::TrackingControl diagnostic;
 };
 
 inline double wrap_angle(double angle) {
@@ -79,7 +80,8 @@ inline geometry_msgs::msg::Twist lyapunov_control(const Point& reference,
 }
 
 inline Control control_cycle(const Inputs& snapshot, std::int64_t now_ns,
-                             const Gains& gains) {
+                             const Gains& gains, double max_prediction_sec = 0.05,
+                             const std::string& base_frame = "base_link") {
   Control output;  // 매 cycle의 기본 출력은 zero command다.
   if (!snapshot.trajectory) return output;
   const auto index = reference_index(*snapshot.trajectory, now_ns);
@@ -90,17 +92,61 @@ inline Control control_cycle(const Inputs& snapshot, std::int64_t now_ns,
   }
   const auto& reference = snapshot.trajectory->points[*index];
   output.requested_mode = reference.requested_mode;
-  if (!snapshot.pose) return output;
+  if (!snapshot.odom) return output;
+  const auto& odom = *snapshot.odom;
   // 비어 있는 frame도 허용하지 않는다. 모드 전달은 기존 정책을 유지한다.
-  if (snapshot.odom_frame.empty() ||
-      snapshot.trajectory->header.frame_id != snapshot.odom_frame) return output;
-  const auto& pose = *snapshot.pose;
-  if (!std::isfinite(pose.x) || !std::isfinite(pose.y) || !std::isfinite(pose.yaw) ||
+  if (odom.header.frame_id.empty() ||
+      snapshot.trajectory->header.frame_id != odom.header.frame_id ||
+      base_frame.empty() || odom.child_frame_id != base_frame) return output;
+  auto pose = odom_pose(odom);
+  const auto& velocity = odom.twist.twist;
+  if (!pose || !std::isfinite(velocity.linear.x) || !std::isfinite(velocity.linear.y) ||
+      !std::isfinite(velocity.angular.z) ||
       !std::isfinite(gains.kx) || !std::isfinite(gains.ky) || !std::isfinite(gains.ktheta) ||
       gains.kx <= 0.0 || gains.ky <= 0.0 || gains.ktheta <= 0.0) return output;
-  const auto command = lyapunov_control(reference, tracking_error(reference, pose), gains);
+  const auto& stamp = odom.header.stamp;
+  if (stamp.sec < 0 || stamp.nanosec >= 1000000000 ||
+      !std::isfinite(max_prediction_sec) || max_prediction_sec <= 0.0) return output;
+  const auto odom_ns = std::int64_t(stamp.sec) * 1000000000 + stamp.nanosec;
+  if (odom_ns > now_ns) return output;
+  const auto& trajectory = *snapshot.trajectory;
+  const auto start_ns = std::int64_t(trajectory.header.stamp.sec) * 1000000000 +
+                        trajectory.header.stamp.nanosec;
+  const auto period_ns = std::uint64_t(trajectory.sample_period.sec) * 1000000000 +
+                         trajectory.sample_period.nanosec;
+  // ceil로 선택한 점까지 남은 시간. index * period의 overflow 없이 계산한다.
+  const auto elapsed_ns = std::uint64_t(now_ns) - std::uint64_t(start_ns);
+  const auto ahead_ns = (period_ns - elapsed_ns % period_ns) % period_ns;
+  const auto prediction_ns = std::uint64_t(now_ns - odom_ns) + ahead_ns;
+  if (prediction_ns > max_prediction_sec * 1.0e9) return output;
+  const double dt = prediction_ns * 1.0e-9;
+  // ponytail: 짧은 구간의 실측 body 속도를 유지한다. 전환 오차가 크면 속도 모델을 보강한다.
+  const double yaw_mid = pose->yaw + 0.5 * velocity.angular.z * dt;
+  const double c = std::cos(yaw_mid), s = std::sin(yaw_mid);
+  pose->x += (c * velocity.linear.x - s * velocity.linear.y) * dt;
+  pose->y += (s * velocity.linear.x + c * velocity.linear.y) * dt;
+  pose->yaw = wrap_angle(pose->yaw + velocity.angular.z * dt);
+  const auto error = tracking_error(reference, *pose);
+  const auto command = lyapunov_control(reference, error, gains);
   if (std::isfinite(command.linear.x) && std::isfinite(command.linear.y) &&
-      std::isfinite(command.angular.z)) output.velocity = command;
+      std::isfinite(command.angular.z)) {
+    output.velocity = command;
+    auto& diagnostic = output.diagnostic;
+    diagnostic.valid = true;
+    diagnostic.header.frame_id = trajectory.header.frame_id;
+    diagnostic.odom_stamp = odom.header.stamp;
+    const auto reference_ns = std::uint64_t(odom_ns) + prediction_ns;
+    diagnostic.reference_stamp.sec = reference_ns / 1000000000;
+    diagnostic.reference_stamp.nanosec = reference_ns % 1000000000;
+    diagnostic.reference = reference;
+    diagnostic.predicted_x = pose->x;
+    diagnostic.predicted_y = pose->y;
+    diagnostic.predicted_yaw = pose->yaw;
+    diagnostic.ex = error.ex;
+    diagnostic.ey = error.ey;
+    diagnostic.etheta = error.etheta;
+    diagnostic.measured_velocity = velocity;
+  }
   return output;
 }
 }  // namespace simp_tracker

@@ -123,7 +123,7 @@ Spatial 후보를 비용순으로 정렬하고 shortlist batch마다
 `generate_open_loop_trajectory()`를 실행한다.
 
 - 기본 horizon 4.0초
-- trajectory knot 0.1초
+- trajectory knot 0.01초 (4초 horizon에서 401점, 구간별 일정 jerk·곡률 해석해)
 - 동역학 검증 substep 0.01초
 - 검사: 속도, 가속도, jerk, heading/lateral 동역학, curvature, terminal 정지
 

@@ -16,10 +16,10 @@ planar simulator, scenario 도구의 기본 파라미터를 한곳에 정리한�
 | 항목 | 현재값 | 산출 근거 |
 |---|---:|---|
 | 시간 Trajectory horizon | 4.0 s | `LongitudinalConfig::horizon` |
-| Trajectory knot 간격 | 0.10 s | ROS `trajectory_knot_dt_sec`가 내부 `dt`를 덮어씀 |
-| Trajectory 구성 | 40 interval / 41 sample | `round(4.0 / 0.1) + 1` |
+| Trajectory knot 간격 | 0.01 s | ROS `trajectory_knot_dt_sec`가 내부 `dt`를 덮어씀 |
+| Trajectory 구성 | 400 interval / 401 sample | `round(4.0 / 0.01) + 1` |
 | 실행 명령 간격 | 0.01 s | `command_frequency_hz=100 Hz` |
-| knot 사이 동적 검사 | 기본 10 substep | `0.10 / 0.01` |
+| knot 사이 동적 검사 | 기본 1 substep | `0.01 / 0.01`, knot 간 변화도 검사 |
 | 횡방향 목표 | -8.0~+8.0 m, 0.25 m 간격 | 총 65개 |
 | 신규 횡 transition 길이 | 3.0~50.0 m | 속도·offset·곡률에 따라 동적 결정; 기존 maneuver 재계획 시 남은 길이는 0.10 m까지 가능 |
 | 공간 경로 sampling | 0.25 m | `spatial_ds` |
@@ -149,7 +149,7 @@ max(1.35 × preview + preview_extra,
 | 파라미터 | 기본값 | 단위 | 상태 및 의미 |
 |---|---:|---:|---|
 | `horizon` | 4.0 | s | 활성, 시간 Trajectory 길이 |
-| `dt` | 0.10 | s | 활성/ROS override, knot 간격 |
+| `dt` | 0.01 | s | 활성/ROS override, knot 간격 |
 | `execution_dt` | 0.01 | s | 활성/ROS derived, knot 내부 검사·실행 간격 |
 | `speed_time_constant` | 1.6 | s | 활성, 속도 오차→목표가속도 응답 |
 | `acceleration_response_time` | 0.9 | s | 활성, 목표가속도→jerk 응답 |
@@ -397,7 +397,7 @@ Left/Right 값은 모든 profile에서 기본값을 유지한다. Left/Right cra
 | `planning_handover_max_lead_sec` | 0.60 | s | handover lead 상한 |
 | `planning_handover_margin_sec` | 0.03 | s | compute estimate margin |
 | `planning_handover_scale` | 1.20 | ratio | P95 compute time 배율 |
-| `trajectory_knot_dt_sec` | 0.10 | s | `longitudinal.dt` override |
+| `trajectory_knot_dt_sec` | 0.01 | s | `longitudinal.dt` override |
 | `command_frequency_hz` | 100.0 | Hz | command timer; `command_dt=0.01 s` |
 | `planning_scheduler_frequency_hz` | 100.0 | Hz | scheduler polling; 0.01 s |
 | `costmap_update_period_sec` | 0.20 | s | costmap crop의 캡처 간 이동 버퍼; simulation launch는 `1/costmap_publish_hz`를 자동 전달 |

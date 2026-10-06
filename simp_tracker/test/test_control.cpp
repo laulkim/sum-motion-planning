@@ -14,9 +14,19 @@ void near(double actual, double expected) {
   require(std::isfinite(actual) && std::abs(actual - expected) < 1e-10, "numeric mismatch");
 }
 void zero(const Control& output) {
+  require(!output.diagnostic.valid, "invalid control must not report a tracking error");
   near(output.velocity.linear.x, 0.0);
   near(output.velocity.linear.y, 0.0);
   near(output.velocity.angular.z, 0.0);
+}
+
+nav_msgs::msg::Odometry::SharedPtr make_odom() {
+  auto odom = std::make_shared<nav_msgs::msg::Odometry>();
+  odom->header.stamp.sec = 1;
+  odom->header.frame_id = "odom";
+  odom->child_frame_id = "base_link";
+  odom->pose.pose.orientation.w = 1.0;
+  return odom;
 }
 
 int main() {
@@ -64,7 +74,7 @@ int main() {
     require(reference_index(*a, 1300000000) == 30, "last point must be usable");
     require(!reference_index(*a, 1300000001), "expired trajectory accepted");
 
-    Inputs latest{a, Pose{0.0, 0.0, 0.0}, "odom"};
+    Inputs latest{a, make_odom()};
     std::mutex mutex;
     Inputs snapshot;
     {
@@ -87,22 +97,28 @@ int main() {
     near(next_cycle.velocity.linear.x, 99.0);
     require(next_cycle.requested_mode == 3, "next cycle must use B");
     auto wrong_frame = latest;
-    wrong_frame.odom_frame = "map";
+    auto frame_odom = make_odom();
+    wrong_frame.odom = frame_odom;
+    frame_odom->header.frame_id = "map";
     const auto mismatch = control_cycle(wrong_frame, 1000000001, Gains{});
     zero(mismatch);
     require(mismatch.requested_mode == 3, "frame check must not change mode relay");
-    wrong_frame.odom_frame.clear();
+    frame_odom->header.frame_id.clear();
     zero(control_cycle(wrong_frame, 1000000001, Gains{}));
     auto empty_frame = std::make_shared<Trajectory>(*b);
     empty_frame->header.frame_id.clear();
     wrong_frame.trajectory = empty_frame;
     zero(control_cycle(wrong_frame, 1000000001, Gains{})); // 둘 다 빈 frame
-    wrong_frame.odom_frame = "odom";
+    frame_odom->header.frame_id = "odom";
     zero(control_cycle(wrong_frame, 1000000001, Gains{})); // trajectory만 빈 frame
+    wrong_frame.trajectory = b;
+    frame_odom->child_frame_id = "sensor";
+    zero(control_cycle(wrong_frame, 1000000001, Gains{}));
+    near(control_cycle(wrong_frame, 1000000001, Gains{}, 0.05, "sensor").velocity.linear.x, 99.0);
     zero(control_cycle(latest, 1300000001, Gains{}));
     zero(control_cycle(latest, 999999999, Gains{}));
     zero(control_cycle(Inputs{}, 1000000000, Gains{}));
-    zero(control_cycle(Inputs{a, std::nullopt, "odom"}, 1010000000, Gains{}));
+    zero(control_cycle(Inputs{a, nullptr}, 1010000000, Gains{}));
 
     auto invalid = std::make_shared<Trajectory>(*a);
     latest.trajectory = invalid;
@@ -121,10 +137,80 @@ int main() {
     invalid->points.clear();
     zero(control_cycle(latest, 1000000000, Gains{}));
     latest.trajectory = a;
-    latest.pose = Pose{std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0};
+    auto bad_odom = make_odom();
+    latest.odom = bad_odom;
+    bad_odom->pose.pose.position.x = std::numeric_limits<double>::quiet_NaN();
     zero(control_cycle(latest, 1010000000, Gains{}));
-    latest.pose = Pose{-std::numeric_limits<double>::max(), 0.0, 0.0};
+    bad_odom->pose.pose.position.x = -std::numeric_limits<double>::max();
     zero(control_cycle(latest, 1010000000, Gains{})); // 유한 입력의 계산 overflow
+
+    // now=1.014여도 선택한 점은 1.020: 전진/후진/횡이동의 가짜 오차가 없어야 한다.
+    auto moving = make_odom();
+    auto aligned = std::make_shared<Trajectory>(*a);
+    Inputs prediction{aligned, moving};
+    auto& target = aligned->points[2];
+    for (const double vx : {-2.0, 0.0, 2.0}) {
+      moving->twist.twist.linear.x = target.vx = vx;
+      moving->twist.twist.linear.y = target.vy = 0.5;
+      target.x = vx * 0.02;
+      target.y = 0.01;
+      const auto output = control_cycle(prediction, 1014000000, Gains{});
+      require(output.diagnostic.valid, "missing control snapshot");
+      require(output.diagnostic.reference_stamp.sec == 1 &&
+              output.diagnostic.reference_stamp.nanosec == 20000000, "reference timestamp");
+      near(output.diagnostic.predicted_x, target.x);
+      near(output.diagnostic.predicted_y, target.y);
+      near(output.diagnostic.ex, 0.0);
+      near(output.diagnostic.ey, 0.0);
+      near(output.diagnostic.etheta, 0.0);
+      near(output.velocity.linear.x, vx);
+      near(output.velocity.linear.y, 0.5);
+      near(output.velocity.angular.z, 0.0);
+    }
+    // 중간 방향이 pi/2인 회전+횡이동, 그리고 pi 경계를 지나는 회전.
+    moving->twist.twist.angular.z = target.yaw_rate = 1.0;
+    for (const double mid_yaw : {kPi / 2, kPi}) {
+      moving->pose.pose.orientation.z = std::sin((mid_yaw - 0.01) / 2);
+      moving->pose.pose.orientation.w = std::cos((mid_yaw - 0.01) / 2);
+      target.x = mid_yaw == kPi ? -0.04 : -0.01;
+      target.y = mid_yaw == kPi ? -0.01 : 0.04;
+      target.body_yaw = wrap_angle(mid_yaw + 0.01);
+      for (int repeat = 0; repeat < 2; ++repeat) {
+        const auto output = control_cycle(prediction, 1014000000, Gains{});
+        near(output.diagnostic.predicted_yaw, target.body_yaw);
+        near(output.diagnostic.ex, 0.0);
+        near(output.diagnostic.ey, 0.0);
+        near(output.diagnostic.etheta, 0.0);
+        near(output.velocity.linear.x, 2.0);
+        near(output.velocity.linear.y, 0.5);
+        near(output.velocity.angular.z, 1.0);
+      }
+      near(moving->pose.pose.position.x, 0.0); // 예측을 odom 원본에 누적하지 않는다.
+    }
+    near(control_cycle(prediction, 1014000000, Gains{}, 0.02).velocity.linear.x, 2.0);
+    const auto too_far = control_cycle(prediction, 1014000000, Gains{}, 0.019);
+    zero(too_far); // now까지는 14ms지만 선택한 점까지는 20ms다.
+    require(too_far.requested_mode == target.requested_mode, "prediction limit changed mode relay");
+    zero(control_cycle(prediction, 1060000000, Gains{})); // stale odom, valid trajectory
+    for (const double limit : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN(),
+                               std::numeric_limits<double>::infinity()}) {
+      zero(control_cycle(prediction, 1014000000, Gains{}, limit));
+    }
+    moving->header.stamp.nanosec = 14000001;
+    zero(control_cycle(prediction, 1014000000, Gains{})); // future odom, before reference
+    moving->header.stamp.nanosec = 1000000000;
+    zero(control_cycle(prediction, 1014000000, Gains{}));
+    moving->header.stamp.nanosec = 0;
+    moving->header.stamp.sec = -1;
+    zero(control_cycle(prediction, 1014000000, Gains{}));
+    moving->header.stamp.sec = 1;
+    for (double* component : {&moving->twist.twist.linear.x, &moving->twist.twist.linear.y,
+                              &moving->twist.twist.angular.z}) {
+      const double saved = *component;
+      *component = std::numeric_limits<double>::quiet_NaN();
+      zero(control_cycle(prediction, 1014000000, Gains{}));
+      *component = saved;
+    }
 
     nav_msgs::msg::Odometry odom;
     odom.pose.pose.orientation.w = 0.0;
@@ -134,7 +220,7 @@ int main() {
     near(odom_pose(odom)->yaw, kPi / 2);
     odom.pose.pose.orientation.w = std::numeric_limits<double>::infinity();
     require(!odom_pose(odom), "nonfinite quaternion accepted");
-    std::cout << "tracker control: equations, yaw wrap, ceil, snapshot and safety passed\n";
+    std::cout << "tracker control: equations, midpoint prediction, ceil, snapshot and safety passed\n";
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;

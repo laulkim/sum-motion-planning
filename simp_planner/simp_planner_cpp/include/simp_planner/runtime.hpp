@@ -142,7 +142,7 @@ class JerkLimitedSafetyStop {
                                              double deceleration_limit,
                                              double jerk_limit);
   bool stopped() const;
-  BodyCommand sample() const;
+  BodyCommand sample(double dt = 0.01) const;
   void advance(double dt);
   BodyCommand sample_and_advance(double dt);
 

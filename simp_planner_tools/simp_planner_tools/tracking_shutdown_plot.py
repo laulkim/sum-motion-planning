@@ -14,56 +14,44 @@ import numpy as np
 
 
 COLUMNS = (
-    "time_s", "x", "y", "yaw", "xr", "yr", "yaw_r", "ex", "ey", "etheta",
+    "time_s", "predicted_x", "predicted_y", "predicted_yaw", "xr", "yr", "yaw_r", "ex", "ey", "etheta",
     "vx", "vy", "omega", "vx_ref", "vy_ref", "omega_ref", "vx_cmd", "vy_cmd", "omega_cmd",
+    "control_stamp_ns", "odom_stamp_ns", "reference_stamp_ns", "valid",
 )
 
 
-def reference_at(trajectory, stamp_ns, frame):
-    if trajectory is None or not frame or trajectory.header.frame_id != frame:
-        return None
-    period = trajectory.sample_period
-    if period.sec < 0 or period.nanosec >= 1000000000:
-        return None
-    dt = period.sec * 1000000000 + period.nanosec
-    stamp = trajectory.header.stamp
-    elapsed = stamp_ns - (stamp.sec * 1000000000 + stamp.nanosec)
-    if dt <= 0 or elapsed < 0:
-        return None
-    index = elapsed // dt + (elapsed % dt != 0)
-    return trajectory.points[index] if index < len(trajectory.points) else None
+def stamp_ns(stamp):
+    return stamp.sec * 1000000000 + stamp.nanosec
 
 
-def sample_row(odom, trajectory, command, origin_ns):
-    stamp = odom.header.stamp
-    stamp_ns = stamp.sec * 1000000000 + stamp.nanosec
-    pose = odom.pose.pose
-    q = pose.orientation
-    yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
-    x, y = pose.position.x, pose.position.y
-    reference = reference_at(trajectory, stamp_ns, odom.header.frame_id)
-    xr, yr, yaw_r, ex, ey, etheta, vxr, vyr, wr = [math.nan] * 9
-    if reference is not None:
-        xr, yr, yaw_r = reference.x, reference.y, reference.body_yaw
-        dx, dy = xr - x, yr - y
-        ex = math.cos(yaw) * dx + math.sin(yaw) * dy
-        ey = -math.sin(yaw) * dx + math.cos(yaw) * dy
-        etheta = math.remainder(yaw_r - yaw, 2 * math.pi)
-        vxr, vyr, wr = reference.vx, reference.vy, reference.yaw_rate
-    velocity = odom.twist.twist
-    cmd = (command.linear.x, command.linear.y, command.angular.z) if command else (math.nan,) * 3
-    return ((stamp_ns - origin_ns) * 1e-9, x, y, yaw, xr, yr, yaw_r, ex, ey, etheta,
-            velocity.linear.x, velocity.linear.y, velocity.angular.z, vxr, vyr, wr, *cmd)
+def sample_row(message, origin_ns):
+    # The controller owns prediction, reference selection and error calculation.
+    state = [math.nan] * 15
+    if message.valid:
+        reference = message.reference
+        velocity = message.measured_velocity
+        state = [message.predicted_x, message.predicted_y, message.predicted_yaw,
+                 reference.x, reference.y, reference.body_yaw,
+                 message.ex, message.ey, message.etheta,
+                 velocity.linear.x, velocity.linear.y, velocity.angular.z,
+                 reference.vx, reference.vy, reference.yaw_rate]
+    command = message.command
+    return ((stamp_ns(message.header.stamp) - origin_ns) * 1e-9, *state,
+            command.linear.x, command.linear.y, command.angular.z,
+            stamp_ns(message.header.stamp),
+            stamp_ns(message.odom_stamp) if message.valid else math.nan,
+            stamp_ns(message.reference_stamp) if message.valid else math.nan, int(message.valid))
 
 
-def create_figures(data):
+def create_figures(data, predicted=True):
     import matplotlib.pyplot as plt
 
     data = np.atleast_2d(data)
     time = data[:, 0]
     errors, axes = plt.subplots(3, 1, sharex=True, figsize=(11, 8), layout="constrained")
     errors.canvas.manager.set_window_title("Tracking errors")
-    errors.suptitle("Body-frame tracking errors (reference selected at odometry timestamp)")
+    errors.suptitle("Controller errors (predicted odometry at selected reference time)" if predicted
+                    else "Body-frame tracking errors (reference selected at odometry timestamp)")
     for ax, column, label, scale in zip(axes, (7, 8, 9), ("ex [m]", "ey [m]", "yaw error [deg]"), (1, 1, 180 / math.pi)):
         ax.plot(time, data[:, column] * scale)
         ax.axhline(0, color="black", linewidth=0.6)
@@ -73,14 +61,15 @@ def create_figures(data):
 
     states, axes = plt.subplots(3, 2, sharex=True, figsize=(14, 9), layout="constrained")
     states.canvas.manager.set_window_title("Vehicle states and control inputs")
-    states.suptitle("Vehicle states and body-frame velocity commands")
+    states.suptitle("Controller snapshot: predicted pose and body-frame velocities" if predicted
+                    else "Vehicle states and body-frame velocity commands")
     for i, (state_label, input_label) in enumerate(zip(("x [m]", "y [m]", "yaw [deg]"), ("vx [m/s]", "vy [m/s]", "omega [deg/s]"))):
         scale = 180 / math.pi if i == 2 else 1
-        axes[i, 0].plot(time, data[:, 1 + i] * scale, label="actual")
+        axes[i, 0].plot(time, data[:, 1 + i] * scale, label="predicted" if predicted else "actual")
         axes[i, 0].plot(time, data[:, 4 + i] * scale, "--", label="reference")
         axes[i, 0].set_ylabel(state_label)
         axes[i, 1].plot(time, data[:, 16 + i] * scale, label="command")
-        axes[i, 1].plot(time, data[:, 10 + i] * scale, label="actual", alpha=0.7)
+        axes[i, 1].plot(time, data[:, 10 + i] * scale, label="measured at odom time" if predicted else "actual", alpha=0.7)
         axes[i, 1].plot(time, data[:, 13 + i] * scale, "--", label="reference")
         axes[i, 1].set_ylabel(input_label)
         for ax in axes[i]:
@@ -98,7 +87,9 @@ def show_recording(path):
     matplotlib.use("TkAgg" if interactive else "Agg")
     import matplotlib.pyplot as plt
 
-    figures = create_figures(np.loadtxt(path, delimiter=",", skiprows=1))
+    with path.open() as file:
+        predicted = "predicted_x" in next(csv.reader(file))
+    figures = create_figures(np.loadtxt(path, delimiter=",", skiprows=1), predicted=predicted)
     for figure, name in zip(figures, ("tracking_errors.png", "tracking_states_inputs.png")):
         figure.savefig(path.parent / name, dpi=140)
     if interactive:
@@ -115,9 +106,7 @@ def main(args=None):
     from rclpy.executors import ExternalShutdownException
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
-    from geometry_msgs.msg import Twist
-    from nav_msgs.msg import Odometry
-    from simp_planner_msgs.msg import TrackingTrajectory
+    from simp_planner_msgs.msg import TrackingControl
 
     rclpy.init(args=args)
     node = Node("tracking_shutdown_plot")
@@ -128,30 +117,17 @@ def main(args=None):
     file = path.open("w", newline="")
     writer = csv.writer(file)
     writer.writerow(COLUMNS)
-    trajectory, command, origin_ns = None, None, None
+    origin_ns = None
     count = 0
 
-    def receive_trajectory(message):
-        nonlocal trajectory
-        stamp = message.header.stamp
-        if trajectory is None or (stamp.sec, stamp.nanosec) > (
-                trajectory.header.stamp.sec, trajectory.header.stamp.nanosec):
-            trajectory = message
-
-    def receive_command(message):
-        nonlocal command
-        command = message
-
-    def receive_odom(message):
+    def receive_control(message):
         nonlocal origin_ns, count
         if origin_ns is None:
-            origin_ns = message.header.stamp.sec * 1000000000 + message.header.stamp.nanosec
-        writer.writerow(sample_row(message, trajectory, command, origin_ns))
+            origin_ns = stamp_ns(message.header.stamp)
+        writer.writerow(sample_row(message, origin_ns))
         count += 1
 
-    node.create_subscription(TrackingTrajectory, "/planner/tracking_trajectory", receive_trajectory, 1)
-    node.create_subscription(Twist, "/cmd_vel", receive_command, 10)
-    node.create_subscription(Odometry, "/odom", receive_odom, qos_profile_sensor_data)
+    node.create_subscription(TrackingControl, "/tracker/control", receive_control, qos_profile_sensor_data)
     node.get_logger().info(f"Ctrl+C 후 추종 플롯 표시 / 기록: {path}")
     try:
         rclpy.spin(node)

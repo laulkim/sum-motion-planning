@@ -87,35 +87,16 @@ const char* drive_mode_control_state_name(DriveModeControlState state) {
 }
 namespace {
 
-double wrap_interpolate(double angle0, double angle1, double alpha) {
-  return wrap_angle(angle0 + alpha * wrap_angle(angle1 - angle0));
-}
-
-std::optional<double> positive_velocity_root(double speed, double acceleration,
-                                             double jerk, double dt) {
-  std::vector<double> roots;
-  if (std::abs(jerk) < 1.0e-12) {
-    if (acceleration < -1.0e-12) roots.push_back(-speed / acceleration);
-  } else {
-    const double discriminant = acceleration * acceleration - 2.0 * jerk * speed;
-    if (discriminant >= 0.0) {
-      const double root = std::sqrt(discriminant);
-      roots.push_back((-acceleration + root) / jerk);
-      roots.push_back((-acceleration - root) / jerk);
-    }
-  }
-  std::optional<double> result;
-  for (double value : roots) {
-    if (value >= 0.0 && value <= dt + 1.0e-12 && (!result || value < *result)) result = value;
-  }
-  return result;
-}
-
 void validate_allocation(const AllocationResult& allocation,
                          const std::vector<PlannerAction>& actions) {
   const auto n = allocation.trajectory.t.size();
   if (n < 2 || allocation.vx.size() != n || allocation.vy.size() != n ||
-      allocation.yaw_rate.size() != n || actions.empty()) {
+      allocation.yaw_rate.size() != n || allocation.beta.size() != n ||
+      allocation.beta_rate.size() != n || allocation.trajectory.x.size() != n ||
+      allocation.trajectory.y.size() != n || allocation.trajectory.chi.size() != n ||
+      allocation.trajectory.speed.size() != n || allocation.trajectory.acceleration.size() != n ||
+      allocation.trajectory.kappa.size() != n ||
+      allocation.trajectory.motion_heading_rate.size() != n || actions.empty()) {
     throw std::invalid_argument("invalid allocated trajectory");
   }
 }
@@ -126,65 +107,53 @@ BodyCommand sample_body_command(const AllocationResult& allocation,
                                 const std::vector<PlannerAction>& planned_actions,
                                 double trajectory_time, double execution_dt) {
   validate_allocation(allocation, planned_actions);
-  if (!std::isfinite(trajectory_time)) throw std::invalid_argument("non-finite trajectory time");
+  if (!std::isfinite(trajectory_time) || !std::isfinite(execution_dt) || execution_dt < 0.0)
+    throw std::invalid_argument("invalid trajectory sample time");
   const auto& tr = allocation.trajectory;
   const auto& t = tr.t;
-  const double elapsed = std::clamp(trajectory_time, t.front(), t.back());
-  std::size_t interval = 0;
-  double tau = 0.0;
-  if (elapsed >= t.back()) {
-    interval = t.size() - 2;
-    tau = t.back() - t[interval];
-  } else {
-    auto upper = std::upper_bound(t.begin(), t.end(), elapsed);
-    interval = upper == t.begin() ? 0 : static_cast<std::size_t>(upper - t.begin() - 1);
-    interval = std::min(interval, t.size() - 2);
-    tau = elapsed - t[interval];
-  }
-  const double dt = t[interval + 1] - t[interval];
-  const double alpha = dt <= 0.0 ? 0.0 : std::clamp(tau / dt, 0.0, 1.0);
-  const std::size_t action_index = std::min(interval, planned_actions.size() - 1);
-  double jerk = planned_actions[action_index].longitudinal_jerk;
-  double heading_acceleration = planned_actions[action_index].motion_heading_acceleration;
-  const auto stop_time = positive_velocity_root(tr.speed[interval], tr.acceleration[interval], jerk, dt);
-  const bool interval_ends_stopped = tr.speed[interval + 1] <= 1.0e-12;
-  const bool stopped = interval_ends_stopped &&
-      ((tr.speed[interval] <= 1.0e-12 && tr.acceleration[interval] <= 0.0) ||
-       (stop_time && tau >= *stop_time - 1.0e-12));
-  double speed;
-  double acceleration;
-  if (stopped) {
-    speed = 0.0;
-    acceleration = 0.0;
-    jerk = 0.0;
-    heading_acceleration = 0.0;
-  } else {
-    speed = tr.speed[interval] + tr.acceleration[interval] * tau + 0.5 * jerk * tau * tau;
-    acceleration = tr.acceleration[interval] + jerk * tau;
-  }
-  const double beta_rate = stopped ? 0.0 : allocation.beta_rate[interval];
-  const double beta = allocation.beta[interval] + beta_rate * tau;
-  const double kappa = (1.0 - alpha) * tr.kappa[interval] + alpha * tr.kappa[interval + 1];
-  const double motion_heading = wrap_interpolate(tr.chi[interval], tr.chi[interval + 1], alpha);
-  const double motion_heading_rate = speed * kappa;
-  const double yaw_rate = motion_heading_rate - beta_rate;
-  const double yaw_acceleration = stopped ? 0.0 :
-      (1.0 - alpha) * allocation.yaw_acceleration[interval] +
-      alpha * allocation.yaw_acceleration[interval + 1];
-  const double vx = speed * std::cos(beta);
-  const double vy = speed * std::sin(beta);
-  const double start_x = (1.0 - alpha) * tr.x[interval] + alpha * tr.x[interval + 1];
-  const double start_y = (1.0 - alpha) * tr.y[interval] + alpha * tr.y[interval + 1];
-  const double next_elapsed = std::min(elapsed + execution_dt, t.back());
-  const double next_alpha = dt <= 0.0 ? 0.0 :
-      std::clamp((next_elapsed - t[interval]) / dt, 0.0, 1.0);
-  const double end_x = (1.0 - next_alpha) * tr.x[interval] + next_alpha * tr.x[interval + 1];
-  const double end_y = (1.0 - next_alpha) * tr.y[interval] + next_alpha * tr.y[interval + 1];
-  const double end_heading = wrap_interpolate(tr.chi[interval], tr.chi[interval + 1], next_alpha);
-  return {vx, vy, yaw_rate, speed, acceleration, jerk, heading_acceleration,
-          motion_heading, kappa, motion_heading_rate, beta, beta_rate,
-          yaw_acceleration, start_x, start_y, motion_heading, end_x, end_y,
-          end_heading, interval, interval, action_index, elapsed};
+  auto sample = [&](double query) {
+    const double elapsed = std::clamp(query, t.front(), t.back());
+    const auto upper = std::upper_bound(t.begin(), t.end(), elapsed);
+    const auto interval = std::min(static_cast<std::size_t>(upper - t.begin() - 1), t.size() - 2);
+    const double tau = elapsed - t[interval];
+    const auto action_index = std::min(interval, planned_actions.size() - 1);
+    const double jerk = planned_actions[action_index].longitudinal_jerk;
+    const double curvature = tr.kappa[interval];
+    const PlannerState initial{tr.x[interval], tr.y[interval], tr.chi[interval],
+        tr.speed[interval], tr.acceleration[interval], tr.motion_heading_rate[interval]};
+    const auto state = integrate_motion(initial, jerk, curvature, tau);
+    const double beta_rate = allocation.beta_rate[interval];
+    const double beta = allocation.beta[interval] + beta_rate * tau;
+    BodyCommand command;
+    command.vx = state.speed * std::cos(beta);
+    command.vy = state.speed * std::sin(beta);
+    command.yaw_rate = state.motion_heading_rate - beta_rate;
+    command.planned_speed = state.speed;
+    command.planned_acceleration = state.acceleration;
+    command.planned_jerk = state.speed == 0.0 && state.acceleration == 0.0 &&
+        (initial.speed > 0.0 || initial.acceleration < 0.0 || jerk <= 0.0) ? 0.0 : jerk;
+    command.planned_heading_acceleration = state.acceleration * curvature;
+    command.motion_heading = state.chi;
+    command.motion_curvature = curvature;
+    command.motion_heading_rate = state.motion_heading_rate;
+    command.beta = beta;
+    command.beta_rate = beta_rate;
+    command.yaw_acceleration = command.planned_heading_acceleration;
+    command.segment_start_x = state.x;
+    command.segment_start_y = state.y;
+    command.segment_start_heading = state.chi;
+    command.state_index = command.yaw_index = interval;
+    command.action_index = action_index;
+    command.trajectory_time = elapsed;
+    return command;
+  };
+  auto command = sample(trajectory_time);
+  // Resolve the end independently: one execution interval can cross a planning knot.
+  const auto end = sample(command.trajectory_time + execution_dt);
+  command.segment_end_x = end.segment_start_x;
+  command.segment_end_y = end.segment_start_y;
+  command.segment_end_heading = end.motion_heading;
+  return command;
 }
 
 std::int64_t align_time_ns(std::int64_t time_ns, double period_sec) {
@@ -216,31 +185,28 @@ PredictedHandoverState predict_handover_state(
   const double end_elapsed = std::max(0.0, 1.0e-9 *
       static_cast<double>(handover_time_ns - *plan_start_ns));
   const double trajectory_end = allocation->trajectory.t.back();
-  double x = current_state.x;
-  double y = current_state.y;
-  double body_yaw = current_body_yaw;
+  BodyCommand expected = sample_body_command(
+      *allocation, *planned_actions, std::min(end_elapsed, trajectory_end), integration_dt);
+  double x = expected.segment_start_x;
+  double y = expected.segment_start_y;
+  double body_yaw = wrap_angle(expected.motion_heading - expected.beta);
   auto integrate = [&](const BodyCommand& command, double dt) {
-    const double yaw_mid = body_yaw + 0.5 * command.yaw_rate * dt;
-    x += (std::cos(yaw_mid) * command.vx - std::sin(yaw_mid) * command.vy) * dt;
-    y += (std::sin(yaw_mid) * command.vx + std::cos(yaw_mid) * command.vy) * dt;
-    body_yaw = wrap_angle(body_yaw + command.yaw_rate * dt);
+    const auto state = integrate_motion(
+        {x, y, body_yaw + command.beta, command.planned_speed, command.planned_acceleration, 0.0},
+        command.planned_jerk, command.motion_curvature, dt);
+    x = state.x;
+    y = state.y;
+    body_yaw = wrap_angle(state.chi - command.beta);
   };
-  double active_elapsed = std::min(start_elapsed, trajectory_end);
-  const double active_target = std::min(end_elapsed, trajectory_end);
-  while (active_elapsed < active_target - 1.0e-12) {
-    const double dt = std::min(integration_dt, active_target - active_elapsed);
-    integrate(sample_body_command(*allocation, *planned_actions,
-                                  active_elapsed + 0.5 * dt, integration_dt), dt);
-    active_elapsed += dt;
-  }
-  BodyCommand expected;
-  if (end_elapsed <= trajectory_end + 1.0e-12) {
-    expected = sample_body_command(*allocation, *planned_actions, end_elapsed, integration_dt);
-  } else {
+  if (end_elapsed > trajectory_end + 1.0e-12) {
     if (!(safety_deceleration_limit > 0.0) || !(safety_jerk_limit > 0.0))
       throw std::invalid_argument("invalid safety braking limits");
-    const auto final_command = sample_body_command(
-        *allocation, *planned_actions, trajectory_end, integration_dt);
+    const auto final_command = expected;
+    if (start_elapsed >= trajectory_end) {
+      x = current_state.x;
+      y = current_state.y;
+      body_yaw = current_body_yaw;
+    }
     JerkLimitedSafetyStop safety = start_elapsed >= trajectory_end
         ? JerkLimitedSafetyStop(current_state.speed, current_state.acceleration,
               final_command.beta, current_state.chi, final_command.motion_curvature,
@@ -250,7 +216,7 @@ PredictedHandoverState predict_handover_state(
     double safety_elapsed = start_elapsed >= trajectory_end ? start_elapsed : trajectory_end;
     while (safety_elapsed < end_elapsed - 1.0e-12) {
       const double dt = std::min(integration_dt, end_elapsed - safety_elapsed);
-      const auto command = safety.sample();
+      const auto command = safety.sample(dt);
       integrate(command, dt);
       safety.advance(dt);
       safety_elapsed += dt;
@@ -302,9 +268,12 @@ double JerkLimitedSafetyStop::current_jerk(double dt) const {
   return 0.0;
 }
 
-BodyCommand JerkLimitedSafetyStop::sample() const {
+BodyCommand JerkLimitedSafetyStop::sample(double dt) const {
+  if (!(dt > 0.0) || !std::isfinite(dt)) throw std::invalid_argument("invalid safety stop dt");
   const bool is_stopped = stopped();
-  const double jerk = is_stopped ? 0.0 : current_jerk(0.01);
+  const double next_acceleration = std::clamp(acceleration_ + current_jerk(dt) * dt,
+      -deceleration_limit_, std::max(acceleration_, 0.0));
+  const double jerk = is_stopped ? 0.0 : (next_acceleration - acceleration_) / dt;
   const double speed = is_stopped ? 0.0 : std::max(speed_, 0.0);
   const double acceleration = is_stopped ? 0.0 : acceleration_;
   const double heading_rate = speed * curvature_;
@@ -320,23 +289,16 @@ BodyCommand JerkLimitedSafetyStop::sample() const {
 void JerkLimitedSafetyStop::advance(double dt) {
   if (!(dt > 0.0) || !std::isfinite(dt)) throw std::invalid_argument("invalid safety stop dt");
   if (stopped()) return;
-  const double jerk = current_jerk(dt);
-  double next_acceleration = acceleration_ + jerk * dt;
-  next_acceleration = std::clamp(next_acceleration, -deceleration_limit_,
-      acceleration_ > 0.0 ? acceleration_ : 0.0);
-  const double next_speed = speed_ + acceleration_ * dt + 0.5 * jerk * dt * dt;
-  if (next_speed <= 0.0) {
-    speed_ = 0.0;
-    acceleration_ = 0.0;
-  } else {
-    speed_ = next_speed;
-    acceleration_ = next_acceleration;
-  }
+  const auto next = integrate_motion({0.0, 0.0, motion_heading_, speed_, acceleration_, 0.0},
+                                     sample(dt).planned_jerk, curvature_, dt);
+  speed_ = next.speed;
+  acceleration_ = next.acceleration;
+  motion_heading_ = next.chi;
   elapsed_ += dt;
 }
 
 BodyCommand JerkLimitedSafetyStop::sample_and_advance(double dt) {
-  auto result = sample();
+  auto result = sample(dt);
   advance(dt);
   return result;
 }

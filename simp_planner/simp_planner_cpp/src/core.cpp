@@ -1089,6 +1089,34 @@ double wrap_angle(double angle) {
   return wrapped - kPi;
 }
 
+PlannerState integrate_motion(const PlannerState& state, double jerk,
+                              double curvature, double duration) {
+  if (!std::isfinite(duration) || duration < 0.0 ||
+      !std::isfinite(state.x) || !std::isfinite(state.y) || !std::isfinite(state.chi) ||
+      !std::isfinite(state.speed) || state.speed < 0.0 ||
+      !std::isfinite(state.acceleration) || !std::isfinite(jerk) || !std::isfinite(curvature)) {
+    throw std::invalid_argument("invalid analytic motion input");
+  }
+  const auto stop = positive_velocity_root(state.speed, state.acceleration, jerk, duration);
+  const bool held = state.speed == 0.0 &&
+      (state.acceleration < 0.0 || (state.acceleration == 0.0 && jerk <= 0.0));
+  const double tau = held ? 0.0 : (stop ? std::min(*stop, duration) : duration);
+  const double distance = jerk_integrated_distance(state.speed, state.acceleration, jerk, tau);
+  const double half_turn = 0.5 * curvature * distance;
+  // Stable straight-line limit of the exact circular-arc displacement.
+  const double sinc = std::abs(half_turn) < 1.0e-6
+      ? 1.0 - half_turn * half_turn / 6.0 : std::sin(half_turn) / half_turn;
+  PlannerState result = state;
+  result.x += distance * sinc * std::cos(state.chi + half_turn);
+  result.y += distance * sinc * std::sin(state.chi + half_turn);
+  result.chi = wrap_angle(state.chi + 2.0 * half_turn);
+  result.speed = held || stop ? 0.0
+      : std::max(0.0, state.speed + state.acceleration * tau + 0.5 * jerk * tau * tau);
+  result.acceleration = held || stop ? 0.0 : state.acceleration + jerk * tau;
+  result.motion_heading_rate = result.speed * curvature;
+  return result;
+}
+
 double drive_mode_heading_offset(DriveMode mode) {
   switch (mode) {
     case DriveMode::Forward: return 0.0;
@@ -1693,7 +1721,7 @@ TimeTrajectory generate_open_loop_trajectory(
     const double remaining_s = terminal_goal_q - q_progress;
     if (terminal_mode_active
         && std::abs(remaining_s) <= tc.longitudinal_tolerance
-        && v <= std::max(lc.stop_speed_threshold, lc.terminal_capture_speed)
+        && v <= 1.0e-10
         && std::abs(a) <= tc.acceleration_tolerance) {
       for (int j = k; j <= N; ++j) {
         trajectory.states[static_cast<std::size_t>(j)] = trajectory.states[index];
@@ -1765,7 +1793,7 @@ TimeTrajectory generate_open_loop_trajectory(
       v_next = 0.0;
       a_next = 0.0;
     } else {
-      v_next = clamp_value(v_trial, c.v_min, c.v_max);
+      v_next = v_trial; // Limits are checked below; clipping would break ds/dt = v.
       distance = std::max(jerk_integrated_distance(v, a, jerk, dt), 0.0);
     }
     }  // end longitudinal_profile_timer scope
@@ -1799,10 +1827,9 @@ TimeTrajectory generate_open_loop_trajectory(
       break;
     }
     const auto sample = interpolate_path(path, l_next);
-    PlannerState next;
-    next.x = sample.x;
-    next.y = sample.y;
-    next.chi = wrap_angle(sample.psi);
+    const double curvature = interpolate_curvature(path, l_progress).kappa;
+    // ponytail: each planning interval uses constant curvature; refine dt for geometry accuracy.
+    auto next = integrate_motion(trajectory.states[index], jerk, curvature, dt);
     next.speed = v_next;
     next.acceleration = a_next;
     next.motion_heading_rate = v_next * sample.kappa;
@@ -1813,7 +1840,7 @@ TimeTrajectory generate_open_loop_trajectory(
     trajectory.speed_reference[index + 1] = trajectory.speed_reference[index];
     }  // end state_calculation_timer scope
     if (terminal_mode_active
-        && v_next <= std::max(lc.stop_speed_threshold, lc.terminal_capture_speed)
+        && v_next <= 1.0e-10
         && std::abs(terminal_goal_q - q_next) <= tc.longitudinal_tolerance
         && std::abs(a_next) <= tc.acceleration_tolerance) {
       trajectory.states[index + 1].speed = 0.0;
@@ -1862,29 +1889,17 @@ TimeTrajectory generate_open_loop_trajectory(
   for (int k = 0; k < N; ++k) {
     const auto& state = trajectory.states[static_cast<std::size_t>(k)];
     const auto& action = trajectory.actions[static_cast<std::size_t>(k)];
-    const auto stop_time = positive_velocity_root(state.speed, state.acceleration,
-                                                   action.longitudinal_jerk, dt);
+    const double curvature = trajectory_kappa[static_cast<std::size_t>(k)];
     for (int sub = 1; sub <= substep_count; ++sub) {
       const double tau = execution_dt + (dt - execution_dt) *
           static_cast<double>(sub - 1) / std::max(substep_count - 1, 1);
-      double speed = std::max(state.speed + state.acceleration * tau
-          + 0.5 * action.longitudinal_jerk * tau * tau, 0.0);
-      double acceleration = state.acceleration + action.longitudinal_jerk * tau;
-      double distance = std::max(jerk_integrated_distance(
-          state.speed, state.acceleration, action.longitudinal_jerk, tau), 0.0);
-      double progress = std::min(trajectory.progress[static_cast<std::size_t>(k)] + distance,
-                                 trajectory.progress[static_cast<std::size_t>(k + 1)]);
-      if (stop_time && tau >= *stop_time - 1.0e-12) {
-        speed = 0.0; acceleration = 0.0;
-        progress = trajectory.progress[static_cast<std::size_t>(k + 1)];
-      }
-      const auto sample = interpolate_path(path, progress);
-      const double heading_rate = speed * sample.kappa;
-      const double heading_acceleration = acceleration * sample.kappa
-          + speed * speed * sample.kappa_l;
+      const auto sampled = integrate_motion(state, action.longitudinal_jerk, curvature, tau);
+      const double speed = sampled.speed;
+      const double acceleration = sampled.acceleration;
+      const double heading_rate = sampled.motion_heading_rate;
+      const double heading_acceleration = acceleration * curvature;
       const double lateral_acceleration = speed * heading_rate;
-      const double lateral_jerk = acceleration * heading_rate
-          + speed * heading_acceleration;
+      const double lateral_jerk = 2.0 * speed * acceleration * curvature;
       constexpr double tolerance = 3.0e-2;
       speed_min_ok &= speed >= c.v_min - tolerance;
       speed_max_ok &= speed <= c.v_max + tolerance;
@@ -1893,8 +1908,16 @@ TimeTrajectory generate_open_loop_trajectory(
       heading_accel_ok &= std::abs(heading_acceleration) <= c.heading_accel_max + 0.5 * kPi / 180.0;
       lateral_accel_ok &= std::abs(lateral_acceleration) <= c.a_lat_max + tolerance;
       lateral_jerk_ok &= std::abs(lateral_jerk) <= c.lateral_jerk_max + tolerance;
-      curvature_ok &= std::abs(sample.kappa) <= c.curvature_max + 1.0e-9;
+      curvature_ok &= std::abs(curvature) <= c.curvature_max + 1.0e-9;
     }
+  }
+  // Curvature changes at knots: also bound the discrete change of the published rates.
+  for (std::size_t i = 0; i + 1 < state_count; ++i) {
+    const double rate0 = trajectory.states[i].speed * trajectory_kappa[i];
+    const double rate1 = trajectory.states[i + 1].speed * trajectory_kappa[i + 1];
+    heading_accel_ok &= std::abs((rate1 - rate0) / dt) <= c.heading_accel_max + 0.5 * kPi / 180.0;
+    lateral_jerk_ok &= std::abs((trajectory.lateral_acceleration[i + 1] -
+                               trajectory.lateral_acceleration[i]) / dt) <= c.lateral_jerk_max + 3.0e-2;
   }
   bool jerk_ok = true;
   for (const auto& action : trajectory.actions) jerk_ok &= std::abs(action.longitudinal_jerk) <= c.jerk_max + 3.0e-2;
@@ -2077,12 +2100,11 @@ PlannerMotionTrajectory build_allocator_trajectory(
   for (std::size_t i = 0; i < n; ++i) {
     motion.t[i] = static_cast<double>(i) * dt;
     const auto& state = trajectory.states[i];
+    motion.x[i] = state.x; motion.y[i] = state.y; motion.chi[i] = state.chi;
     if (selected_path) {
       const auto sample = interpolate_path(*selected_path, trajectory.progress[i]);
-      motion.x[i] = sample.x; motion.y[i] = sample.y; motion.chi[i] = sample.psi;
       motion.kappa[i] = sample.kappa; motion.kappa_s[i] = sample.kappa_l;
     } else {
-      motion.x[i] = state.x; motion.y[i] = state.y; motion.chi[i] = state.chi;
       motion.kappa[i] = state.speed > 0.10 ? state.motion_heading_rate / state.speed : 0.0;
       motion.kappa_s[i] = 0.0;
     }
@@ -3247,6 +3269,10 @@ OrientedCollisionResult check_oriented_allocation_collision(
                allocation.psi[0], allocation.trajectory.speed[0]);
     return result;
   }
+  const auto& motion = allocation.trajectory;
+  const bool analytic = motion.t.size() == n && motion.chi.size() == n &&
+      motion.acceleration.size() == n && motion.longitudinal_jerk.size() == n &&
+      motion.kappa.size() == n && allocation.beta.size() == n && allocation.beta_rate.size() == n;
   for (std::size_t i = 0; i + 1 < n; ++i) {
     const double dx = allocation.trajectory.x[i + 1] - allocation.trajectory.x[i];
     const double dy = allocation.trajectory.y[i + 1] - allocation.trajectory.y[i];
@@ -3258,6 +3284,15 @@ OrientedCollisionResult check_oriented_allocation_collision(
     const int subdivisions = std::max(1, std::max(translation_steps, yaw_steps));
     for (int j = 0; j < subdivisions; ++j) {
       const double u = static_cast<double>(j) / static_cast<double>(subdivisions);
+      if (analytic && j > 0) {
+        const double tau = u * (motion.t[i + 1] - motion.t[i]);
+        const auto state = integrate_motion(
+            {motion.x[i], motion.y[i], motion.chi[i], motion.speed[i], motion.acceleration[i], 0.0},
+            motion.longitudinal_jerk[i], motion.kappa[i], tau);
+        check_pose(state.x, state.y, state.chi - allocation.beta[i] - allocation.beta_rate[i] * tau,
+                   state.speed);
+        continue;
+      }
       check_pose(allocation.trajectory.x[i] + u * dx,
                  allocation.trajectory.y[i] + u * dy,
                  allocation.psi[i] + u * dpsi,

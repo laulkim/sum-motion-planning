@@ -136,8 +136,10 @@ void test_nominal_planning_and_allocation() {
   const auto result = planner.plan(initial, previous, command);
 
   require(result.diagnostics.status == "FEASIBLE_OPEN_LOOP", "nominal planner status");
-  require(result.trajectory.states.size() == 41, "state horizon mismatch");
-  require(result.trajectory.actions.size() == 40, "action horizon mismatch");
+  require(result.trajectory.states.size() == 401, "state horizon mismatch");
+  require(result.trajectory.actions.size() == 400, "action horizon mismatch");
+  require(std::abs(result.motion.t[1] - result.motion.t[0] - 0.01) < 1e-12,
+          "planning knots must be generated at 10ms");
   require(result.diagnostics.selected_candidate_id >= 0, "candidate selection failed");
   require(std::abs(result.diagnostics.selected_n_target) < 1e-12, "center target mismatch");
   require(result.trajectory.valid_dynamic, "nominal trajectory dynamic invalid");
@@ -196,6 +198,117 @@ void test_runtime_execution_and_handover() {
           "handover speed mismatch");
   require(simp_planner::align_time_ns(151000001, 0.01) == 160000000,
           "time alignment mismatch");
+}
+
+
+void test_analytic_motion_and_sampling() {
+  using namespace simp_planner;
+  auto near = [](double actual, double expected, const char* message) {
+    require(std::isfinite(actual) && std::abs(actual - expected) < 1e-9, message);
+  };
+  const PlannerState initial{0.0, 0.0, 0.0, 1.0, 2.0, 0.0};
+  const auto straight = integrate_motion(initial, 0.0, 0.0, 0.05);
+  near(straight.x, 0.0525, "analytic acceleration distance");
+  near(straight.speed, 1.1, "analytic acceleration speed");
+  const auto jerking = integrate_motion(initial, 3.0, 0.0, 0.05);
+  near(jerking.x, 0.0525625, "analytic jerk distance");
+  near(jerking.speed, 1.10375, "analytic jerk speed");
+  const auto stopped = integrate_motion({0.0, 0.0, 0.0, 1.0, -2.0, 0.0}, 0.0, 0.2, 1.0);
+  near(stopped.x, std::sin(0.05) / 0.2, "stop distance must end at zero velocity root");
+  near(stopped.y, (1.0 - std::cos(0.05)) / 0.2, "stopped arc position");
+  near(stopped.speed, 0.0, "stop reversed speed");
+  const auto tiny_curve = integrate_motion(initial, 0.0, 1e-12, 0.05);
+  near(tiny_curve.x, straight.x, "straight-line limit is unstable");
+
+  for (const auto mode : {DriveMode::Forward, DriveMode::Reverse, DriveMode::Left, DriveMode::Right}) {
+    PlannerMotionTrajectory motion;
+    constexpr double jerk = -0.8, curvature = 0.1, dt = 0.01;
+    const PlannerState origin{3.0, -1.0, kPi - 0.005, 1.0, 2.0, 0.1};
+    std::vector<PlannerAction> actions(20, {jerk, 0.0});
+    for (int i = 0; i <= 20; ++i) {
+      const double t = i * dt;
+      const auto state = integrate_motion(origin, jerk, curvature, t);
+      motion.t.push_back(t);
+      motion.x.push_back(state.x); motion.y.push_back(state.y); motion.chi.push_back(state.chi);
+      motion.speed.push_back(state.speed); motion.acceleration.push_back(state.acceleration);
+      motion.kappa.push_back(curvature); motion.kappa_s.push_back(0.0);
+      motion.longitudinal_jerk.push_back(jerk);
+      motion.motion_heading_rate.push_back(state.motion_heading_rate);
+      motion.motion_heading_acceleration.push_back(state.acceleration * curvature);
+      motion.drive_mode.push_back(mode);
+    }
+    const auto allocation = allocate_trajectory(motion);
+    for (double t : {0.0, 0.005, 0.014, 0.02, 0.055, 0.195, 0.2}) {
+      const auto sample = sample_body_command(allocation, actions, t, 0.017);
+      const auto exact = integrate_motion(origin, jerk, curvature, t);
+      near(sample.segment_start_x, exact.x, "runtime must preserve analytic x across knots");
+      near(sample.segment_start_y, exact.y, "runtime must preserve analytic y across knots");
+      const auto end = integrate_motion(origin, jerk, curvature, std::min(t + 0.017, 0.2));
+      near(sample.segment_end_x, end.x, "segment end did not cross planning knots");
+      near(sample.segment_end_y, end.y, "segment end analytic y");
+    }
+    for (double t : {0.005, 0.014, 0.055, 0.195}) {
+      constexpr double eps = 1e-5;
+      const auto before = sample_body_command(allocation, actions, t - eps);
+      const auto at = sample_body_command(allocation, actions, t);
+      const auto after = sample_body_command(allocation, actions, t + eps);
+      const double yaw = at.motion_heading - at.beta;
+      near((after.segment_start_x - before.segment_start_x) / (2 * eps),
+           std::cos(yaw) * at.vx - std::sin(yaw) * at.vy, "dx/dt != world vx");
+      near((after.segment_start_y - before.segment_start_y) / (2 * eps),
+           std::sin(yaw) * at.vx + std::cos(yaw) * at.vy, "dy/dt != world vy");
+      near(wrap_angle((after.motion_heading - after.beta) -
+                      (before.motion_heading - before.beta)) / (2 * eps),
+           at.yaw_rate, "d(body_yaw)/dt != yaw_rate");
+    }
+    const auto sampled = sample_body_command(allocation, actions, 0.157);
+    const auto handover = predict_handover_state(origin,
+        origin.chi - allocation.beta.front(), 0, 157000000, std::int64_t{0},
+        &allocation, &actions, 0.01, 1.0, 0.8);
+    near(handover.state.x, sampled.segment_start_x, "handover re-integrated a different x");
+    near(handover.state.y, sampled.segment_start_y, "handover re-integrated a different y");
+    near(wrap_angle(handover.body_yaw - sampled.motion_heading + sampled.beta), 0.0,
+         "handover yaw differs from tracking reference");
+  }
+
+  JerkLimitedSafetyStop safety(1.0, -0.99, 0.4, 0.3, 0.1, 1.0, 0.8);
+  const auto command = safety.sample_and_advance(0.02);
+  const auto next = safety.sample();
+  near(command.planned_jerk, -0.5, "safety jerk must reflect acceleration clipping");
+  const auto state = integrate_motion({0.0, 0.0, 0.3, 1.0, -0.99, 0.1},
+                                     command.planned_jerk, 0.1, 0.02);
+  near(next.planned_speed, state.speed, "safety speed uses a different model");
+  near(next.motion_heading, state.chi, "safety heading uses a different model");
+}
+
+void test_curved_plan_analytic_continuity() {
+  using namespace simp_planner;
+  std::vector<double> s, x, y, heading, curvature;
+  for (int i = 0; i <= 400; ++i) {
+    const double arc = i * 0.1, angle = arc / 25.0;
+    s.push_back(arc); x.push_back(25.0 * std::sin(angle));
+    y.push_back(25.0 * (1.0 - std::cos(angle)));
+    heading.push_back(angle); curvature.push_back(0.04);
+  }
+  PathVelocityPlanner planner({}, ReferencePath{s, x, y, heading, curvature}, empty_costmap());
+  const auto plan = planner.plan({0.0, 0.0, 0.0, 1.0, 0.0, 0.04}, {}, {2.0, DriveMode::Left});
+  require(plan.trajectory.safe(), "curved analytic plan is infeasible");
+  const auto allocation = allocate_trajectory(plan.motion);
+  for (std::size_t i = 0; i + 1 < plan.motion.t.size(); ++i) {
+    const double t = plan.motion.t[i];
+    const double dt = plan.motion.t[i + 1] - t;
+    const auto integrated = integrate_motion(plan.trajectory.states[i],
+        plan.trajectory.actions[i].longitudinal_jerk, plan.motion.kappa[i], dt);
+    require(std::hypot(integrated.x - plan.motion.x[i + 1],
+                       integrated.y - plan.motion.y[i + 1]) < 1e-10,
+            "planned knot position differs from analytic velocity integration");
+    require(std::abs(wrap_angle(integrated.chi - plan.motion.chi[i + 1])) < 1e-10,
+            "planned knot heading differs from analytic integration");
+    const auto sample = sample_body_command(allocation, plan.trajectory.actions, t + dt - 1e-9);
+    require(std::hypot(sample.segment_start_x - plan.motion.x[i + 1],
+                       sample.segment_start_y - plan.motion.y[i + 1]) < 1e-8,
+            "analytic curve jumps at a planning knot");
+  }
 }
 
 
@@ -838,6 +951,8 @@ int main() {
     test_nominal_planning_and_allocation();
     test_stationary_hold();
     test_runtime_execution_and_handover();
+    test_analytic_motion_and_sampling();
+    test_curved_plan_analytic_continuity();
     test_lateral_priority_allocation();
     test_drive_mode_feedback_supervisor();
     test_terminal_monotonic_braking_with_positive_jerk();

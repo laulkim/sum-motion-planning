@@ -31,8 +31,10 @@ def main():
     messages = []
     states = []
     plans = []
+    planned_paths = []
     node.create_subscription(TrackingTrajectory, "/planner/tracking_trajectory", messages.append, 100)
     node.create_subscription(String, "/planner/execution_state", lambda msg: states.append(msg.data), qos)
+    node.create_subscription(ReferencePath, "/planner/selected_trajectory_data", planned_paths.append, qos)
 
     def receive_status(message):
         plan = json.loads(message.data).get("plan", {})
@@ -108,7 +110,8 @@ def main():
             path_pub.publish(path)
             map_pub.publish(grid)
             speed_pub.publish(Float64(data=1.0))
-            wait_for(lambda: len(plans) >= 1)
+            wait_for(lambda: len(plans) >= 1 and planned_paths)
+            assert len(planned_paths[-1].x) == 401, "4초 계획 자체가 0.01초 간격으로 생성되지 않음"
             first_plan = plans[-1]
             speed_pub.publish(Float64(data=0.8))
             wait_for(lambda: plans[-1]["id"] > first_plan["id"])
@@ -120,6 +123,9 @@ def main():
             moving = messages[-1]
             assert moving.points[-1].x > moving.points[0].x, "미래 위치가 진행하지 않음"
             assert all(abs(p.y - 2.0) < 1e-5 for p in moving.points), "직선 경로 이탈"
+            assert all(abs((b.x - a.x) - 0.005 * (a.vx + b.vx)) < 2e-5
+                       for a, b in zip(moving.points, moving.points[1:])), \
+                "발행 위치 변화량과 속도 적분 불일치"
 
             # 주행 중에도 새 계획을 즉시 등록하고 한 배열 안에서 경계를 연결한다.
             plan_id = plans[-1]["id"]

@@ -175,7 +175,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
             declare_parameter<double>("planning_handover_margin_sec", 0.03),
             0.95,
             declare_parameter<double>("planning_handover_scale", 1.20)) {
-    trajectory_knot_dt_ = declare_parameter<double>("trajectory_knot_dt_sec", 0.10);
+    trajectory_knot_dt_ = declare_parameter<double>("trajectory_knot_dt_sec", 0.01);
     scheduler_frequency_hz_ = declare_parameter<double>("planning_scheduler_frequency_hz", 100.0);
     costmap_update_period_sec_ =
         declare_parameter<double>("costmap_update_period_sec", 0.20);
@@ -196,7 +196,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       throw std::invalid_argument("invalid spot turn detection/clearance settings");
     }
     maneuver_ = SpotTurnManeuver(spot_turn_config_);
-    if (!(trajectory_knot_dt_ > 0.0) ||
+    if (!(trajectory_knot_dt_ > 0.0) || !std::isfinite(trajectory_knot_dt_) ||
         !(scheduler_frequency_hz_ > 0.0) || !(costmap_update_period_sec_ > 0.0) ||
         !std::isfinite(costmap_update_period_sec_)) {
       throw std::invalid_argument("planner timing parameters must be positive");
@@ -1315,6 +1315,18 @@ class PlannerNodeCpp final : public rclcpp::Node {
     point.body_yaw = wrap_angle(point.body_yaw + point.yaw_rate * dt);
   }
 
+  static void advance_tracking_pose(
+      simp_planner_msgs::msg::TrackingTrajectoryPoint& point,
+      const BodyCommand& command, double dt) {
+    const auto state = integrate_motion(
+        {point.x, point.y, point.body_yaw + command.beta,
+         command.planned_speed, command.planned_acceleration, 0.0},
+        command.planned_jerk, command.motion_curvature, dt);
+    point.x = state.x;
+    point.y = state.y;
+    point.body_yaw = wrap_angle(state.chi - command.beta - command.beta_rate * dt);
+  }
+
   void start_nominal_stop_locked() {
     nominal_stop_.emplace(current_state_.speed, current_state_.acceleration,
         wrap_angle(current_state_.chi - current_body_yaw_), current_state_.chi,
@@ -1371,7 +1383,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
           point.vx = command.vx;
           point.vy = command.vy;
           point.yaw_rate = command.yaw_rate;
-          advance_tracking_pose(point, dt);
+          advance_tracking_pose(point, command, dt);
           const auto next = nominal_stop_->sample();
           current_state_.speed = std::hypot(next.vx, next.vy);
           current_state_.acceleration = next.planned_acceleration;
@@ -1505,7 +1517,6 @@ class PlannerNodeCpp final : public rclcpp::Node {
             const double time = (target_ns - plan->start_ns) * 1.0e-9;
             const double end = plan->allocation.trajectory.t.back();
             if (time <= end + 1.0e-12) {
-              // ponytail: 위치 선형 보간의 한계는 simp_tracker/TRACKING_TRAJECTORY_KR.md 참고.
               command = sample_body_command(plan->allocation,
                   plan->result.trajectory.actions, time, kTrackingSampleDt);
               point.x = command.segment_start_x;
@@ -1524,11 +1535,11 @@ class PlannerNodeCpp final : public rclcpp::Node {
                 for (double remaining = time - end;
                      remaining > 1.0e-12 && !stop->stopped();) {
                   const double dt = std::min(kTrackingSampleDt, remaining);
-                  const auto tail = stop->sample();
+                  const auto tail = stop->sample(dt);
                   point.vx = tail.vx;
                   point.vy = tail.vy;
                   point.yaw_rate = tail.yaw_rate;
-                  advance_tracking_pose(point, dt);
+                  advance_tracking_pose(point, tail, dt);
                   stop->advance(dt);
                   remaining -= dt;
                 }
@@ -1543,7 +1554,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
         point.vy = command.vy;
         point.yaw_rate = command.yaw_rate;
         message.points.push_back(point);
-        advance_tracking_pose(point, kTrackingSampleDt);
+        if (turning) advance_tracking_pose(point, kTrackingSampleDt);
+        else advance_tracking_pose(point, command, kTrackingSampleDt);
       }
       reference_state = spot_turn_waiting_clearance_ ? "SPOT_TURN_WAITING_CLEARANCE"
           : (!mode_ready ? (stopping_for_mode ? "MODE_STOP" : "MODE_WAIT")
@@ -1878,7 +1890,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
   std::uint64_t plan_id_counter_{0};
   std::string execution_state_{"STARTUP"};
 
-  double trajectory_knot_dt_{0.10};
+  double trajectory_knot_dt_{0.01};
   double scheduler_frequency_hz_{100.0};
   double costmap_update_period_sec_{0.20};
   double maximum_handover_lead_sec_{0.60};
