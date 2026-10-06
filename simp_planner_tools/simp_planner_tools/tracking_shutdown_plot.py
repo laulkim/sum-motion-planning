@@ -20,8 +20,46 @@ COLUMNS = (
 )
 
 
+# Below this speed the motion direction atan2(vy, vx) is undefined.
+HEADING_MIN_SPEED = 0.05
+
+
 def stamp_ns(stamp):
     return stamp.sec * 1000000000 + stamp.nanosec
+
+
+def wrap_angle(angle):
+    return (np.asarray(angle) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def motion_heading(yaw, vx, vy):
+    """chi = body yaw + slip angle atan2(vy, vx); NaN while (nearly) stationary."""
+    chi = wrap_angle(yaw + np.arctan2(vy, vx))
+    with np.errstate(invalid="ignore"):
+        return np.where(np.hypot(vx, vy) >= HEADING_MIN_SPEED, chi, math.nan)
+
+
+def motion_heading_rate(time, yaw_rate, vx, vy):
+    """chi_dot = yaw rate + beta_dot. beta_dot is the difference of atan2(vy, vx)
+    between distinct sample times; a repeated sample (held odometry) keeps the
+    previous rate instead of producing a zero-time spike."""
+    beta = np.arctan2(vy, vx)
+    with np.errstate(invalid="ignore"):
+        valid = np.isfinite(time) & (np.hypot(vx, vy) >= HEADING_MIN_SPEED)
+    beta_rate = np.full(len(time), math.nan)
+    last = None
+    for k in range(len(time)):
+        if not valid[k]:
+            last = None
+            continue
+        if last is not None:
+            dt = time[k] - time[last]
+            if dt <= 0.0:
+                beta_rate[k] = beta_rate[last]
+                continue
+            beta_rate[k] = wrap_angle(beta[k] - beta[last]) / dt
+        last = k
+    return yaw_rate + beta_rate
 
 
 def sample_row(message, origin_ns):
@@ -59,7 +97,7 @@ def create_figures(data, predicted=True):
         ax.grid(True, alpha=0.3)
     axes[-1].set_xlabel("Elapsed time [s]")
 
-    states, axes = plt.subplots(3, 2, sharex=True, figsize=(14, 9), layout="constrained")
+    states, axes = plt.subplots(4, 2, sharex=True, figsize=(14, 11), layout="constrained")
     states.canvas.manager.set_window_title("Vehicle states and control inputs")
     states.suptitle("Controller snapshot: predicted pose and body-frame velocities" if predicted
                     else "Vehicle states and body-frame velocity commands")
@@ -72,7 +110,29 @@ def create_figures(data, predicted=True):
         axes[i, 1].plot(time, data[:, 10 + i] * scale, label="measured at odom time" if predicted else "actual", alpha=0.7)
         axes[i, 1].plot(time, data[:, 13 + i] * scale, "--", label="reference")
         axes[i, 1].set_ylabel(input_label)
-        for ax in axes[i]:
+    # Motion direction chi = yaw + atan2(vy, vx) and its rate chi_dot = omega + beta_dot.
+    # beta_dot is differenced on each signal's own clock: odometry and reference
+    # stamps when recorded, the control time otherwise (old CSVs).
+    deg = 180 / math.pi
+    has_stamps = data.shape[1] > 21
+    measured_time = data[:, 20] * 1e-9 if has_stamps else time
+    reference_time = data[:, 21] * 1e-9 if has_stamps else time
+    axes[3, 0].plot(time, motion_heading(data[:, 3], data[:, 10], data[:, 11]) * deg,
+                    label="predicted" if predicted else "actual")
+    axes[3, 0].plot(time, motion_heading(data[:, 6], data[:, 13], data[:, 14]) * deg,
+                    "--", label="reference")
+    axes[3, 0].set_ylabel("chi [deg]")
+    axes[3, 1].plot(time, motion_heading_rate(time, data[:, 18], data[:, 16], data[:, 17]) * deg,
+                    label="command")
+    axes[3, 1].plot(time, motion_heading_rate(measured_time, data[:, 12], data[:, 10],
+                                              data[:, 11]) * deg,
+                    label="measured at odom time" if predicted else "actual", alpha=0.7)
+    axes[3, 1].plot(time, motion_heading_rate(reference_time, data[:, 15], data[:, 13],
+                                              data[:, 14]) * deg,
+                    "--", label="reference")
+    axes[3, 1].set_ylabel("chi_rate [deg/s]")
+    for row in axes:
+        for ax in row:
             ax.legend()
             ax.grid(True, alpha=0.3)
     for ax in axes[-1]:

@@ -7,7 +7,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from simp_planner_msgs.msg import TrackingControl, TrackingTrajectoryPoint
 
-from simp_planner_tools.tracking_shutdown_plot import COLUMNS, create_figures, sample_row, show_recording
+from simp_planner_tools.tracking_shutdown_plot import (
+    COLUMNS, create_figures, motion_heading, motion_heading_rate, sample_row, show_recording)
 
 
 def test_shutdown_figures_use_controller_snapshot(tmp_path):
@@ -37,10 +38,14 @@ def test_shutdown_figures_use_controller_snapshot(tmp_path):
     assert invalid[16:19] == (0.0, 0.0, 0.0)
     assert invalid[-1] == 0
     figures = create_figures(np.asarray([row, invalid]))
-    assert [len(figure.axes) for figure in figures] == [3, 6]
+    assert [len(figure.axes) for figure in figures] == [3, 8]
     np.testing.assert_allclose(figures[0].axes[0].lines[0].get_ydata(), [0.0, np.nan])
     np.testing.assert_allclose(figures[1].axes[1].lines[0].get_ydata(), [2.0, 0.0])
     assert figures[1].axes[0].lines[0].get_label() == "predicted"
+    chi_axis = figures[1].axes[6]
+    assert chi_axis.get_ylabel() == "chi [deg]"
+    np.testing.assert_allclose(chi_axis.lines[0].get_ydata(), [0.0, np.nan])
+    assert figures[1].axes[7].get_ylabel() == "chi_rate [deg/s]"
     for index, figure in enumerate(figures):
         figure.savefig(tmp_path / f"figure{index}.png")
         plt.close(figure)
@@ -63,3 +68,29 @@ def test_single_sample_recording_saves_both_figures_without_display(tmp_path, mo
     for name in ("tracking_errors.png", "tracking_states_inputs.png"):
         assert (tmp_path / name).stat().st_size > 0
     assert not plt.get_fignums()
+
+
+def test_motion_heading_and_rate():
+    # Crab-like motion: body yaw 0.1 rad, velocity along body +y -> chi = 0.1 + pi/2.
+    np.testing.assert_allclose(motion_heading(np.array([0.1]), np.array([0.0]), np.array([1.5])),
+                               [0.1 + math.pi / 2])
+    # Below the heading speed the motion direction is undefined.
+    assert math.isnan(motion_heading(np.array([0.0]), np.array([0.01]), np.array([0.0]))[0])
+
+    # yaw rate 0.1 rad/s and slip angle turning at 0.2 rad/s -> chi_dot = 0.3 rad/s,
+    # including across the +-pi wrap of beta.
+    time = np.arange(6) * 0.01
+    beta = math.pi - 0.002 + 0.2 * time
+    rate = motion_heading_rate(time, np.full(6, 0.1), 2.0 * np.cos(beta), 2.0 * np.sin(beta))
+    assert math.isnan(rate[0])
+    np.testing.assert_allclose(rate[1:], 0.3)
+
+    # A repeated sample (held odometry) keeps the previous rate, not a zero-time spike;
+    # a stationary sample breaks the series.
+    time = np.array([0.00, 0.01, 0.01, 0.02, 0.03, 0.04])
+    beta = 0.2 * time
+    speed = np.array([1.0, 1.0, 1.0, 0.0, 1.0, 1.0])
+    rate = motion_heading_rate(time, np.zeros(6), speed * np.cos(beta), speed * np.sin(beta))
+    np.testing.assert_allclose(rate[1:3], 0.2)
+    assert math.isnan(rate[3]) and math.isnan(rate[4])
+    np.testing.assert_allclose(rate[5], 0.2)
