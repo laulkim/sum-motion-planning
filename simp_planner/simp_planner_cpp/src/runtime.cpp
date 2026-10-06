@@ -432,46 +432,51 @@ bool spot_turn_feasible(const Costmap2D& costmap, const PlannerState& state,
 YawRotationProfile::YawRotationProfile(const SpotTurnConfig& config) : config_(config) {
   if (!std::isfinite(config.yaw_rate_max) || config.yaw_rate_max <= 0.0 ||
       !std::isfinite(config.yaw_rate_accel_max) || config.yaw_rate_accel_max <= 0.0 ||
-      !std::isfinite(config.yaw_tolerance_rad) || config.yaw_tolerance_rad <= 0.0 ||
-      !std::isfinite(config.yaw_rate_tolerance) || config.yaw_rate_tolerance <= 0.0) {
+      !std::isfinite(config.yaw_tolerance_rad) || config.yaw_tolerance_rad <= 0.0) {
     throw std::invalid_argument("spot turn rotation limits must be finite and positive");
   }
 }
 
-void YawRotationProfile::engage(double target_yaw) {
-  if (!std::isfinite(target_yaw)) throw std::invalid_argument("invalid target yaw");
+void YawRotationProfile::engage(double start_yaw, double target_yaw) {
+  if (!std::isfinite(start_yaw) || !std::isfinite(target_yaw))
+    throw std::invalid_argument("invalid rotation start or target yaw");
   target_yaw_ = wrap_angle(target_yaw);
+  yaw_ = wrap_angle(start_yaw);
   rate_ = 0.0;
   done_ = false;
 }
 
-BodyCommand YawRotationProfile::sample(double dt, double measured_yaw,
-                                      double measured_yaw_rate) {
-  if (!std::isfinite(dt) || dt <= 0.0 || !std::isfinite(measured_yaw) ||
-      !std::isfinite(measured_yaw_rate)) throw std::invalid_argument("invalid rotation feedback");
-  const double error = wrap_angle(target_yaw_ - measured_yaw);
+BodyCommand YawRotationProfile::sample(double dt) {
+  if (!std::isfinite(dt) || dt <= 0.0) throw std::invalid_argument("invalid rotation dt");
+  // Feedback is the previous trajectory point (yaw_, rate_), not odometry.
+  const double start_yaw = yaw_;
+  const double error = wrap_angle(target_yaw_ - start_yaw);
   const double old_rate = rate_;
   const double feasible_rate = std::sqrt(2.0 * config_.yaw_rate_accel_max * std::abs(error));
   const double desired = std::abs(error) <= config_.yaw_tolerance_rad ? 0.0 :
       std::copysign(std::min(config_.yaw_rate_max, feasible_rate), error);
   const double delta = config_.yaw_rate_accel_max * dt;
   rate_ += std::clamp(desired - rate_, -delta, delta);
-  done_ = std::abs(error) <= config_.yaw_tolerance_rad &&
-          std::abs(rate_) <= 1.0e-9 &&
-          std::abs(measured_yaw_rate) <= config_.yaw_rate_tolerance;
+  // The command is held for dt, matching how the vehicle executes yaw_rate.
+  yaw_ = wrap_angle(start_yaw + rate_ * dt);
+  done_ = std::abs(error) <= config_.yaw_tolerance_rad && std::abs(rate_) <= 1.0e-9;
   BodyCommand command{};
   command.yaw_rate = rate_;
   command.yaw_acceleration = (rate_ - old_rate) / dt;
   command.planned_heading_acceleration = command.yaw_acceleration;
-  command.motion_heading = measured_yaw;
+  command.motion_heading = start_yaw;
   command.motion_heading_rate = rate_;
+  command.segment_start_heading = start_yaw;
+  command.segment_end_heading = yaw_;
   return command;
 }
 
 SpotTurnManeuver::SpotTurnManeuver(const SpotTurnConfig& config) : rotation_(config) {}
 
-void SpotTurnManeuver::trigger(double target_body_yaw, DriveMode external_mode) {
+void SpotTurnManeuver::trigger(double start_body_yaw, double target_body_yaw,
+                               DriveMode external_mode) {
   if (state_ != SpotTurnManeuverState::Inactive) throw std::logic_error("spot turn already active");
+  start_yaw_ = start_body_yaw;
   target_yaw_ = target_body_yaw;
   external_mode_ = external_mode;
   returning_ = false;
@@ -481,7 +486,7 @@ void SpotTurnManeuver::trigger(double target_body_yaw, DriveMode external_mode) 
 bool SpotTurnManeuver::on_mode_ready(const DriveModeSupervisor& supervisor) {
   if (!supervisor.ready() || state_ != SpotTurnManeuverState::AligningWheels) return false;
   if (!returning_ && supervisor.requested_mode() == DriveMode::SpotTurn) {
-    rotation_.engage(target_yaw_);
+    rotation_.engage(start_yaw_, target_yaw_);
     state_ = SpotTurnManeuverState::Rotating;
   } else if (returning_ && supervisor.requested_mode() == external_mode_) {
     state_ = SpotTurnManeuverState::Inactive;
@@ -490,10 +495,9 @@ bool SpotTurnManeuver::on_mode_ready(const DriveModeSupervisor& supervisor) {
   return false;
 }
 
-std::optional<BodyCommand> SpotTurnManeuver::sample(
-    double dt, double measured_yaw, double measured_yaw_rate, DriveModeSupervisor& supervisor) {
+std::optional<BodyCommand> SpotTurnManeuver::sample(double dt, DriveModeSupervisor& supervisor) {
   if (state_ != SpotTurnManeuverState::Rotating) return std::nullopt;
-  const auto command = rotation_.sample(dt, measured_yaw, measured_yaw_rate);
+  const auto command = rotation_.sample(dt);
   if (rotation_.done()) {
     supervisor.set_requested_mode(external_mode_);
     returning_ = true;

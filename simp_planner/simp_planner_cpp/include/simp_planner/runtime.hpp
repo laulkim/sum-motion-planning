@@ -164,7 +164,6 @@ struct SpotTurnConfig {
   double yaw_rate_max{0.3};
   double yaw_rate_accel_max{0.3};
   double yaw_tolerance_rad{0.02};
-  double yaw_rate_tolerance{0.02};
 };
 
 // Input includes the publisher's extra curvature-sampling point: the last
@@ -198,18 +197,22 @@ double spot_turn_target_body_yaw(double path_start_psi, DriveMode mode);
 bool spot_turn_feasible(const Costmap2D& costmap, const PlannerState& state,
                         const VehicleConfig& vehicle, double safety_margin);
 
-// Acceleration-limited rotation, closed around measured odometry. Completion
-// requires both actual heading and actual yaw rate to settle.
+// Acceleration-limited rotation generated as a yaw trajectory. Each sample
+// is fed back from the previous trajectory point (yaw, yaw rate) rather than
+// measured odometry, so consecutive points are continuous and tracking the
+// trajectory is left to the controller. Completion means the trajectory
+// itself has reached the target heading and come to rest.
 class YawRotationProfile {
  public:
   explicit YawRotationProfile(const SpotTurnConfig& config = {});
-  void engage(double target_yaw);
-  BodyCommand sample(double dt, double measured_yaw, double measured_yaw_rate);
+  void engage(double start_yaw, double target_yaw);
+  BodyCommand sample(double dt);
   bool done() const { return done_; }
 
  private:
   SpotTurnConfig config_;
   double target_yaw_{0.0};
+  double yaw_{0.0};
   double rate_{0.0};
   bool done_{false};
 };
@@ -219,11 +222,11 @@ enum class SpotTurnManeuverState { Inactive, AligningWheels, Rotating };
 class SpotTurnManeuver {
  public:
   explicit SpotTurnManeuver(const SpotTurnConfig& config = {});
-  void trigger(double target_body_yaw, DriveMode external_mode);
+  // `start_body_yaw` is the trajectory point the turn begins from (the last
+  // point of the trajectory that brought the vehicle to rest).
+  void trigger(double start_body_yaw, double target_body_yaw, DriveMode external_mode);
   bool on_mode_ready(const DriveModeSupervisor& supervisor);
-  std::optional<BodyCommand> sample(double dt, double measured_yaw,
-                                   double measured_yaw_rate,
-                                   DriveModeSupervisor& supervisor);
+  std::optional<BodyCommand> sample(double dt, DriveModeSupervisor& supervisor);
   bool set_external_requested_mode(DriveMode mode, DriveModeSupervisor& supervisor);
   SpotTurnManeuverState state() const { return state_; }
   const char* state_name() const;
@@ -231,6 +234,7 @@ class SpotTurnManeuver {
  private:
   SpotTurnManeuverState state_{SpotTurnManeuverState::Inactive};
   bool returning_{false};
+  double start_yaw_{0.0};
   double target_yaw_{0.0};
   DriveMode external_mode_{DriveMode::Forward};
   YawRotationProfile rotation_;

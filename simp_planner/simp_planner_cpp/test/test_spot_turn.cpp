@@ -153,31 +153,38 @@ void test_invalid_reference_arrays_are_rejected() {
           "a valid reference array was rejected");
 }
 
-void test_rotation_uses_feedback_and_accepts_new_return_mode() {
+void test_rotation_follows_previous_trajectory_point_and_accepts_new_return_mode() {
   SpotTurnConfig config;
   SpotTurnManeuver maneuver(config);
   DriveModeSupervisor supervisor;
   supervisor.set_requested_mode(DriveMode::Forward);
   supervisor.update_vehicle_feedback(DriveMode::Forward, DriveMode::Forward, VehicleModeStatus::Ready);
-  maneuver.trigger(40 * kPi / 180, DriveMode::Forward);
+  // 170 deg -> -150 deg: the short way is +40 deg across +-pi.
+  const double start = 170 * kPi / 180;
+  const double target = -150 * kPi / 180;
+  maneuver.trigger(start, target, DriveMode::Forward);
   supervisor.set_requested_mode(DriveMode::SpotTurn);
   supervisor.update_vehicle_feedback(DriveMode::SpotTurn, DriveMode::SpotTurn, VehicleModeStatus::Ready);
   maneuver.on_mode_ready(supervisor);
-  double yaw = 0, measured_rate = 0, previous_rate = 0;
+  double yaw = start, previous_rate = 0;
   for (int i = 0; i < 2500 && maneuver.state() == SpotTurnManeuverState::Rotating; ++i) {
-    auto cmd = maneuver.sample(0.01, yaw, measured_rate, supervisor);
+    auto cmd = maneuver.sample(0.01, supervisor);
     require(cmd && cmd->vx == 0 && cmd->vy == 0, "rotation moved vehicle laterally");
     require(std::abs(cmd->yaw_rate - previous_rate) <= config.yaw_rate_accel_max * 0.01 + 1.0e-9,
             "yaw acceleration limit exceeded");
+    require(cmd->yaw_rate >= 0.0, "rotation reversed or took the long way around");
+    // Every point must continue from the previous trajectory point, and its
+    // end must be exactly where holding yaw_rate for dt puts the vehicle.
+    require(std::abs(wrap_angle(cmd->segment_start_heading - yaw)) < 1.0e-12,
+            "trajectory point did not start from the previous point");
+    require(std::abs(wrap_angle(cmd->segment_end_heading - (yaw + cmd->yaw_rate * 0.01))) < 1.0e-12,
+            "segment end heading does not match the held yaw rate");
     previous_rate = cmd->yaw_rate;
-    // Hold actual yaw for the first five seconds, then apply only 75% of
-    // the command. An internally integrated profile would finish too soon.
-    measured_rate = i < 500 ? 0.0 : 0.75 * cmd->yaw_rate;
-    yaw = wrap_angle(yaw + measured_rate * 0.01);
-    if (i == 499) require(maneuver.state() == SpotTurnManeuverState::Rotating, "completed without actual rotation");
+    yaw = cmd->segment_end_heading;
   }
   require(maneuver.state() == SpotTurnManeuverState::AligningWheels, "rotation did not converge");
-  require(std::abs(wrap_angle(40 * kPi / 180 - yaw)) <= config.yaw_tolerance_rad, "actual heading off target");
+  require(previous_rate == 0.0, "trajectory did not come to rest");
+  require(std::abs(wrap_angle(target - yaw)) <= config.yaw_tolerance_rad, "trajectory heading off target");
   require(maneuver.set_external_requested_mode(DriveMode::Left, supervisor), "return request not retargeted");
   supervisor.update_vehicle_feedback(DriveMode::Left, DriveMode::Left, VehicleModeStatus::Ready);
   require(maneuver.on_mode_ready(supervisor), "return alignment stuck after new request");
@@ -199,7 +206,7 @@ int main() {
     test_heading_jump_between_legs_is_detected_per_mode();
     test_split_reference_path_at_interior_corner();
     test_invalid_reference_arrays_are_rejected();
-    test_rotation_uses_feedback_and_accepts_new_return_mode();
+    test_rotation_follows_previous_trajectory_point_and_accepts_new_return_mode();
     test_clearance_gate();
     std::cout << "all spot-turn integration tests passed\n";
   } catch (const std::exception& error) {

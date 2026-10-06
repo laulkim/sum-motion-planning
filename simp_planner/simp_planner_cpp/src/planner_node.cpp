@@ -196,7 +196,6 @@ class PlannerNodeCpp final : public rclcpp::Node {
     spot_turn_config_.yaw_rate_max = declare_parameter<double>("spot_turn_yaw_rate_max", 0.3);
     spot_turn_config_.yaw_rate_accel_max = declare_parameter<double>("spot_turn_yaw_rate_accel_max", 0.3);
     spot_turn_config_.yaw_tolerance_rad = declare_parameter<double>("spot_turn_yaw_tolerance_rad", 0.02);
-    spot_turn_config_.yaw_rate_tolerance = declare_parameter<double>("spot_turn_yaw_rate_tolerance", 0.02);
     if (!std::isfinite(spot_turn_config_.heading_jump_threshold_rad) ||
         spot_turn_config_.heading_jump_threshold_rad <= 0.0 ||
         spot_turn_config_.heading_jump_threshold_rad > kPi ||
@@ -1382,7 +1381,10 @@ class PlannerNodeCpp final : public rclcpp::Node {
           measured_speed <= mode_change_stop_speed_ && terminal_hold_latched() &&
           pending_spot_turn_target_yaw_) {
         if (spot_turn_feasible(*costmap_, current_state_, config_.vehicle, spot_turn_config_.safety_margin)) {
-          maneuver_.trigger(*pending_spot_turn_target_yaw_, *pending_spot_turn_mode_);
+          // current_body_yaw_ is the handover-predicted end point of the
+          // trajectory that stopped the vehicle here; the turn starts from it.
+          maneuver_.trigger(current_body_yaw_, *pending_spot_turn_target_yaw_,
+                            *pending_spot_turn_mode_);
           mode_supervisor_.set_requested_mode(DriveMode::SpotTurn);
           pending_spot_turn_target_yaw_.reset();
           ++command_revision_;
@@ -1395,24 +1397,17 @@ class PlannerNodeCpp final : public rclcpp::Node {
       waiting_clearance = spot_turn_waiting_clearance_;
       if (mode_ready) {
         const auto previous_request = mode_supervisor_.requested_mode();
-        rotating_command = maneuver_.sample(
-            command_dt_, current_body_yaw_, current_body_yaw_rate_, mode_supervisor_);
+        rotating_command = maneuver_.sample(command_dt_, mode_supervisor_);
         if (mode_supervisor_.requested_mode() != previous_request) ++command_revision_;
         if (rotating_command) {
           rotating_command->segment_start_x = rotating_command->segment_end_x = current_state_.x;
           rotating_command->segment_start_y = rotating_command->segment_end_y = current_state_.y;
-          rotating_command->segment_start_heading = current_body_yaw_;
-          rotating_command->segment_end_heading =
-              wrap_angle(current_body_yaw_ + rotating_command->yaw_rate * command_dt_);
-          // Spot-turn-local handover: planning_callback() returns immediately
-          // while input->spot_turn_active is true, so predict_handover_state()
-          // never runs during a turn, and odom_callback() only seeds state
-          // once for the whole run (see both call sites). Without this,
-          // measured_yaw handed to YawRotationProfile::sample() next tick
-          // would stay frozen at the pre-turn heading forever, error would
-          // never shrink, and done() could never become true. Advance by
-          // exactly what we just commanded (Vx=Vy=0, pure yaw_rate) so the
-          // next sample() call sees progress.
+          // The rotation profile feeds back from its own previous trajectory
+          // point, so nothing here is read back as feedback. planning_callback()
+          // returns while input->spot_turn_active, so predict_handover_state()
+          // cannot keep the planner state current during a turn; mirror the
+          // turn trajectory into it instead, so the post-turn replan starts
+          // from where the turn trajectory ended.
           current_body_yaw_ = rotating_command->segment_end_heading;
           current_body_yaw_rate_ = rotating_command->yaw_rate;
           current_state_time_ns_ = stamp_ns;
