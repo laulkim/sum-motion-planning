@@ -57,7 +57,7 @@ class PlanarVelocitySimNode(Node):
 
         initial_mode = int(self.get_parameter("initial_drive_mode").value)
         if initial_mode not in VALID_DRIVE_MODES:
-            raise ValueError("initial_drive_mode must be in [0, 3]")
+            raise ValueError("initial_drive_mode must be in [0, 4]")
         self.mode_model = DriveModeTransitionModel(
             initial_mode=initial_mode,
             transition_duration_sec=float(
@@ -137,8 +137,7 @@ class PlanarVelocitySimNode(Node):
         message.header.frame_id = self.base_frame
         message.current_mode = feedback.current_mode
         message.requested_mode = feedback.requested_mode
-        message.transition_in_progress = feedback.transition_in_progress
-        message.transition_complete = feedback.transition_complete
+        message.status = int(feedback.status)
         self.mode_state_pub.publish(message)
 
     def update(self) -> None:

@@ -23,9 +23,10 @@ planar simulator, scenario 도구의 기본 파라미터를 한곳에 정리한�
 | 횡방향 목표 | -8.0~+8.0 m, 0.25 m 간격 | 총 65개 |
 | 신규 횡 transition 길이 | 3.0~50.0 m | 속도·offset·곡률에 따라 동적 결정; 기존 maneuver 재계획 시 남은 길이는 0.10 m까지 가능 |
 | 공간 경로 sampling | 0.25 m | `spatial_ds` |
-| 기본 최소 spatial preview | 32.0 m | adaptive bottleneck preview |
-| 기본 preview 후보 preliminary extent | 45.2 m 이상 | `1.35 × 32.0 + 2.0` |
+| 기본 최소 spatial preview | 28.0 m | 30 m local-map 반경 안의 안전 preview |
+| 기본 preview 후보 preliminary extent | 39.8 m 이상 | `1.35 × 28.0 + 2.0`; 최종 preview로 truncate |
 | local reference window | 뒤 5.0 m / 앞 45.0 m | Scenario/Track provider 기본값 |
+| Scenario local costmap | 차량 중심 60 m × 60 m, 5 Hz | 캡처 시점 Body 축 정렬 |
 | 진행 속도 범위 | 0.0~5.8 m/s | Body 축별 속도 제한이 아님 |
 | 진행 가속도 범위 | -2.0~+1.2 m/s² | nominal 운용은 -1.0~+0.8 m/s² |
 | 진행 jerk 상한 | 3.0 m/s³ | nominal comfort 상한은 0.8 m/s³ |
@@ -106,7 +107,8 @@ Body `vx`, `vy` 제약이 아니다.
 
 | 파라미터 | 기본값 | 단위 | 상태 및 의미 |
 |---|---:|---:|---|
-| `n_targets` | -8.0~+8.0, step 0.25 | m | 활성, Frenet lateral target 65개 |
+| `n_targets` | -3.5~+3.5, step 0.109375 | m | 활성, Frenet lateral target 65개 |
+| `near_target_offset` | 0.21875 | m | 활성, 이보다 가까운 target은 길이 후보 1개·기동 미고정 (target 간격 2칸) |
 | `min_length` | 3.0 | m | 활성, 새로 생성하는 nominal 횡 transition 최소 길이 |
 | `max_length` | 50.0 | m | 활성, 횡 transition 최대 길이; 기존 maneuver 재계획 시 남은 segment는 0.10 m까지 허용 |
 | `spatial_ds` | 0.25 | m | 활성, 공간 후보 sampling 간격 |
@@ -115,7 +117,7 @@ Body `vx`, `vy` 제약이 아니다.
 | `normal_shortlist_size` | 9 | count | 활성, 일반 첫 time-rollout batch |
 | `terminal_shortlist_size` | 3 | count | 활성, terminal 첫 time-rollout batch |
 | `normal_fallback_batch_size` | 4 | count | 활성, 첫 batch 실패 후 batch 크기 |
-| `target_continuity_weight` | 3.0 | cost | 조건부, 이전 lateral target 유지 비용 |
+| `target_continuity_weight` | 15.7 | cost | 조건부, 이전 lateral target 유지 비용 |
 | `reference_center_lock_enabled` | true | bool | 활성, 완전히 안전한 center path 고정 |
 | `reference_center_lock_obstacle_cost_tolerance` | 1e-12 | cost | 활성, center-lock obstacle cost 허용치 |
 | `short_path_fallback_enabled` | true | bool | 활성, 정지 가능한 짧은 path fallback |
@@ -134,7 +136,7 @@ max(0.20 m,
 ```
 
 현재 `V <= 5.8 m/s`, `horizon=4 s`에서 `1.10 × 23.2 = 25.52 m`이므로
-`minimum_spatial_preview=32 m`가 기본적으로 지배한다.
+`minimum_spatial_preview=28 m`가 기본적으로 지배한다.
 
 새 후보의 preliminary extent는 다음과 같다.
 
@@ -194,18 +196,18 @@ jerk:         min(jerk_max=3.0, comfort_jerk=0.8) = ±0.8 m/s³
 | `w_jerk` | 0.50 | 활성, longitudinal jerk cost |
 | `w_heading_accel` | 0.05 | 활성, motion-heading acceleration cost |
 | `w_lateral_jerk` | 0.10 | 활성, path-frame lateral jerk cost |
-| `w_lateral_offset` | 0.08 | 활성, 전체 lateral offset cost |
-| `w_terminal_offset` | 0.12 | 활성, 실제 path end lateral offset cost |
-| `w_offset_overshoot` | 2.0 | 활성, lateral target 범위 overshoot cost |
+| `w_lateral_offset` | 1.5 | 활성, 전체 lateral offset cost |
+| `w_terminal_offset` | 2.25 | 활성, 실제 path end lateral offset cost |
+| `w_offset_overshoot` | 15.0 | 활성, lateral target 범위 overshoot cost |
 | `w_curvature` | 8.0 | 활성, curvature cost |
 | `w_curvature_rate` | 1.2 | 활성, curvature 공간미분 cost |
 | `w_real_end_offset` | 90.0 | 미사용 |
 | `w_real_end_heading` | 45.0 | 미사용 |
-| `w_obstacle` | 110.0 | 활성, 평균 soft-clearance 부족 cost |
-| `w_min_clearance` | 380.0 | 활성, 최대 clearance 부족 cost |
+| `w_obstacle` | 20.0 | 활성, 평균 soft-clearance 부족 cost |
+| `w_min_clearance` | 60.0 | 활성, 최대 clearance 부족 cost |
 | `w_collision` | 200000 | 활성, collision sample penalty |
-| `obstacle_soft_margin` | 0.10 m | 활성, soft-clearance 기본 추가량 |
-| `obstacle_time_headway` | 0.20 s | 활성, 속도 비례 soft-clearance |
+| `obstacle_soft_margin` | 0.05 m | 활성, soft-clearance 기본 추가량 |
+| `obstacle_time_headway` | 0.05 s | 활성, 속도 비례 soft-clearance |
 | `obstacle_soft_margin_max` | 1.25 m | 활성, soft-clearance 상한 |
 | `hard_clearance_margin_low_speed` | 0.10 m | 미사용 |
 | `hard_clearance_margin` | 0.10 m | 활성, 모든 속도에서 동일한 hard margin |
@@ -223,6 +225,9 @@ min(hard_clearance_margin
 `effective_hard_clearance_margin()`은 속도를 사용하지 않으므로 low-speed/full-speed
 두 필드는 현재 효과가 없다.
 
+장애물 비용은 완화하고 레퍼런스 비용은 강화한 값이다. 1.5 m/s에서 soft-clearance 목표는
+0.225 m(이전 0.50 m)이고, hard margin(0.10 m)과 collision 판정은 바꾸지 않았다.
+
 ### 3.6 TerminalConstraintConfig
 
 | 파라미터 | 기본값 | 단위 | 상태 및 의미 |
@@ -230,6 +235,8 @@ min(hard_clearance_margin
 | `activation_margin` | 3.0 | m | 활성, stopping distance 추가량 |
 | `minimum_activation_distance` | 1.0 | m | 활성, terminal 제약 최소 활성 거리 |
 | `safe_region_planning_buffer` | 12.0 | m | 활성, terminal safe-region 조기 탐색 buffer |
+| `reference_tracking_distance` | 22.0 | m | 목표점까지 이 거리 이내의 저속 접근은 실행 가능한 최소 종단 횡오차 후보 우선. 0이면 비활성 |
+| `reference_tracking_speed_max` | 1.1 | m/s | 위 우선순위 적용 시 현재 속력과 목표 속도의 상한. 실제 차체 충돌검사/회피 fallback 유지 |
 | `safe_region_settle_distance` | 4.0 | m | 활성, endpoint 전 lateral settle 거리 |
 | `longitudinal_tolerance` | 0.20 | m | 활성, terminal 위치 허용치 |
 | `speed_tolerance` | 0.03 | m/s | 활성, auxiliary terminal stop 판정 |
@@ -268,7 +275,7 @@ max(minimum_activation_distance,
 | 파라미터 | 기본값 | 단위 | 상태 및 의미 |
 |---|---:|---:|---|
 | `enabled` | true | bool | 활성, bottleneck 탐색 및 최소 preview |
-| `minimum_spatial_preview` | 32.0 | m | 활성 |
+| `minimum_spatial_preview` | 28.0 | m | 활성, 30 m local-map 반경 안의 여유 반영 |
 | `bottleneck_trigger_extra` | 1.50 | m | 활성, bottleneck 진입 여유 |
 | `bottleneck_release_extra` | 2.00 | m | 활성, bottleneck 해제 여유 |
 | `bottleneck_post_buffer` | 8.0 | m | 활성, bottleneck 뒤 decision buffer |
@@ -287,7 +294,7 @@ max(minimum_activation_distance,
 | `minimum_reference_scale` | 0.35 | ratio | 미사용 |
 | `failed_target_weight` | 80.0 | cost | dormant allocation-failure branch |
 | `failed_target_sigma` | 0.75 | m | dormant allocation-failure branch |
-| `maneuver_target_tolerance` | 0.30 | m | 활성, latched maneuver 완료 판단 |
+| `maneuver_target_tolerance` | 0.13125 | m | 활성, latched maneuver 완료 판단 |
 | `maneuver_release_progress_margin` | 0.50 | m | 활성, maneuver release 판단 |
 
 Allocation-failure 기반 weight scheduler는 현재 production 경로에서
@@ -348,9 +355,16 @@ Body acceleration/jerk 배열은 계산되지만 위의 `3.2`, `9.0` 값과 비�
 | `Balanced` | 0.50 / 0.55 | 0.65 / 0.70 | 35° / 30° | 사용 안 함 |
 | `YawPriority` | 0.75 / 0.80 | 0.90 / 0.95 | 25° / 20° | 사용 안 함 |
 | `MinimumVy` | 0.92 / 0.92 | 1.20 / 1.20 | 12° / 12° | Forward/Reverse 2순위 |
+| `VxPriority` | 0.65 / 0.70 | 0.80 / 0.85 | 25° / 22° | 1순위로 선택 가능 |
+
+1순위 profile은 planner 파라미터 `allocation_primary_profile`(기본 `LATERAL_PRIORITY`)로
+고른다. simulation launch는 시나리오의 `allocation_profile`(현재 모든 시나리오
+`LATERAL_PRIORITY`)을 넘기고, launch 인자 `allocation_profile:=...`로 덮어쓸 수 있다. 1순위의
+4초 궤적이 충돌하면 `MinimumVy`로 한 번 더 시도한다. `VxPriority`는 `LateralPriority`보다
+차체가 진행 방향을 더 따라 돌아 slip(beta)이 작고 vx가 크다.
 
 Left/Right 값은 모든 profile에서 기본값을 유지한다. Left/Right crab trajectory는
-`MinimumVy`를 재시도하지 않고 `LateralPriority`만 평가한다.
+`MinimumVy`를 재시도하지 않고 1순위 profile만 평가한다.
 
 ### 4.4 OrientedFootprintConfig
 
@@ -384,7 +398,7 @@ Left/Right 값은 모든 profile에서 기본값을 유지한다. Left/Right cra
 
 ## 6. Planner ROS runtime 파라미터
 
-`planner_node_cpp`가 ROS에 노출하는 파라미터는 아래 16개뿐이다.
+`planner_node_cpp`가 ROS에 노출하는 파라미터는 아래 17개뿐이다.
 
 | ROS parameter | 기본값 | 단위 | 적용 |
 |---|---:|---:|---|
@@ -399,6 +413,7 @@ Left/Right 값은 모든 profile에서 기본값을 유지한다. Left/Right cra
 | `trajectory_knot_dt_sec` | 0.10 | s | `longitudinal.dt` override |
 | `command_frequency_hz` | 100.0 | Hz | command timer; `command_dt=0.01 s` |
 | `planning_scheduler_frequency_hz` | 100.0 | Hz | scheduler polling; 0.01 s |
+| `costmap_update_period_sec` | 0.20 | s | costmap crop의 캡처 간 이동 버퍼; simulation launch는 `1/costmap_publish_hz`를 자동 전달 |
 | `mode_change_stop_speed_mps` | 0.03 | m/s | Planner mode 전환 정지 기준 |
 | `mode_command_period_sec` | 0.25 | s | mode command 재송신 간격; 4 Hz |
 | `oriented_footprint_circle_count` | 3 | count | final footprint circle 수 |
@@ -483,6 +498,8 @@ Planner의 `mode_change_stop_speed_mps`와 simulator의
 | `command_frequency_hz` | 100.0 Hz | Planner command frequency만 override |
 | `oriented_footprint_circle_count` | 0 | sentinel, scenario 권장값 사용 |
 | `costmap_resolution` | -1.0 | sentinel, scenario 권장값 사용 |
+| `costmap_size_m` | 60.0 m | 차량 중심 정사각형 local costmap 한 변 |
+| `costmap_publish_hz` | 5.0 Hz | local costmap 발행률 |
 | `oriented_footprint_translation_step_m` | 0.20 m | Planner final swept check |
 | `oriented_footprint_yaw_step_deg` | 2.0° | Planner final swept check |
 | `save_period` | 10.0 s | debug snapshot 저장 주기 |
@@ -519,7 +536,9 @@ initial_body_yaw   = first_path.yaw[0] - beta_center(mode)
 | `path_ahead_length` | 45.0 | m | local reference 앞쪽 길이 |
 | `path_update_distance` | 1.0 | m | reference 재발행 이동거리 |
 | `costmap_resolution` | -1.0 | m/cell | sentinel, scenario 값 사용 |
-| `costmap_margin` | 10.0 | m | path/obstacle bounds 외곽 여유 |
+| `costmap_margin` | 10.0 | m | 기존 설정 호환용; 차량 기준 local costmap에는 미사용 |
+| `costmap_size_m` | 60.0 | m | 차량 중심 정사각형 local costmap의 한 변 |
+| `costmap_publish_hz` | 5.0 | Hz | 최신 odom capture 기준 local costmap 발행률 |
 | `stop_speed_threshold` | 0.03 | m/s | phase 종료 정지 판정 |
 | `terminal_capture_distance` | 0.20 | m | phase stop 위치 허용치 |
 | `projection_search_back` | 20 | segment | local projection 뒤 검색 |
@@ -529,6 +548,7 @@ initial_body_yaw   = first_path.yaw[0] - beta_center(mode)
 추가 하드코딩 동작:
 
 - heartbeat: 0.5 s
+- local costmap은 유효 odom을 받은 뒤부터 5 Hz로 발행
 - odom 수신 전 static input 재발행: 최대 10회
 - 일반 phase 실행 끝: `path.total_length - terminal_margin`
 - mode-change phase 실행 끝: 지정된 `switch_s`
@@ -626,6 +646,33 @@ Conservative correction은 distance field에서 `0.5 × sqrt(2) × resolution`�
 separating-axis 검사를 사용한다. `narrow_offset_corridor`만 scenario 기본
 resolution이 0.05 m/cell이다.
 
+### 11.3 차량 기준 local costmap 계약
+
+Scenario Manager는 시나리오 장애물을 캡처 시점 차량 Body 축에 정렬된 고정
+`60 m × 60 m` 정사각형으로 rasterize하고 5 Hz로 발행한다. 차량은 정사각형의
+중앙에 있으며 셀 수는 한 축당 `ceil(costmap_size_m / resolution)`이다. 따라서
+0.20 m/cell에서는 `300 × 300`, 0.05 m/cell에서는 `1200 × 1200`이다.
+
+`OccupancyGrid.header.frame_id`는 `odom`이고 `header.stamp`는 발행 타이머 시각이
+아니라 grid 생성에 실제 사용한 `Odometry.header.stamp`와 동일하다. 이로써 pose와
+grid contents가 하나의 capture 시점을 나타낸다.
+
+`OccupancyGrid.info.origin`은 차량 위치가 아니라 cell `(0, 0)`의 좌하단 corner를
+`odom`으로 표현한 pose다. 캡처 차량 pose를 `(x, y, yaw)`, 실제 grid 한 변을
+`L = ceil(size / resolution) × resolution`, `h = L / 2`라 하면 다음과 같다.
+
+```text
+origin_position = [x, y] + R(yaw) × [-h, -h]
+origin_yaw      = yaw
+```
+
+Planner와 debug plot은 이 position과 orientation을 함께 사용해 grid 좌표를
+`odom`으로 변환한다. 즉 차량이 다음 costmap 발행 전에 이동하거나 회전해도 기존
+grid는 해당 capture 시점 pose에 고정된다.
+
+30 m 반경과 spatial preview가 겹치지 않도록 Planner의
+`minimum_spatial_preview` 기본값은 `28.0 m`로 설정한다.
+
 ## 12. 대체 Track Map 실행 경로
 
 `simp_planner_tools/launch/track_map.launch.py`는 main scenario launch와 별개다.
@@ -677,6 +724,11 @@ Provider heartbeat는 1.0 s이고 costmap은 전체 free cell이다. 이 launch�
 | `tracking_motion_limit_deg` | 3° | tracking heading 진단 |
 | `planning_deadline_ms` | 100 ms | 진단 threshold |
 | `dynamic_topic_timeout` | 2.0 s | stale topic 진단 |
+
+Debug map은 시나리오에 정의된 모든 장애물을 전역 `odom` 폴리곤으로 표시한다.
+현재 local costmap은 회전된 외곽선, 캡처 시점 차량 중심, 실제 가로·세로 크기와
+차량 Body 축 기준 전/후/좌/우 반경을 함께 표시한다. 기본 60 m 정사각형에서는
+Body x/y 범위가 각각 `-30 .. +30 m`이다.
 
 출력 위치는 `<output_dir>/<scenario>/<timestamp>/`이며 CSV history, status JSON,
 PNG snapshot을 생성한다.

@@ -1,4 +1,7 @@
-from planar_velocity_sim.mode_transition import DriveModeTransitionModel
+from planar_velocity_sim.mode_transition import (
+    DriveModeTransitionModel,
+    VehicleModeStatus,
+)
 
 
 def test_mode_change_requires_standstill_and_feedback_completion():
@@ -15,11 +18,23 @@ def test_mode_change_requires_standstill_and_feedback_completion():
     assert model.update(3.0)
     feedback = model.feedback()
     assert feedback.current_mode == 2
-    assert feedback.transition_complete
-    assert not feedback.transition_in_progress
+    assert feedback.status == VehicleModeStatus.READY
 
 
 def test_same_mode_command_completes_immediately():
     model = DriveModeTransitionModel(initial_mode=1)
     assert model.command(1, measured_speed=0.0, now_sec=0.0)
-    assert model.feedback().transition_complete
+    assert model.feedback().status == VehicleModeStatus.READY
+
+
+def test_spot_turn_aligns_then_applies_rotation_and_returns_to_forward():
+    model = DriveModeTransitionModel(initial_mode=0, transition_duration_sec=2.0)
+    assert not model.command(4, measured_speed=0.2, now_sec=0.0)
+    assert model.command(4, measured_speed=0.0, now_sec=0.0)
+    assert model.applied_velocity(0.0, 0.0, 0.3) == (0.0, 0.0, 0.0)
+    assert model.update(2.0)
+    assert model.feedback().current_mode == 4
+    assert model.applied_velocity(0.0, 0.0, 0.3) == (0.0, 0.0, 0.3)
+    assert model.command(0, measured_speed=0.0, now_sec=3.0)
+    assert model.update(5.0)
+    assert model.applied_velocity(1.5, 0.0, 0.0) == (1.5, 0.0, 0.0)

@@ -78,15 +78,63 @@ void test_math_and_projection() {
   require(std::abs(projection.n - 0.40) < 1e-12, "continuous projection n mismatch");
 }
 
+void test_rotated_costmap_registration() {
+  constexpr int width = 40;
+  constexpr int height = 30;
+  constexpr double resolution = 0.5;
+  constexpr double origin_x = 10.0;
+  constexpr double origin_y = -4.0;
+  constexpr double origin_yaw = 0.5 * simp_planner::kPi;
+  constexpr int occupied_x = 12;
+  constexpr int occupied_y = 8;
+  std::vector<std::int8_t> data(width * height, 0);
+  data[static_cast<std::size_t>(occupied_y * width + occupied_x)] = 100;
+  simp_planner::Costmap2D costmap(
+      std::move(data), width, height, resolution,
+      origin_x, origin_y, origin_yaw);
+
+  const double occupied_local_x =
+      (static_cast<double>(occupied_x) + 0.5) * resolution;
+  const double occupied_local_y =
+      (static_cast<double>(occupied_y) + 0.5) * resolution;
+  const double occupied_world_x = origin_x - occupied_local_y;
+  const double occupied_world_y = origin_y + occupied_local_x;
+  require(costmap.distance_at_world(occupied_world_x, occupied_world_y) < 1.0e-12,
+          "rotated costmap did not register occupied cell in world frame");
+
+  const double free_local_x = 4.25;
+  const double free_local_y = 6.25;
+  const double free_world_x = origin_x - free_local_y;
+  const double free_world_y = origin_y + free_local_x;
+  require(costmap.distance_at_world(free_world_x, free_world_y) > 0.5,
+          "rotated costmap mapped a free world point to the obstacle");
+
+  simp_planner::AllocationResult allocation;
+  allocation.trajectory.x = {occupied_world_x};
+  allocation.trajectory.y = {occupied_world_y};
+  allocation.trajectory.speed = {0.0};
+  allocation.psi = {origin_yaw};
+  const auto collision = simp_planner::check_oriented_allocation_collision(
+      allocation, costmap, {}, {});
+  require(!collision.collision_free,
+          "oriented collision gate ignored rotated costmap registration");
+}
+
 void test_nominal_planning_and_allocation() {
   simp_planner::EnvConfig config;
   require(config.lateral.n_targets.size() == 65, "lateral exploration count mismatch");
-  require(std::abs(config.lateral.n_targets.front() + 8.0) < 1e-12, "lateral minimum mismatch");
-  require(std::abs(config.lateral.n_targets.back() - 8.0) < 1e-12, "lateral maximum mismatch");
+  require(std::abs(config.lateral.n_targets.front() + 3.5) < 1e-12, "lateral minimum mismatch");
+  require(std::abs(config.lateral.n_targets.back() - 3.5) < 1e-12, "lateral maximum mismatch");
+  const double target_spacing = 7.0 / 64.0;
   for (std::size_t i = 1; i < config.lateral.n_targets.size(); ++i) {
-    require(std::abs(config.lateral.n_targets[i] - config.lateral.n_targets[i - 1] - 0.25) < 1e-12,
+    require(std::abs(config.lateral.n_targets[i] - config.lateral.n_targets[i - 1]
+                     - target_spacing) < 1e-12,
             "lateral target spacing mismatch");
   }
+  require(std::abs(config.lateral.near_target_offset - 2.0 * target_spacing) < 1e-12,
+          "near-target threshold must stay two target spacings");
+  require(config.adaptive_replan.maneuver_target_tolerance < config.lateral.near_target_offset,
+          "maneuver release tolerance must be inside the near-target threshold");
   simp_planner::PathVelocityPlanner planner(config, straight_path(), empty_costmap());
   const simp_planner::PlannerState initial{};
   const simp_planner::PlannerAction previous{};
@@ -212,6 +260,7 @@ void test_drive_mode_feedback_supervisor() {
   require(std::abs(simp_planner::motion_heading_from_body_yaw(0.0, DriveMode::Right) + 0.5 * simp_planner::kPi) < 1e-12,
           "right-crab stationary motion heading mismatch");
   using simp_planner::DriveModeControlState;
+  using simp_planner::VehicleModeStatus;
   simp_planner::DriveModeSupervisor supervisor;
   require(supervisor.state(0.0, 0.03) ==
               DriveModeControlState::WaitingForRequest,
@@ -222,7 +271,8 @@ void test_drive_mode_feedback_supervisor() {
               DriveModeControlState::WaitingForFeedback,
           "mode supervisor should wait for vehicle feedback");
   require(!supervisor.update_vehicle_feedback(
-              DriveMode::Forward, DriveMode::Forward, false, true),
+              DriveMode::Forward, DriveMode::Forward,
+              VehicleModeStatus::Ready),
           "unconfirmed mode must not increment generation");
   require(supervisor.state(0.5, 0.03) ==
               DriveModeControlState::StoppingForChange,
@@ -232,13 +282,14 @@ void test_drive_mode_feedback_supervisor() {
   require(supervisor.should_publish_command(0.0, 0.03),
           "mode command should be sent at standstill");
   require(!supervisor.update_vehicle_feedback(
-              DriveMode::Forward, DriveMode::Left, true, false),
+              DriveMode::Forward, DriveMode::Left,
+              VehicleModeStatus::Aligning),
           "in-progress mode must not be confirmed");
   require(!supervisor.ready(), "in-progress mode reported ready");
   require(!supervisor.should_publish_command(0.0, 0.03),
           "matching in-progress command should not be resent");
   require(supervisor.update_vehicle_feedback(
-              DriveMode::Left, DriveMode::Left, false, true),
+              DriveMode::Left, DriveMode::Left, VehicleModeStatus::Ready),
           "completed vehicle mode was not confirmed");
   require(supervisor.ready(), "completed vehicle mode not ready");
   require(supervisor.current_mode() == DriveMode::Left,
@@ -246,7 +297,7 @@ void test_drive_mode_feedback_supervisor() {
   require(supervisor.confirmed_generation() == 1,
           "confirmed mode generation mismatch");
   require(!supervisor.update_vehicle_feedback(
-              DriveMode::Left, DriveMode::Left, false, true),
+              DriveMode::Left, DriveMode::Left, VehicleModeStatus::Ready),
           "repeated feedback must not create a new generation");
 }
 
@@ -305,8 +356,18 @@ void test_soft_input_revision_policy() {
 
   current = planned;
   current.structural_revision += 1;
-  require(!simp_planner::plan_registration_is_current(planned, current),
-          "costmap/safety revision failed to invalidate plan");
+  require(simp_planner::plan_registration_is_current(planned, current),
+          "rolling costmap update incorrectly invalidated plan handover");
+  require(simp_planner::planner_rebuild_required(planned, current),
+          "rolling costmap update did not request planner rebuild");
+
+  current = planned;
+  current.request_revision += 1000;
+  current.structural_revision += 1000;
+  require(simp_planner::plan_registration_is_current(planned, current),
+          "costmap burst incorrectly invalidated plan handover");
+  require(simp_planner::planner_rebuild_required(planned, current),
+          "costmap burst did not preserve latest-map planner rebuild");
 
   current = planned;
   current.command_revision += 1;
@@ -317,6 +378,37 @@ void test_soft_input_revision_policy() {
   current.mode_revision += 1;
   require(!simp_planner::plan_registration_is_current(planned, current),
           "confirmed vehicle-mode change failed to invalidate plan");
+}
+
+void test_costmap_refresh_collision_gate() {
+  constexpr int width = 20;
+  constexpr int height = 20;
+  constexpr double resolution = 0.5;
+  constexpr double origin = -5.0;
+  std::vector<std::int8_t> free_data(width * height, 0);
+  auto blocked_data = free_data;
+  const int center_x = static_cast<int>(std::floor(-origin / resolution));
+  const int center_y = static_cast<int>(std::floor(-origin / resolution));
+  blocked_data[static_cast<std::size_t>(center_y * width + center_x)] = 100;
+
+  const simp_planner::Costmap2D free_map(
+      std::move(free_data), width, height, resolution, origin, origin);
+  const simp_planner::Costmap2D blocked_map(
+      std::move(blocked_data), width, height, resolution, origin, origin);
+  simp_planner::AllocationResult pending;
+  pending.trajectory.x = {0.0};
+  pending.trajectory.y = {0.0};
+  pending.trajectory.speed = {0.0};
+  pending.psi = {0.0};
+  const simp_planner::OrientedFootprintConfig footprint{
+      3, 0.20, 2.0 * simp_planner::kPi / 180.0};
+
+  require(simp_planner::check_oriented_allocation_collision(
+              pending, free_map, {}, {}, footprint).collision_free,
+          "safe costmap refresh incorrectly invalidated pending handover");
+  require(!simp_planner::check_oriented_allocation_collision(
+               pending, blocked_map, {}, {}, footprint).collision_free,
+          "colliding costmap refresh failed to invalidate pending handover");
 }
 
 
@@ -407,6 +499,8 @@ simp_planner::Costmap2D two_bottleneck_costmap() {
 
 void test_bottleneck_limiter_and_low_speed_maneuver_latch() {
   simp_planner::EnvConfig config;
+  // This fixture needs its original 32 m horizon to include both bottlenecks.
+  config.adaptive_replan.minimum_spatial_preview = 32.0;
   simp_planner::PathVelocityPlanner planner(
       config, straight_path(), two_bottleneck_costmap());
   simp_planner::PlannerState state;
@@ -660,6 +754,68 @@ void test_terminal_safe_region_keeps_center_when_clear() {
           "clear terminal region reported a nonzero goal offset");
 }
 
+void test_low_speed_docking_reference_priority() {
+  constexpr int width = 500, height = 200;
+  constexpr double resolution = 0.1;
+  std::vector<std::int8_t> data(width * height, 0);
+  // Safe alongside the forward-oriented vehicle, but inside the external
+  // circle's preferred clearance: the old cost ranking pushes away.
+  for (int iy = 119; iy <= 123; ++iy) {
+    for (int ix = 0; ix < width; ++ix) data[iy * width + ix] = 100;
+  }
+  const simp_planner::Costmap2D map(data, width, height, resolution, -10.0, -10.0);
+  simp_planner::EnvConfig config;
+  simp_planner::PlannerState state;
+  state.x = 5.0;
+  state.speed = 0.5;
+  const simp_planner::PlanningCommand command{0.5, simp_planner::DriveMode::Forward};
+  auto old_config = config;
+  old_config.terminal.reference_tracking_distance = 0.0;
+  simp_planner::PathVelocityPlanner old_planner(old_config, straight_path(15.0), map);
+  const auto old_plan = old_planner.plan(state, {}, command);
+  require(std::abs(old_plan.diagnostics.selected_n_target) > 0.01,
+          "docking fixture did not reproduce the soft-cost reference deviation");
+
+  simp_planner::PathVelocityPlanner planner(config, straight_path(15.0), map);
+  const auto result = planner.plan(state, {}, command);
+  require(result.trajectory.safe(), "reference docking plan is infeasible");
+  require(result.diagnostics.lateral_selection_basis == "DOCKING_REFERENCE_MIN_OFFSET",
+          "low-speed docking did not activate reference priority");
+  require(std::abs(result.diagnostics.selected_n_target) < 1e-9,
+          "safe docking reference was displaced by obstacle cost");
+  require(simp_planner::allocate_with_oriented_collision_search(
+              result.motion, map, config.vehicle, config.cost).collision.collision_free,
+          "reference preference selected an unsafe allocated docking trajectory");
+  // Final allocation may reject the nominal reference in another orientation.
+  // Exclusion must still permit a non-center fallback (no hard center lock).
+  planner.set_one_shot_excluded_paths({}, {0.0});
+  const auto fallback = planner.plan(state, {}, command);
+  require(fallback.trajectory.safe() && std::abs(fallback.diagnostics.selected_n_target) > 1e-9,
+          "docking reference priority prevented excluded-center fallback");
+
+  simp_planner::PathVelocityPlanner cruise(config, straight_path(90.0), map);
+  require(cruise.plan(state, {}, command).diagnostics.lateral_selection_basis == "SPATIAL_ONLY",
+          "docking priority leaked outside the approach distance");
+  simp_planner::PathVelocityPlanner fast(config, straight_path(15.0), map);
+  require(fast.plan(state, {}, {2.0, simp_planner::DriveMode::Forward})
+              .diagnostics.lateral_selection_basis == "SPATIAL_ONLY",
+          "docking priority activated for a high requested speed");
+
+  // A lateral docking approach can safely stop closer to a wall in front of
+  // the motion direction than the external circle suggests.
+  const auto dock_map = blocking_wall_costmap(16.5);
+  for (auto mode : {simp_planner::DriveMode::Left, simp_planner::DriveMode::Right}) {
+    simp_planner::PathVelocityPlanner crab(config, straight_path(15.0), dock_map);
+    state.x = 13.0;
+    const auto plan = crab.plan(state, {}, {0.5, mode});
+    require(plan.trajectory.safe() && std::abs(plan.diagnostics.selected_n_target) < 1e-9,
+            "crab docking did not preserve the reference");
+    require(simp_planner::allocate_with_oriented_collision_search(
+                plan.motion, dock_map, config.vehicle, config.cost).collision.collision_free,
+            "crab docking reference failed the actual body collision check");
+  }
+}
+
 void test_terminal_braking_fallback_recovers_from_early_stop() {
   simp_planner::EnvConfig config;
   const std::vector<double> accelerations{-0.10, 0.0, 0.05, 0.10};
@@ -709,16 +865,48 @@ void test_terminal_virtual_extension_within_tolerance() {
           "terminal virtual extension exceeded longitudinal tolerance");
 }
 
+void test_blocked_path_end_starts_terminal_stop_within_horizon() {
+  // 도크처럼 경로 끝 3 m 앞이 벽이면, 정지거리보다 먼 곳에서도 시야(속도 x horizon) 안이면
+  // 종단 정지가 켜져 궤적이 경로 끝을 넘어 벽으로 연장되지 않아야 한다.
+  simp_planner::EnvConfig config;
+  simp_planner::PlannerState state;
+  state.x = 12.0;
+  state.speed = 1.0;
+  const simp_planner::PlanningCommand command{1.0, simp_planner::DriveMode::Forward};
+
+  simp_planner::PathVelocityPlanner open_end(config, straight_path(15.0), empty_costmap());
+  require(!open_end.plan(state, {}, command).diagnostics.terminal_constraint_active,
+          "open path end activated terminal stop beyond the stopping distance");
+
+  simp_planner::PathVelocityPlanner docking(
+      config, straight_path(15.0), blocking_wall_costmap(18.0));
+  const auto result = docking.plan(state, {}, command);
+  require(result.diagnostics.terminal_constraint_active,
+          "blocked path end did not start terminal stop within the planning horizon");
+  require(result.trajectory.safe(), "blocked path end approach was not feasible");
+  for (const auto& planned : result.trajectory.states) {
+    require(planned.x <= 15.0 + config.terminal.longitudinal_tolerance,
+            "trajectory ran past a blocked path end toward the wall");
+  }
+}
+
 void test_scheduler_and_safety_tail() {
   simp_planner::LatestOnlyPlanningScheduler scheduler(10.0, 0.5, 0.005);
   scheduler.request(0, 1, 1, "INITIAL", true);
   auto first = scheduler.begin_if_due(0, false, false);
   require(first.has_value(), "urgent initial request not consumed");
-  scheduler.request(1000000, 2, 1, "ODOM", false);
-  require(!scheduler.begin_if_due(5000000, true, false).has_value(),
+  for (std::uint64_t revision = 2; revision <= 10; ++revision) {
+    scheduler.request(
+        static_cast<std::int64_t>(revision) * 1000000,
+        revision, revision, "COSTMAP_CHANGED", true);
+  }
+  require(!scheduler.begin_if_due(50000000, true, false).has_value(),
           "frequency cap violated");
-  require(scheduler.begin_if_due(100000000, true, false).has_value(),
-          "coalesced request not consumed");
+  const auto coalesced = scheduler.begin_if_due(100000000, true, false);
+  require(coalesced.has_value(), "coalesced request not consumed");
+  require(coalesced->input_revision == 10 &&
+              coalesced->structural_revision == 10,
+          "costmap burst did not coalesce to the latest revision");
 
   simp_planner::JerkLimitedSafetyStop safety(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.8);
   for (int i = 0; i < 1000 && !safety.stopped(); ++i) safety.advance(0.01);
@@ -731,9 +919,39 @@ void test_scheduler_and_safety_tail() {
 
 }  // namespace
 
+void test_vx_priority_profile_sits_between_lateral_and_minimum_vy() {
+  using simp_planner::AllocationProfile;
+  for (const auto profile : {AllocationProfile::LateralPriority, AllocationProfile::Balanced,
+                             AllocationProfile::YawPriority, AllocationProfile::MinimumVy,
+                             AllocationProfile::VxPriority}) {
+    const auto parsed = simp_planner::allocation_profile_from_name(
+        simp_planner::allocation_profile_name(profile));
+    require(parsed && *parsed == profile, "allocation profile name round trip failed");
+  }
+  require(!simp_planner::allocation_profile_from_name("NOT_A_PROFILE"),
+          "unknown allocation profile name was accepted");
+  const auto lateral = simp_planner::allocation_limits_for_profile(AllocationProfile::LateralPriority);
+  const auto vx = simp_planner::allocation_limits_for_profile(AllocationProfile::VxPriority);
+  const auto minimum_vy = simp_planner::allocation_limits_for_profile(AllocationProfile::MinimumVy);
+  for (int mode = 0; mode < 2; ++mode) {   // Forward, Reverse
+    require(lateral.beta_max_deviation[mode] > vx.beta_max_deviation[mode] &&
+                vx.beta_max_deviation[mode] > minimum_vy.beta_max_deviation[mode],
+            "vx-priority slip envelope must sit between lateral-priority and minimum-vy");
+    require(lateral.body_yaw_fraction[mode] < vx.body_yaw_fraction[mode] &&
+                vx.body_yaw_fraction[mode] < minimum_vy.body_yaw_fraction[mode],
+            "vx-priority body yaw share must sit between lateral-priority and minimum-vy");
+  }
+  for (int mode = 2; mode < 4; ++mode) {   // Left, Right: crab limits are shared
+    require(vx.beta_max_deviation[mode] == lateral.beta_max_deviation[mode] &&
+                vx.body_yaw_fraction[mode] == lateral.body_yaw_fraction[mode],
+            "vx-priority must not change crab allocation limits");
+  }
+}
+
 int main() {
   try {
     test_math_and_projection();
+    test_rotated_costmap_registration();
     test_nominal_planning_and_allocation();
     test_stationary_hold();
     test_runtime_execution_and_handover();
@@ -741,6 +959,7 @@ int main() {
     test_drive_mode_feedback_supervisor();
     test_terminal_monotonic_braking_with_positive_jerk();
     test_soft_input_revision_policy();
+    test_costmap_refresh_collision_gate();
     test_oriented_footprint_directionality_and_profiles();
     test_bottleneck_limiter_and_low_speed_maneuver_latch();
     test_minimum_vy_collision_retry();
@@ -748,8 +967,11 @@ int main() {
     test_short_path_stop_fallback();
     test_terminal_safe_region_prefers_minimum_safe_offset();
     test_terminal_safe_region_keeps_center_when_clear();
+    test_low_speed_docking_reference_priority();
     test_terminal_braking_fallback_recovers_from_early_stop();
     test_terminal_virtual_extension_within_tolerance();
+    test_blocked_path_end_starts_terminal_stop_within_horizon();
+    test_vx_priority_profile_sits_between_lateral_and_minimum_vy();
     test_scheduler_and_safety_tail();
     std::cout << "all standalone C++ core tests passed\n";
     return 0;

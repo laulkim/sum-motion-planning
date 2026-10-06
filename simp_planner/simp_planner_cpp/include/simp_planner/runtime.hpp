@@ -39,13 +39,22 @@ enum class DriveModeControlState : std::uint8_t {
   WaitingForCompletion = 4,
 };
 
+// 차량이 보고하는 바퀴 configuration 상태. DriveModeState.msg의
+// STATUS_ALIGNING(0)/STATUS_READY(1)와 1:1로 대응한다 -- 예전에는
+// transition_in_progress/transition_complete 두 bool로 나뉘어 있었지만,
+// 실제로 나오는 조합이 항상 서로의 부정(complete == !in_progress)이라
+// 독립적인 정보가 아니었다. 필드 하나로 합친다.
+enum class VehicleModeStatus : std::uint8_t {
+  Aligning = 0,
+  Ready = 1,
+};
+
 class DriveModeSupervisor {
  public:
   bool set_requested_mode(DriveMode mode);
   bool update_vehicle_feedback(DriveMode current_mode,
                                DriveMode vehicle_requested_mode,
-                               bool transition_in_progress,
-                               bool transition_complete);
+                               VehicleModeStatus vehicle_status);
   bool ready() const;
   bool should_publish_command(double measured_speed,
                               double stop_speed_threshold) const;
@@ -56,16 +65,14 @@ class DriveModeSupervisor {
   std::optional<DriveMode> vehicle_requested_mode() const {
     return vehicle_requested_mode_;
   }
-  bool transition_in_progress() const { return transition_in_progress_; }
-  bool transition_complete() const { return transition_complete_; }
+  VehicleModeStatus vehicle_status() const { return vehicle_status_; }
   std::uint64_t confirmed_generation() const { return confirmed_generation_; }
 
  private:
   std::optional<DriveMode> requested_mode_;
   std::optional<DriveMode> current_mode_;
   std::optional<DriveMode> vehicle_requested_mode_;
-  bool transition_in_progress_{false};
-  bool transition_complete_{false};
+  VehicleModeStatus vehicle_status_{VehicleModeStatus::Aligning};
   std::optional<DriveMode> last_confirmed_mode_;
   std::uint64_t confirmed_generation_{0};
 };
@@ -149,6 +156,84 @@ class JerkLimitedSafetyStop {
   double deceleration_limit_{1.0};
   double jerk_limit_{0.8};
   double elapsed_{0.0};
+};
+
+struct SpotTurnConfig {
+  double heading_jump_threshold_rad{0.349066};  // 20 deg
+  double safety_margin{0.0};
+  double yaw_rate_max{0.3};
+  double yaw_rate_accel_max{0.3};
+  double yaw_tolerance_rad{0.02};
+  double yaw_rate_tolerance{0.02};
+};
+
+// Input includes the publisher's extra curvature-sampling point: the last
+// point is dropped after its forward-difference curvature estimates the
+// true last usable point.
+std::shared_ptr<ReferencePath> build_reference_path(
+    const std::vector<double>& x, const std::vector<double>& y,
+    const std::vector<double>& yaw);
+
+struct ReferencePathSplit {
+  std::shared_ptr<ReferencePath> before;
+  std::shared_ptr<ReferencePath> after;  // null when the array has no interior corner.
+};
+
+// Scans the interior of the array for a point whose forward-difference
+// curvature exceeds `curvature_max` -- a heading change sharper than
+// steering can ever track, so no comparison against the vehicle's actual
+// heading is needed: it unconditionally needs a spot turn. When found, the
+// path is split there: `before` ends at the corner (its own last point);
+// `after` restarts on the far side with its own s = 0. Returns `after ==
+// nullptr` when no interior corner exists, with `before` covering the whole
+// array (same result as build_reference_path()).
+ReferencePathSplit split_reference_path_at_corner(
+    const std::vector<double>& x, const std::vector<double>& y,
+    const std::vector<double>& yaw, double curvature_max);
+
+// The body yaw a vehicle in `mode` must hold to drive a reference path whose
+// first point's motion heading is `path_start_psi`.
+double spot_turn_target_body_yaw(double path_start_psi, DriveMode mode);
+
+bool spot_turn_feasible(const Costmap2D& costmap, const PlannerState& state,
+                        const VehicleConfig& vehicle, double safety_margin);
+
+// Acceleration-limited rotation, closed around measured odometry. Completion
+// requires both actual heading and actual yaw rate to settle.
+class YawRotationProfile {
+ public:
+  explicit YawRotationProfile(const SpotTurnConfig& config = {});
+  void engage(double target_yaw);
+  BodyCommand sample(double dt, double measured_yaw, double measured_yaw_rate);
+  bool done() const { return done_; }
+
+ private:
+  SpotTurnConfig config_;
+  double target_yaw_{0.0};
+  double rate_{0.0};
+  bool done_{false};
+};
+
+enum class SpotTurnManeuverState { Inactive, AligningWheels, Rotating };
+
+class SpotTurnManeuver {
+ public:
+  explicit SpotTurnManeuver(const SpotTurnConfig& config = {});
+  void trigger(double target_body_yaw, DriveMode external_mode);
+  bool on_mode_ready(const DriveModeSupervisor& supervisor);
+  std::optional<BodyCommand> sample(double dt, double measured_yaw,
+                                   double measured_yaw_rate,
+                                   DriveModeSupervisor& supervisor);
+  bool set_external_requested_mode(DriveMode mode, DriveModeSupervisor& supervisor);
+  SpotTurnManeuverState state() const { return state_; }
+  const char* state_name() const;
+
+ private:
+  SpotTurnManeuverState state_{SpotTurnManeuverState::Inactive};
+  bool returning_{false};
+  double target_yaw_{0.0};
+  DriveMode external_mode_{DriveMode::Forward};
+  YawRotationProfile rotation_;
 };
 
 struct PlanningRequestToken {

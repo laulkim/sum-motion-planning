@@ -12,7 +12,9 @@ namespace simp_planner {
 
 constexpr double kPi = 3.141592653589793238462643383279502884;
 
-enum class DriveMode : std::uint8_t { Forward = 0, Reverse = 1, Left = 2, Right = 3 };
+enum class DriveMode : std::uint8_t {
+  Forward = 0, Reverse = 1, Left = 2, Right = 3, SpotTurn = 4
+};
 
 double drive_mode_heading_offset(DriveMode mode);
 double motion_heading_from_body_yaw(double body_yaw, DriveMode mode);
@@ -21,6 +23,119 @@ struct PlanningCommand {
   double target_speed{0.0};
   DriveMode drive_mode{DriveMode::Forward};
 };
+
+// Per-cycle call counters for the three core planning stages, used for
+// runtime profiling/visualization (not part of the planning logic itself).
+struct PlanningCallCounts {
+  int spatial_path_generation{0};
+  int trajectory_planning{0};
+  int allocation{0};
+  // Raw number of generate_spatial_path_candidate() invocations, including
+  // every curvature-violation retry (up to 8x recursive re-attempts with an
+  // extended length) and the short-path fallback pass. Unlike
+  // spatial_path_generation above (one per generation-phase entry), this
+  // counts every individual candidate-generation attempt.
+  int spatial_candidate_generation_attempts{0};
+  // How many times a candidate's required curvature was found to exceed
+  // curvature_max. Each occurrence either triggers a retry with an extended
+  // length or, once the retry budget/max_length is exhausted, lets the
+  // over-limit candidate through to screen_spatial_candidate() (which then
+  // marks it curvature_valid=false there). A retried candidate can be
+  // counted here more than once, so this is not a count of distinct
+  // rejected n_targets.
+  int curvature_rejected_candidates{0};
+};
+
+// Per-cycle accumulated wall-clock time (milliseconds) for the same three
+// stages. Spatial path generation and trajectory generation each split into
+// a "normal" and a "terminal/stop" bucket, since the two take different
+// code paths with different cost; allocation (which also performs the
+// trajectory-level collision check) has a single bucket.
+struct PlanningBlockTimings {
+  double spatial_normal_ms{0.0};
+  double spatial_terminal_ms{0.0};
+  double trajectory_normal_ms{0.0};
+  double trajectory_terminal_ms{0.0};
+  double allocation_ms{0.0};
+  // Cross-cutting breakdown by computation kind, orthogonal to the five
+  // stage buckets above (a stage's time is also counted here under whichever
+  // kind of work it was doing). candidate_generation_ms sums every
+  // generate_spatial_path_candidate() call in the cycle, including
+  // curvature-violation retries and the short-path fallback pass.
+  // feasibility_check_ms is the open-loop trajectory simulation plus its
+  // dynamic/kinematic constraint checks. collision_check_ms covers every
+  // obstacle-clearance query (spatial screening, trajectory-level clearance,
+  // and the final oriented multi-circle allocation check). ranking_ms is the
+  // candidate sorting/selection work that picks the best entry at each
+  // stage.
+  double candidate_generation_ms{0.0};
+  double feasibility_check_ms{0.0};
+  double collision_check_ms{0.0};
+  double ranking_ms{0.0};
+  // Further breakdown of candidate_generation_ms into the internal phases of
+  // generate_spatial_path_candidate() (all nested inside it, so each of
+  // these is also counted in candidate_generation_ms and they need not sum
+  // to it exactly; candidate_projection_ms also includes one call site
+  // outside candidate generation, see below). candidate_projection_ms is
+  // matching the vehicle/query state onto the reference path itself: the
+  // once-per-cycle initial Frenet projection (path_.project() at the top of
+  // plan_at_speed()), plus the single-point reference-path evaluate() calls
+  // used to seed a new candidate's boundary conditions and to locate its
+  // real endpoint. It excludes the per-sample-point path evaluation used to
+  // build a candidate's full curve, which is folded into
+  // candidate_curvature_cartesian_ms instead (see below).
+  // candidate_boundary_setup_ms is the initial Frenet boundary conditions
+  // plus the spatial (S) extent/sample-array setup -- a fixed amount of
+  // work per attempt. candidate_polynomial_fit_ms is solving for the
+  // septic/quartic lateral-offset polynomial coefficients, redone on every
+  // curvature-violation retry. candidate_sample_points_ms is evaluating
+  // that polynomial (Horner) at each sample point. candidate_curvature_
+  // cartesian_ms is evaluating the reference path (with virtual extension)
+  // at every sample point of a candidate's full curve, turning the result
+  // into Cartesian (x, y) points, plus the arc-length/curvature/curvature-
+  // rate derived from them.
+  double candidate_projection_ms{0.0};
+  double candidate_boundary_setup_ms{0.0};
+  double candidate_polynomial_fit_ms{0.0};
+  double candidate_sample_points_ms{0.0};
+  double candidate_curvature_cartesian_ms{0.0};
+  // Breakdown of generate_open_loop_trajectory() into its conceptual stages.
+  // trajectory_generation_ms is the total wall-clock time of the whole
+  // function (wraps the entire body; the five entries below are nested
+  // inside it and need not sum to it exactly). trajectory_initial_state_target_ms
+  // is the pre-loop setup: binding the initial handover state and deciding
+  // this call's objective (cruise-to-target-speed vs. terminal-stop). It also
+  // includes the terminal-mode activation decision in plan_at_speed(), run
+  // once per cycle before any candidate is generated: comparing remaining
+  // distance to the reference path's stop point against a jerk-limited
+  // required stopping distance (terminal_constraint_active/terminal_mode_active),
+  // plus the terminal safe-region obstacle check (terminal_safe_region_active).
+  // trajectory_longitudinal_profile_ms is, per simulated step, turning that
+  // objective into v(t)/a(t)/j(t) (terminal feedback control, emergency
+  // braking, or cruise-speed tracking, then jerk/accel clamping).
+  // trajectory_state_calculation_ms is integrating that profile into
+  // arc-length progress (s_{k+1} = s_k + distance) plus the endpoint-overshoot
+  // check, then turning that progress back into path geometry (x, y, heading,
+  // curvature) via interpolate_path and assembling each trajectory point --
+  // both inside the main loop and in the post-loop pass that derives lateral
+  // acceleration/jerk for every state. These two used to be separate buckets
+  // (time parameterization vs. state calculation) but are folded into one:
+  // they run back-to-back on every step with no other work between them, so
+  // splitting them never told us anything the combined number didn't.
+  // trajectory_feasibility_check_ms is the fine-substep dynamic/
+  // kinematic constraint validation loop that produces valid_dynamic (not to
+  // be confused with feasibility_check_ms above, which is the spatial
+  // candidate's curvature check).
+  double trajectory_generation_ms{0.0};
+  double trajectory_initial_state_target_ms{0.0};
+  double trajectory_longitudinal_profile_ms{0.0};
+  double trajectory_state_calculation_ms{0.0};
+  double trajectory_feasibility_check_ms{0.0};
+};
+
+void reset_planning_call_counts();
+PlanningCallCounts planning_call_counts();
+PlanningBlockTimings planning_block_timings();
 
 struct PlannerState {
   double x{0.0};
@@ -64,25 +179,30 @@ struct ConstraintConfig {
 };
 
 struct LateralPathConfig {
+  // ±3.5 m를 65개로 등분 (간격 7/64 = 0.109375 m, 0.0 포함). 개수는 이전 ±8 m 설정과 같다.
   std::vector<double> n_targets{
-      -8.0, -7.75, -7.5, -7.25, -7.0, -6.75, -6.5, -6.25,
-      -6.0, -5.75, -5.5, -5.25, -5.0, -4.75, -4.5, -4.25,
-      -4.0, -3.75, -3.5, -3.25, -3.0, -2.75, -2.5, -2.25,
-      -2.0, -1.75, -1.5, -1.25, -1.0, -0.75, -0.5, -0.25,
-      0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75,
-      2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75,
-      4.0, 4.25, 4.5, 4.75, 5.0, 5.25, 5.5, 5.75,
-      6.0, 6.25, 6.5, 6.75, 7.0, 7.25, 7.5, 7.75,
-      8.0};
+      -3.5, -3.390625, -3.28125, -3.171875, -3.0625, -2.953125, -2.84375, -2.734375,
+      -2.625, -2.515625, -2.40625, -2.296875, -2.1875, -2.078125, -1.96875, -1.859375,
+      -1.75, -1.640625, -1.53125, -1.421875, -1.3125, -1.203125, -1.09375, -0.984375,
+      -0.875, -0.765625, -0.65625, -0.546875, -0.4375, -0.328125, -0.21875, -0.109375,
+      0.0, 0.109375, 0.21875, 0.328125, 0.4375, 0.546875, 0.65625, 0.765625,
+      0.875, 0.984375, 1.09375, 1.203125, 1.3125, 1.421875, 1.53125, 1.640625,
+      1.75, 1.859375, 1.96875, 2.078125, 2.1875, 2.296875, 2.40625, 2.515625,
+      2.625, 2.734375, 2.84375, 2.953125, 3.0625, 3.171875, 3.28125, 3.390625,
+      3.5};
+  // 현재 오프셋과 목표 차이가 이 값보다 작으면 "가까운 목표": 길이 후보를 1개만 만들고
+  // 횡이동 기동으로 고정하지 않는다. 목표 간격의 2칸(이전 0.25 m 간격일 때 0.50 m).
+  double near_target_offset{0.21875};
   double min_length{3.0};
-  double max_length{50.0};
-  double spatial_ds{0.25};
+  double max_length{32.0};
+  double spatial_ds{0.5};
   double dynamic_margin{1.08};
   double preview_extra{2.0};
   int normal_shortlist_size{9};
   int terminal_shortlist_size{3};
   int normal_fallback_batch_size{4};
-  double target_continuity_weight{3.0};
+  // 목표 1칸 이동당 억제력을 이전 0.25 m 간격일 때(3.0 x 0.25^2)와 같게: 3.0 x (0.25/0.109375)^2
+  double target_continuity_weight{15.7};
   bool reference_center_lock_enabled{true};
   double reference_center_lock_obstacle_cost_tolerance{1.0e-12};
   bool short_path_fallback_enabled{true};
@@ -128,18 +248,19 @@ struct CostConfig {
   double w_jerk{0.50};
   double w_heading_accel{0.05};
   double w_lateral_jerk{0.10};
-  double w_lateral_offset{0.08};
-  double w_terminal_offset{0.12};
-  double w_offset_overshoot{2.0};
+  // 레퍼런스 추종을 장애물 회피 여유보다 우선한다 (hard margin/collision 판정은 그대로).
+  double w_lateral_offset{1.5};
+  double w_terminal_offset{2.25};
+  double w_offset_overshoot{15.0};
   double w_curvature{8.0};
   double w_curvature_rate{1.2};
   double w_real_end_offset{90.0};
   double w_real_end_heading{45.0};
-  double w_obstacle{110.0};
-  double w_min_clearance{380.0};
+  double w_obstacle{20.0};
+  double w_min_clearance{60.0};
   double w_collision{2.0e5};
-  double obstacle_soft_margin{0.10};
-  double obstacle_time_headway{0.20};
+  double obstacle_soft_margin{0.05};
+  double obstacle_time_headway{0.05};
   double obstacle_soft_margin_max{1.25};
   double hard_clearance_margin_low_speed{0.10};
   double hard_clearance_margin{0.10};
@@ -147,10 +268,14 @@ struct CostConfig {
 };
 
 struct TerminalConstraintConfig {
-  double activation_margin{3.0};
+  double activation_margin{2.0};
   double minimum_activation_distance{1.0};
   double safe_region_planning_buffer{12.0};
   double safe_region_settle_distance{4.0};
+  // Prefer minimum terminal reference offset on deliberate low-speed approaches.
+  // Set distance to zero to disable; final allocated collision checks still apply.
+  double reference_tracking_distance{22.0};
+  double reference_tracking_speed_max{1.1};
   double longitudinal_tolerance{0.20};
   double speed_tolerance{0.03};
   double acceleration_tolerance{0.10};
@@ -176,7 +301,7 @@ struct AdaptiveReplanConfig {
   // Preserve long-range obstacle awareness at low speed.  The first active
   // bottleneck limiter below prevents a single-target path from being judged
   // against multiple alternating gates at once.
-  double minimum_spatial_preview{32.0};
+  double minimum_spatial_preview{28.0};
   double bottleneck_trigger_extra{1.50};
   double bottleneck_release_extra{2.00};
   double bottleneck_post_buffer{8.0};
@@ -202,7 +327,9 @@ struct AdaptiveReplanConfig {
   // Keep an active lateral maneuver tied to a fixed reference-path end
   // position so frequent replanning does not repeatedly restart the first
   // infinitesimal portion of a seventh-order profile.
-  double maneuver_target_tolerance{0.30};
+  // 고정된 기동 해제 허용치. near_target_offset보다 작아야 해제 후 남은 차이가 다시
+  // 새 기동으로 잡히지 않는다 (목표 범위 축소 비율 3.5/8을 그대로 적용: 0.30 -> 0.13125).
+  double maneuver_target_tolerance{0.13125};
   double maneuver_release_progress_margin{0.50};
 };
 
@@ -237,7 +364,8 @@ class ReferencePath {
   double s_min() const;
   double s_max() const;
   std::size_t size() const;
-  void evaluate(double s_query, double& x, double& y, double& psi, double& kappa) const;
+  void evaluate(double s_query, double& x, double& y, double& psi, double& kappa,
+                double& kappa_s) const;
   FrenetProjection project(double px, double py, double psi) const;
   FrenetProjection project_local(double px, double py, double psi, double s_hint,
                                   double search_back = 2.0,
@@ -267,12 +395,18 @@ class Costmap2D {
             int occupied_threshold = 50, int unknown_value = -1,
             bool unknown_is_occupied = true,
             bool conservative_cell_correction = true);
+  Costmap2D(std::vector<std::int8_t> data, int width, int height,
+            double resolution, double origin_x, double origin_y,
+            double origin_yaw, int occupied_threshold = 50,
+            int unknown_value = -1, bool unknown_is_occupied = true,
+            bool conservative_cell_correction = true);
 
   double distance_at_world(double x, double y) const;
   double clearance_single_circle(double x, double y, double radius) const;
   int width() const { return width_; }
   int height() const { return height_; }
   double resolution() const { return resolution_; }
+  double origin_yaw() const { return origin_yaw_; }
   bool empty() const { return distance_field_.empty(); }
 
  private:
@@ -281,6 +415,9 @@ class Costmap2D {
   double resolution_{0.1};
   double origin_x_{0.0};
   double origin_y_{0.0};
+  double origin_yaw_{0.0};
+  double cos_origin_yaw_{1.0};
+  double sin_origin_yaw_{0.0};
   std::vector<std::int8_t> data_;
   std::vector<double> distance_field_;
 };
@@ -430,9 +567,14 @@ enum class AllocationProfile : std::uint8_t {
   Balanced = 1,
   YawPriority = 2,
   MinimumVy = 3,
+  // LateralPriority보다 차체가 진행 방향을 더 따라 돌아 slip(beta)이 작고 vx가 크다.
+  // MinimumVy만큼 극단적이지는 않아 횡 기동 여유를 남긴다.
+  VxPriority = 4,
 };
 
 const char* allocation_profile_name(AllocationProfile profile);
+// "LATERAL_PRIORITY" 등 allocation_profile_name()과 같은 이름 -> profile. 모르는 이름은 nullopt.
+std::optional<AllocationProfile> allocation_profile_from_name(const std::string& name);
 
 struct OrientedFootprintConfig {
   int circle_count{3};
@@ -522,16 +664,23 @@ AllocationSelectionResult allocate_with_oriented_collision_search(
     const VehicleConfig& vehicle,
     const CostConfig& cost,
     std::optional<AllocatorInitialState> initial_state = std::nullopt,
-    const OrientedFootprintConfig& footprint = OrientedFootprintConfig{});
+    const OrientedFootprintConfig& footprint = OrientedFootprintConfig{},
+    AllocationProfile primary_profile = AllocationProfile::LateralPriority);
 
 class PathVelocityPlanner {
  public:
   PathVelocityPlanner(EnvConfig config, ReferencePath path,
                       std::optional<Costmap2D> costmap = std::nullopt);
 
+  // `known_projection`, when provided, must be path().project(state.x,
+  // state.y, state.chi) already computed by the caller (e.g. planner_node.cpp
+  // frequently needs that same projection for its own terminal-finishing
+  // check right before calling plan()) -- passing it in skips recomputing
+  // that same O(reference point count) nearest-point search here.
   PlanResult plan(const PlannerState& state,
                   const PlannerAction& previous_action,
-                  const PlanningCommand& command);
+                  const PlanningCommand& command,
+                  std::optional<FrenetProjection> known_projection = std::nullopt);
 
   void set_lateral_target_hint(std::optional<double> hint);
   std::optional<double> lateral_target_hint() const { return lateral_target_hint_; }
@@ -557,16 +706,22 @@ class PathVelocityPlanner {
   const std::optional<Costmap2D>& costmap() const { return costmap_; }
 
  private:
+  // `fr` must already be path_.project(state.x, state.y, state.chi) -- both
+  // callers (the plan() speed-trial loop, and emergency_stop() called with
+  // its caller's own state) already have it computed, so it's threaded
+  // through instead of each re-deriving it from scratch.
   PlanResult plan_at_speed(const PlannerState& state,
                            const PlannerAction& previous_action,
                            double target_speed,
                            DriveMode drive_mode,
                            const std::vector<int>& excluded_candidate_ids,
-                           const std::vector<double>& excluded_lateral_targets);
+                           const std::vector<double>& excluded_lateral_targets,
+                           const FrenetProjection& fr);
   TimeTrajectory emergency_stop(const PlannerState& state,
                                 const PlannerAction& previous_action,
                                 double target_speed,
-                                bool terminal_stop_required);
+                                bool terminal_stop_required,
+                                const FrenetProjection& fr);
   std::vector<double> speed_trials(double requested_speed) const;
 
   EnvConfig config_;

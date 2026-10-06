@@ -12,6 +12,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Polygon
+from matplotlib.transforms import Affine2D
 
 from .debug_plot_layout import add_zero_line, create_debug_figure, first_true_time, symmetric_limit
 
@@ -45,6 +46,236 @@ def _vehicle_polygon(x: float, y: float, yaw: float, length: float, width: float
     return corners @ np.asarray([[c, -s], [s, c]]).T + np.asarray([x, y])
 
 
+def _costmap_geometry(
+    snapshot: dict[str, Any],
+    expected_shape: tuple[int, int] | None = None,
+    prefix: str = "costmap",
+) -> dict[str, Any] | None:
+    """Return validated grid geometry expressed in odom coordinates.
+
+    ``prefix`` selects which set of snapshot keys to read: "costmap" is the
+    full grid as received from the sensor/scenario side; "costmap_crop" is
+    the (usually smaller, reference-path-slice-sized) window the planner
+    actually ran its distance transform over -- see
+    LOCAL_COSTMAP_REDESIGN_KR.md. Both share this same key shape:
+    ``{prefix}_origin`` (dict with x/y/yaw), ``{prefix}_resolution``,
+    ``{prefix}_width``, ``{prefix}_height``.
+    """
+    origin = snapshot.get(f"{prefix}_origin")
+    try:
+        origin_x = float(origin["x"])
+        origin_y = float(origin["y"])
+        origin_yaw = float(origin["yaw"])
+        resolution = float(snapshot.get(f"{prefix}_resolution"))
+        default_height, default_width = expected_shape or (0, 0)
+        width = int(snapshot.get(f"{prefix}_width", default_width))
+        height = int(snapshot.get(f"{prefix}_height", default_height))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    if not (
+        math.isfinite(origin_x)
+        and math.isfinite(origin_y)
+        and math.isfinite(origin_yaw)
+        and math.isfinite(resolution)
+        and resolution > 0.0
+        and width > 0
+        and height > 0
+        and (expected_shape is None or expected_shape == (height, width))
+    ):
+        return None
+
+    width_m = width * resolution
+    height_m = height * resolution
+    local_corners = np.asarray(
+        [[0.0, 0.0], [width_m, 0.0], [width_m, height_m], [0.0, height_m]],
+        dtype=float,
+    )
+    c = math.cos(origin_yaw)
+    s = math.sin(origin_yaw)
+    rotation = np.asarray([[c, -s], [s, c]], dtype=float)
+    corners = local_corners @ rotation.T + np.asarray([origin_x, origin_y])
+    center = np.asarray([[0.5 * width_m, 0.5 * height_m]]) @ rotation.T
+    center = center[0] + np.asarray([origin_x, origin_y])
+    return {
+        "origin_x": origin_x,
+        "origin_y": origin_y,
+        "yaw": origin_yaw,
+        "resolution": resolution,
+        "width": width,
+        "height": height,
+        "width_m": width_m,
+        "height_m": height_m,
+        "corners": corners,
+        "center": center,
+    }
+
+
+def _draw_costmap(map_ax: Any, snapshot: dict[str, Any]) -> Any:
+    """Draw a costmap in odom coordinates, with legacy extent fallback."""
+    costmap = snapshot.get("costmap_data")
+    if costmap is None:
+        return None
+
+    costmap_array = np.asarray(costmap)
+    if costmap_array.ndim != 2:
+        return None
+    occupied = np.ma.masked_where(costmap_array < 50, costmap_array)
+
+    geometry = _costmap_geometry(snapshot, costmap_array.shape)
+    if geometry is not None:
+        local_extent = (
+            0.0,
+            geometry["width_m"],
+            0.0,
+            geometry["height_m"],
+        )
+        grid_to_odom = (
+            Affine2D()
+            .rotate(geometry["yaw"])
+            .translate(geometry["origin_x"], geometry["origin_y"])
+        )
+        return map_ax.imshow(
+            occupied,
+            origin="lower",
+            extent=local_extent,
+            transform=grid_to_odom + map_ax.transData,
+            interpolation="nearest",
+            alpha=0.45,
+        )
+
+    # Snapshots written before rotated-grid metadata was introduced contain
+    # only an odom-axis-aligned extent. Keep rendering those unchanged.
+    extent = snapshot.get("costmap_extent")
+    if extent is None:
+        return None
+    return map_ax.imshow(
+        occupied,
+        origin="lower",
+        extent=extent,
+        interpolation="nearest",
+        alpha=0.45,
+    )
+
+
+def _draw_scenario_obstacles(
+    map_ax: Any, snapshot: dict[str, Any]
+) -> list[Polygon]:
+    """Draw every authored scenario obstacle, including those outside the local map."""
+    valid: list[np.ndarray] = []
+    for vertices in snapshot.get("scenario_obstacles", ()) or ():
+        array = np.asarray(vertices, dtype=float)
+        if array.ndim == 2 and array.shape[0] >= 3 and array.shape[1] == 2:
+            if np.all(np.isfinite(array)):
+                valid.append(array)
+
+    artists: list[Polygon] = []
+    for index, vertices in enumerate(valid):
+        artist = Polygon(
+            vertices,
+            closed=True,
+            facecolor="tab:red",
+            edgecolor="darkred",
+            linewidth=1.1,
+            alpha=0.24,
+            zorder=3,
+            label=(f"Scenario obstacles ({len(valid)} total)" if index == 0 else None),
+        )
+        map_ax.add_patch(artist)
+        artists.append(artist)
+    return artists
+
+
+def _costmap_is_vehicle_centered(snapshot: dict[str, Any]) -> bool:
+    semantic = snapshot.get("costmap_vehicle_centered")
+    if semantic is not None:
+        return bool(semantic)
+    return str(snapshot.get("scenario_name", "")).strip().lower() != "track_map"
+
+
+def _draw_costmap_boundary(map_ax: Any, snapshot: dict[str, Any]) -> Polygon | None:
+    """Outline the region the planner actually ran its distance transform over.
+
+    Prefers ``costmap_crop_*`` (the planner's reference-path-slice crop of
+    the received grid, see LOCAL_COSTMAP_REDESIGN_KR.md) and falls back to
+    the raw received ``costmap_*`` grid when a snapshot has no crop metadata
+    (older snapshots, or before the planner has both a path and odom to crop
+    with). The crop is generally NOT centred on the vehicle -- it can reach
+    much further ahead than behind, or further to one side than the other --
+    so the marker/annotation report the vehicle's actual local position
+    rather than assuming it sits at the box's geometric centre.
+    """
+    geometry = _costmap_geometry(snapshot, prefix="costmap_crop")
+    is_planner_window = geometry is not None
+    if geometry is None:
+        geometry = _costmap_geometry(snapshot)
+    if geometry is None:
+        return None
+    width_m = float(geometry["width_m"])
+    height_m = float(geometry["height_m"])
+    vehicle_centered = _costmap_is_vehicle_centered(snapshot)
+    label = f"Costmap {width_m:.1f}×{height_m:.1f} m"
+    if vehicle_centered:
+        qualifier = "planner window" if is_planner_window else "as received"
+        label = f"Local costmap {width_m:.1f}×{height_m:.1f} m ({qualifier})"
+    boundary = Polygon(
+        geometry["corners"],
+        closed=True,
+        fill=False,
+        edgecolor="tab:cyan",
+        linestyle="--",
+        linewidth=1.8,
+        zorder=5,
+        label=label,
+    )
+    map_ax.add_patch(boundary)
+    first_corner = geometry["corners"][0]
+    annotation = f"{width_m:.1f} × {height_m:.1f} m"
+    if vehicle_centered:
+        state = snapshot.get("current_state") or {}
+        try:
+            vehicle_x = float(state["x"])
+            vehicle_y = float(state["y"])
+        except (KeyError, TypeError, ValueError):
+            vehicle_x = vehicle_y = None
+        if vehicle_x is not None:
+            c = math.cos(geometry["yaw"])
+            s = math.sin(geometry["yaw"])
+            dx = vehicle_x - geometry["origin_x"]
+            dy = vehicle_y - geometry["origin_y"]
+            local_x = c * dx + s * dy
+            local_y = -s * dx + c * dy
+            map_ax.scatter(
+                [vehicle_x], [vehicle_y], marker="+", s=80,
+                color="tab:cyan", linewidths=1.6, zorder=6,
+                label="Costmap capture vehicle pose",
+            )
+            annotation += (
+                f"\nvehicle: ahead {width_m - local_x:.1f} m, "
+                f"behind {local_x:.1f} m, "
+                f"left {height_m - local_y:.1f} m, right {local_y:.1f} m"
+            )
+        else:
+            # Snapshot predates per-state vehicle pose, or state is missing
+            # this tick -- fall back to the box's own geometric centre.
+            center = geometry["center"]
+            map_ax.scatter(
+                [center[0]], [center[1]], marker="+", s=80,
+                color="tab:cyan", linewidths=1.6, zorder=6,
+                label="Costmap centre",
+            )
+    map_ax.annotate(
+        annotation,
+        xy=(first_corner[0], first_corner[1]),
+        xytext=(5, 5),
+        textcoords="offset points",
+        fontsize=7.0,
+        color="teal",
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.72},
+        zorder=7,
+    )
+    return boundary
+
+
 def render_debug_snapshot(
     snapshot: dict[str, Any],
     session_dir_value: str,
@@ -70,11 +301,7 @@ def render_debug_snapshot(
     allocation_accel_ax = dashboard.allocation_acceleration
     allocation_consistency_ax = dashboard.allocation_consistency
 
-    costmap = snapshot.get("costmap_data")
-    extent = snapshot.get("costmap_extent")
-    if costmap is not None and extent is not None:
-        occupied = np.ma.masked_where(np.asarray(costmap) < 50, np.asarray(costmap))
-        map_ax.imshow(occupied, origin="lower", extent=extent, interpolation="nearest", alpha=0.45)
+    _draw_costmap(map_ax, snapshot)
 
     global_x = _array(snapshot, "global_x")
     global_y = _array(snapshot, "global_y")
@@ -94,28 +321,39 @@ def render_debug_snapshot(
     if selected_x.size:
         map_ax.plot(selected_x, selected_y, ":", linewidth=2.0, label="Selected trajectory")
 
+    obstacle_artists = _draw_scenario_obstacles(map_ax, snapshot)
+    costmap_boundary = _draw_costmap_boundary(map_ax, snapshot)
+
     state = snapshot.get("current_state") or {}
     projection = snapshot.get("current_projection") or {}
     selected_projection = snapshot.get("selected_projection") or {}
-    if state and projection:
-        map_ax.add_patch(
-            Polygon(
-                _vehicle_polygon(
-                    float(state["x"]),
-                    float(state["y"]),
-                    float(state["body_yaw"]),
-                    float(snapshot["vehicle_length"]),
-                    float(snapshot["vehicle_width"]),
-                ),
-                closed=True,
-                fill=False,
-                linewidth=2.0,
-                label="Vehicle",
-            )
+    vehicle_artist: Polygon | None = None
+    if state:
+        vehicle_artist = Polygon(
+            _vehicle_polygon(
+                float(state["x"]),
+                float(state["y"]),
+                float(state["body_yaw"]),
+                float(snapshot["vehicle_length"]),
+                float(snapshot["vehicle_width"]),
+            ),
+            closed=True,
+            fill=False,
+            linewidth=2.0,
+            zorder=7,
+            label="Vehicle",
         )
-        map_ax.scatter([projection["x"]], [projection["y"]], marker="x", s=70, label="Global projection")
-        if selected_projection:
-            map_ax.scatter([selected_projection["x"]], [selected_projection["y"]], marker="+", s=70, label="Selected projection")
+        map_ax.add_patch(vehicle_artist)
+    if projection:
+        map_ax.scatter(
+            [projection["x"]], [projection["y"]], marker="x", s=70,
+            zorder=8, label="Global projection",
+        )
+    if selected_projection:
+        map_ax.scatter(
+            [selected_projection["x"]], [selected_projection["y"]],
+            marker="+", s=70, zorder=8, label="Selected projection",
+        )
 
     map_x_parts: list[np.ndarray] = []
     map_y_parts: list[np.ndarray] = []
@@ -123,6 +361,18 @@ def render_debug_snapshot(
         if x_values.size and y_values.size:
             map_x_parts.append(x_values)
             map_y_parts.append(y_values)
+    for obstacle in obstacle_artists:
+        vertices = np.asarray(obstacle.get_xy(), dtype=float)
+        map_x_parts.append(vertices[:, 0])
+        map_y_parts.append(vertices[:, 1])
+    if costmap_boundary is not None:
+        vertices = np.asarray(costmap_boundary.get_xy(), dtype=float)
+        map_x_parts.append(vertices[:, 0])
+        map_y_parts.append(vertices[:, 1])
+    if vehicle_artist is not None:
+        vertices = np.asarray(vehicle_artist.get_xy(), dtype=float)
+        map_x_parts.append(vertices[:, 0])
+        map_y_parts.append(vertices[:, 1])
     if map_x_parts:
         map_x = np.concatenate(map_x_parts)
         map_y = np.concatenate(map_y_parts)
@@ -391,6 +641,26 @@ def render_debug_snapshot(
     diagnosis = str(snapshot.get("diagnosis", "UNKNOWN"))
     detail = str(snapshot.get("detail", ""))
     max_odom_delay = max(snapshot.get("odom_callback_delay_history", [0.0]) or [0.0])
+    costmap_geometry = _costmap_geometry(snapshot)
+    if costmap_geometry is None:
+        costmap_status = ["[LOCAL COSTMAP]", "not received"]
+    else:
+        width_m = float(costmap_geometry["width_m"])
+        height_m = float(costmap_geometry["height_m"])
+        costmap_status = [
+            "[LOCAL COSTMAP]",
+            f"size      {width_m:.1f} x {height_m:.1f} m",
+        ]
+        if _costmap_is_vehicle_centered(snapshot):
+            costmap_status.extend(
+                [
+                    f"body x    {-0.5 * width_m:.1f} .. {0.5 * width_m:.1f} m",
+                    f"body y    {-0.5 * height_m:.1f} .. {0.5 * height_m:.1f} m",
+                ]
+            )
+        costmap_status.append(
+            f"obstacles {len(snapshot.get('scenario_obstacles', ()) or ())} total"
+        )
     status_left = [
         f"DIAGNOSIS  {diagnosis}", detail[:72], "",
         "[SCENARIO / STATE]",
@@ -400,7 +670,8 @@ def render_debug_snapshot(
         f"planner   {snapshot.get('planner_state', 'N/A')}",
         f"hold      {snapshot.get('hold_latched', False)}",
         f"mode req/actual {snapshot.get('requested_drive_mode', 'N/A')} / {snapshot.get('vehicle_drive_mode', 'N/A')}",
-        f"mode transition {snapshot.get('vehicle_transition_in_progress', False)} complete={snapshot.get('vehicle_transition_complete', False)}", "",
+        f"mode status {snapshot.get('vehicle_status', 'N/A')}", "",
+        *costmap_status, "",
         "[TIMESTAMP LOGGING]",
         f"odom samples {len(odom_time)}",
         f"cmd samples  {len(cmd_time)}",

@@ -14,6 +14,10 @@ setup(
         ("share/" + package_name, ["package.xml", "README_KR.md"]),
         (join("share", package_name, "maps"), glob("maps/*.csv")),
         (join("share", package_name, "launch"), glob("launch/*.launch.py")),
+        (join("share", package_name, "rviz"), glob("rviz/*.rviz")),
+        (join("share", package_name, "meshes"), glob("meshes/*.dae")),
+        (join("share", package_name, "HDMap", "HDMAP"), glob("../HDMap/HDMAP/*")),
+        (join("share", package_name, "HDMap", "output"), glob("../HDMap/output/*")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
@@ -26,6 +30,11 @@ setup(
             "scenario_manager_node = simp_planner_tools.scenario_manager_node:main",
             "track_map_provider_node = simp_planner_tools.track_map_provider_node:main",
             "debug_plot_node = simp_planner_tools.debug_plot_node:main",
+            "planning_call_count_report_node = simp_planner_tools.planning_call_count_report:main",
+            "vehicle_visualizer_node = simp_planner_tools.vehicle_visualizer_node:main",
+            "hdmap_lane_visualizer_node = simp_planner_tools.hdmap_lane_visualizer_node:main",
+            "scenario_obstacle_visualizer_node = "
+            "simp_planner_tools.scenario_obstacle_visualizer_node:main",
         ],
     },
 )
