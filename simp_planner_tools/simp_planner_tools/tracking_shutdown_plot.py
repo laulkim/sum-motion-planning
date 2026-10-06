@@ -29,6 +29,9 @@ HEADING_MIN_SPEED = 0.05
 # no allocation produced: stops, holds and spot-turn rotations.
 VY_PRIORITY = "LATERAL_PRIORITY"  # beta and vy carry the maneuver, body heading lags
 VX_PRIORITY = "MINIMUM_VY"        # body heading follows the motion, vy kept small
+# Level of each profile in the allocation state graph; "NONE" is trajectory
+# content that no allocation produced (stops, holds and spot-turn rotation).
+ALLOCATION_STATES = {"NONE": 0, VY_PRIORITY: 1, VX_PRIORITY: 2}
 ALLOCATION_COLUMNS = ("start_ns", "allocation_profile")
 ALLOCATION_FILE = "allocation.csv"
 
@@ -137,7 +140,18 @@ def create_figures(data, predicted=True, allocation=None):
         ax.grid(True, alpha=0.3)
     axes[-1].set_xlabel("Elapsed time [s]")
 
-    states, axes = plt.subplots(5, 2, sharex=True, figsize=(14, 13), layout="constrained")
+    # Four rows of state/input pairs, then one full-width allocation state row.
+    # The full-width row has its own horizontal scale, so the last pair row keeps
+    # its time labels too.
+    states = plt.figure(figsize=(14, 13), layout="constrained")
+    grid = states.add_gridspec(5, 2)
+    axes = np.empty((4, 2), dtype=object)
+    for i in range(4):
+        for j in range(2):
+            axes[i, j] = states.add_subplot(grid[i, j], sharex=axes[0, 0] if i or j else None)
+            if i < 3:
+                axes[i, j].tick_params(labelbottom=False)
+    allocation_axis = states.add_subplot(grid[4, :], sharex=axes[0, 0])
     states.canvas.manager.set_window_title("Vehicle states and control inputs")
     states.suptitle("Controller snapshot: predicted pose and body-frame velocities" if predicted
                     else "Vehicle states and body-frame velocity commands")
@@ -171,28 +185,24 @@ def create_figures(data, predicted=True, allocation=None):
                                               data[:, 14]) * deg,
                     "--", label="reference")
     axes[3, 1].set_ylabel("chi_rate [deg/s]")
-    # Which allocation profile produced the command at each control time:
-    # one on/off state graph per profile (both off for stops, holds and turns).
-    profiles = (allocation_profiles(data[:, 19], allocation)
-                if allocation is not None and has_stamps else None)
-    for ax, name, label in ((axes[4, 0], VY_PRIORITY, "Vy-priority"),
-                            (axes[4, 1], VX_PRIORITY, "Vx-priority")):
-        ax.set_ylabel(label)
-        ax.set_ylim(-0.2, 1.2)
-        ax.set_yticks([0, 1], ["off", "on"])
-        if profiles is None:
-            ax.text(0.5, 0.5, "no allocation record", transform=ax.transAxes,
-                    ha="center", va="center")
-            continue
-        state = [math.nan if profile is None else float(profile == name) for profile in profiles]
-        ax.plot(time, state, drawstyle="steps-post", label=name)
-    for row in axes:
-        for ax in row:
-            if ax.lines:
-                ax.legend()
-            ax.grid(True, alpha=0.3)
-    for ax in axes[-1]:
-        ax.set_xlabel("Elapsed time [s]")
+    # Which allocation profile produced the command at each control time, as one
+    # state graph: no allocation (stops, holds and turns), Vy-priority, Vx-priority.
+    allocation_axis.set_ylabel("allocation")
+    allocation_axis.set_ylim(-0.4, 2.4)
+    allocation_axis.set_yticks(list(ALLOCATION_STATES.values()),
+                               ["none (stop/hold/turn)", "Vy-priority", "Vx-priority"])
+    if allocation is not None and has_stamps:
+        state = [ALLOCATION_STATES.get(profile, math.nan)
+                 for profile in allocation_profiles(data[:, 19], allocation)]
+        allocation_axis.plot(time, state, drawstyle="steps-post")
+    else:
+        allocation_axis.text(0.5, 0.5, "no allocation record", transform=allocation_axis.transAxes,
+                             ha="center", va="center")
+    for ax in axes.flat:
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    allocation_axis.grid(True, alpha=0.3)
+    allocation_axis.set_xlabel("Elapsed time [s]")
     return errors, states
 
 
