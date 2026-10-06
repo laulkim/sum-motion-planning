@@ -9,8 +9,11 @@ namespace simp_planner {
 
 bool plan_registration_is_current(const PlanningRevisionState& planned,
                                   const PlanningRevisionState& current) {
-  return planned.structural_revision == current.structural_revision &&
-         planned.command_revision == current.command_revision &&
+  // Rolling costmaps are a latest-only planning input.  A newer map must
+  // rebuild the next planner cycle, but it must not make an already computed
+  // plan impossible to hand over when maps arrive faster than the handover
+  // lead.  Command and confirmed-mode changes still invalidate immediately.
+  return planned.command_revision == current.command_revision &&
          planned.mode_revision == current.mode_revision;
 }
 
@@ -30,11 +33,10 @@ bool DriveModeSupervisor::set_requested_mode(DriveMode mode) {
 
 bool DriveModeSupervisor::update_vehicle_feedback(
     DriveMode current_mode, DriveMode vehicle_requested_mode,
-    bool transition_in_progress, bool transition_complete) {
+    VehicleModeStatus vehicle_status) {
   current_mode_ = current_mode;
   vehicle_requested_mode_ = vehicle_requested_mode;
-  transition_in_progress_ = transition_in_progress;
-  transition_complete_ = transition_complete;
+  vehicle_status_ = vehicle_status;
   if (!ready()) return false;
   const bool changed = !last_confirmed_mode_ || *last_confirmed_mode_ != current_mode;
   if (changed) {
@@ -47,7 +49,7 @@ bool DriveModeSupervisor::update_vehicle_feedback(
 bool DriveModeSupervisor::ready() const {
   return requested_mode_ && current_mode_ &&
          *requested_mode_ == *current_mode_ &&
-         !transition_in_progress_ && transition_complete_;
+         vehicle_status_ == VehicleModeStatus::Ready;
 }
 
 bool DriveModeSupervisor::should_publish_command(
@@ -55,7 +57,7 @@ bool DriveModeSupervisor::should_publish_command(
   if (!requested_mode_ || !current_mode_) return false;
   if (ready()) return false;
   if (measured_speed > stop_speed_threshold) return false;
-  if (transition_in_progress_ && vehicle_requested_mode_ &&
+  if (vehicle_status_ == VehicleModeStatus::Aligning && vehicle_requested_mode_ &&
       *vehicle_requested_mode_ == *requested_mode_) {
     return false;
   }
@@ -291,7 +293,9 @@ bool JerkLimitedSafetyStop::stopped() const {
 
 double JerkLimitedSafetyStop::current_jerk(double dt) const {
   if (stopped()) return 0.0;
-  const double release_speed = std::pow(std::min(acceleration_, 0.0), 2) / (2.0 * jerk_limit_);
+  const double braking_acceleration = std::min(acceleration_, 0.0);
+  const double release_speed = braking_acceleration * braking_acceleration /
+      (2.0 * jerk_limit_);
   const double release_margin = std::max(0.5 * std::abs(acceleration_) * dt, 1.0e-5);
   if (acceleration_ < -1.0e-9 && speed_ <= release_speed + release_margin) return jerk_limit_;
   if (acceleration_ > -deceleration_limit_ + 1.0e-9) return -jerk_limit_;
@@ -335,6 +339,302 @@ BodyCommand JerkLimitedSafetyStop::sample_and_advance(double dt) {
   auto result = sample();
   advance(dt);
   return result;
+}
+
+namespace {
+
+std::vector<double> cumulative_arc_length(const std::vector<double>& x,
+                                         const std::vector<double>& y) {
+  std::vector<double> s(x.size(), 0.0);
+  for (std::size_t i = 1; i < x.size(); ++i) {
+    s[i] = s[i - 1] + std::hypot(x[i] - x[i - 1], y[i] - y[i - 1]);
+  }
+  return s;
+}
+
+// Same forward difference every reference path uses to report its own
+// per-point curvature.
+std::vector<double> estimate_curvature_from_yaw(const std::vector<double>& psi,
+                                               const std::vector<double>& s) {
+  std::vector<double> kappa(psi.size() - 1, 0.0);
+  for (std::size_t i = 0; i < kappa.size(); ++i) {
+    kappa[i] = (psi[i + 1] - psi[i]) / std::max(s[i + 1] - s[i], 1.0e-15);
+  }
+  return kappa;
+}
+
+}  // namespace
+
+std::shared_ptr<ReferencePath> build_reference_path(
+    const std::vector<double>& x, const std::vector<double>& y,
+    const std::vector<double>& yaw) {
+  if (x.size() < 4 || x.size() != y.size() || x.size() != yaw.size()) {
+    throw std::invalid_argument("reference arrays require at least three points plus padding");
+  }
+  for (std::size_t i = 0; i < x.size(); ++i) {
+    if (!std::isfinite(x[i]) || !std::isfinite(y[i]) || !std::isfinite(yaw[i])) {
+      throw std::invalid_argument("reference path contains non-finite values");
+    }
+  }
+  const auto s = cumulative_arc_length(x, y);
+  const auto psi = unwrap_angles(yaw);
+  const auto kappa = estimate_curvature_from_yaw(psi, s);
+  const auto used = kappa.size();  // Drop the trailing curvature-sampling point.
+  return std::make_shared<ReferencePath>(
+      std::vector<double>(s.begin(), s.begin() + static_cast<std::ptrdiff_t>(used)),
+      std::vector<double>(x.begin(), x.begin() + static_cast<std::ptrdiff_t>(used)),
+      std::vector<double>(y.begin(), y.begin() + static_cast<std::ptrdiff_t>(used)),
+      std::vector<double>(psi.begin(), psi.begin() + static_cast<std::ptrdiff_t>(used)), kappa);
+}
+
+ReferencePathSplit split_reference_path_at_corner(
+    const std::vector<double>& x, const std::vector<double>& y,
+    const std::vector<double>& yaw, double curvature_max) {
+  if (x.size() < 4 || x.size() != y.size() || x.size() != yaw.size()) {
+    throw std::invalid_argument("reference arrays require at least three points plus padding");
+  }
+  const auto s = cumulative_arc_length(x, y);
+  const auto psi = unwrap_angles(yaw);
+  const auto kappa = estimate_curvature_from_yaw(psi, s);
+  // kappa.back() belongs to the publisher's own padding point (see
+  // build_reference_path) and is never a real interior corner.
+  for (std::size_t i = 0; i + 1 < kappa.size(); ++i) {
+    if (std::abs(kappa[i]) <= curvature_max) continue;
+    std::vector<double> before_x(x.begin(), x.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+    std::vector<double> before_y(y.begin(), y.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+    std::vector<double> before_yaw(yaw.begin(), yaw.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+    // build_reference_path always drops its own last point as a
+    // curvature-sampling pad; duplicate the corner point itself so the
+    // segment ending there gets a real (zero) curvature, not the spike.
+    before_x.push_back(x[i]);
+    before_y.push_back(y[i]);
+    before_yaw.push_back(yaw[i]);
+    std::vector<double> after_x(x.begin() + static_cast<std::ptrdiff_t>(i) + 1, x.end());
+    std::vector<double> after_y(y.begin() + static_cast<std::ptrdiff_t>(i) + 1, y.end());
+    std::vector<double> after_yaw(yaw.begin() + static_cast<std::ptrdiff_t>(i) + 1, yaw.end());
+    return {build_reference_path(before_x, before_y, before_yaw),
+            build_reference_path(after_x, after_y, after_yaw)};
+  }
+  return {build_reference_path(x, y, yaw), nullptr};
+}
+
+double spot_turn_target_body_yaw(double path_start_psi, DriveMode mode) {
+  return wrap_angle(path_start_psi - drive_mode_heading_offset(mode));
+}
+
+bool spot_turn_feasible(const Costmap2D& costmap, const PlannerState& state,
+                        const VehicleConfig& vehicle, double safety_margin) {
+  const double radius = circumscribed_radius(vehicle.length, vehicle.width,
+                                              vehicle.footprint_margin) + safety_margin;
+  return costmap.clearance_single_circle(state.x, state.y, radius) > 0.0;
+}
+
+YawRotationProfile::YawRotationProfile(const SpotTurnConfig& config) : config_(config) {
+  if (!std::isfinite(config.yaw_rate_max) || config.yaw_rate_max <= 0.0 ||
+      !std::isfinite(config.yaw_rate_accel_max) || config.yaw_rate_accel_max <= 0.0 ||
+      !std::isfinite(config.yaw_tolerance_rad) || config.yaw_tolerance_rad <= 0.0) {
+    throw std::invalid_argument("spot turn rotation limits must be finite and positive");
+  }
+}
+
+void YawRotationProfile::engage(double start_yaw, double target_yaw) {
+  if (!std::isfinite(start_yaw) || !std::isfinite(target_yaw))
+    throw std::invalid_argument("invalid rotation start or target yaw");
+  target_yaw_ = wrap_angle(target_yaw);
+  yaw_ = wrap_angle(start_yaw);
+  rate_ = 0.0;
+  done_ = false;
+}
+
+BodyCommand YawRotationProfile::sample(double dt) {
+  if (!std::isfinite(dt) || dt <= 0.0) throw std::invalid_argument("invalid rotation dt");
+  // Feedback is the previous trajectory point (yaw_, rate_), not odometry.
+  const double start_yaw = yaw_;
+  const double error = wrap_angle(target_yaw_ - start_yaw);
+  const double old_rate = rate_;
+  const double feasible_rate = std::sqrt(2.0 * config_.yaw_rate_accel_max * std::abs(error));
+  const double desired = std::abs(error) <= config_.yaw_tolerance_rad ? 0.0 :
+      std::copysign(std::min(config_.yaw_rate_max, feasible_rate), error);
+  const double delta = config_.yaw_rate_accel_max * dt;
+  rate_ += std::clamp(desired - rate_, -delta, delta);
+  // The command is held for dt, matching how the vehicle executes yaw_rate.
+  yaw_ = wrap_angle(start_yaw + rate_ * dt);
+  done_ = std::abs(error) <= config_.yaw_tolerance_rad && std::abs(rate_) <= 1.0e-9;
+  BodyCommand command{};
+  command.yaw_rate = rate_;
+  command.yaw_acceleration = (rate_ - old_rate) / dt;
+  command.planned_heading_acceleration = command.yaw_acceleration;
+  command.motion_heading = start_yaw;
+  command.motion_heading_rate = rate_;
+  command.segment_start_heading = start_yaw;
+  command.segment_end_heading = yaw_;
+  return command;
+}
+
+SpotTurnManeuver::SpotTurnManeuver(const SpotTurnConfig& config) : rotation_(config) {}
+
+void SpotTurnManeuver::trigger(double target_body_yaw, DriveMode external_mode) {
+  if (state_ != SpotTurnManeuverState::Inactive) throw std::logic_error("spot turn already active");
+  target_yaw_ = target_body_yaw;
+  external_mode_ = external_mode;
+  returning_ = false;
+  state_ = SpotTurnManeuverState::AligningWheels;
+}
+
+bool SpotTurnManeuver::on_mode_ready(const DriveModeSupervisor& supervisor) {
+  if (!supervisor.ready() || state_ != SpotTurnManeuverState::AligningWheels) return false;
+  if (!returning_ && supervisor.requested_mode() == DriveMode::SpotTurn) {
+    state_ = SpotTurnManeuverState::Rotating;
+  } else if (returning_ && supervisor.requested_mode() == external_mode_) {
+    state_ = SpotTurnManeuverState::Inactive;
+    return true;
+  }
+  return false;
+}
+
+std::vector<BodyCommand> SpotTurnManeuver::rotation_commands(double start_yaw, double dt) {
+  if (state_ != SpotTurnManeuverState::Rotating) throw std::logic_error("spot turn is not rotating");
+  if (!std::isfinite(dt) || dt <= 0.0) throw std::invalid_argument("invalid rotation dt");
+  rotation_.engage(start_yaw, target_yaw_);
+  // Guard only: a half turn at the default limits settles in about 12 s.
+  const auto limit = static_cast<std::size_t>(std::ceil(600.0 / dt));
+  std::vector<BodyCommand> commands;
+  do {
+    commands.push_back(rotation_.sample(dt));
+  } while (!rotation_.done() && commands.size() < limit);
+  if (!rotation_.done()) throw std::runtime_error("spot turn rotation did not settle");
+  return commands;
+}
+
+void SpotTurnManeuver::finish_rotation(DriveModeSupervisor& supervisor) {
+  if (state_ != SpotTurnManeuverState::Rotating) throw std::logic_error("spot turn is not rotating");
+  supervisor.set_requested_mode(external_mode_);
+  returning_ = true;
+  state_ = SpotTurnManeuverState::AligningWheels;
+}
+
+bool SpotTurnManeuver::set_external_requested_mode(DriveMode mode, DriveModeSupervisor& supervisor) {
+  external_mode_ = mode;
+  // A request arriving during RETURN alignment must retarget the actual
+  // supervisor as well, otherwise its ready edge would never finish us.
+  return returning_ && supervisor.set_requested_mode(mode);
+}
+
+const char* SpotTurnManeuver::state_name() const {
+  if (state_ == SpotTurnManeuverState::Inactive) return "INACTIVE";
+  if (state_ == SpotTurnManeuverState::Rotating) return "SPOT_TURN_ROTATING";
+  return returning_ ? "SPOT_TURN_ALIGNING_REGULAR" : "SPOT_TURN_ALIGNING_WHEELS";
+}
+
+const char* execution_state_name(ExecutionState state) {
+  switch (state) {
+    case ExecutionState::Idle: return "IDLE";
+    case ExecutionState::ActivePlan: return "ACTIVE_PLAN";
+    case ExecutionState::SafetyStop: return "SAFETY_STOP";
+    case ExecutionState::TerminalHold: return "TERMINAL_HOLD";
+    case ExecutionState::ModeStop: return "MODE_STOP";
+    case ExecutionState::ModeWait: return "MODE_WAIT";
+    case ExecutionState::SpotTurnRotating: return "SPOT_TURN_ROTATING";
+    case ExecutionState::SpotTurnWaitingClearance: return "SPOT_TURN_WAITING_CLEARANCE";
+  }
+  return "UNKNOWN";
+}
+
+std::size_t TrackingTrajectory::index_at(std::int64_t time_ns) const {
+  if (points.empty()) throw std::logic_error("empty tracking trajectory");
+  if (time_ns <= stamp_ns) return 0;
+  const auto index = static_cast<std::size_t>((time_ns - stamp_ns) / period_ns);
+  return std::min(index, points.size() - 1);
+}
+
+const TrackingPoint& TrackingTrajectory::at(std::int64_t time_ns) const {
+  return points[index_at(time_ns)];
+}
+
+BodyCommand hold_command(const BodyCommand& previous, DriveMode previous_mode,
+                         DriveMode mode, double body_yaw) {
+  BodyCommand hold{};
+  hold.beta = mode == previous_mode || mode == DriveMode::SpotTurn
+      ? previous.beta : drive_mode_heading_offset(mode);
+  hold.motion_heading = wrap_angle(body_yaw + hold.beta);
+  hold.segment_start_heading = hold.segment_end_heading = hold.motion_heading;
+  hold.trajectory_time = previous.trajectory_time;
+  return hold;
+}
+
+PredictedHandoverState handover_from_point(const TrackingPoint& point) {
+  const auto& command = point.command;
+  PlannerState state;
+  state.x = point.x;
+  state.y = point.y;
+  state.chi = wrap_angle(point.body_yaw + command.beta);
+  state.speed = command.planned_speed;
+  state.acceleration = command.planned_acceleration;
+  state.motion_heading_rate = command.motion_heading_rate;
+  PlannerAction last_action{command.planned_jerk, command.planned_heading_acceleration};
+  AllocatorInitialState allocator_state{command.beta, command.beta_rate,
+                                         command.yaw_rate, command.yaw_acceleration};
+  return {state, point.body_yaw, last_action, allocator_state, command};
+}
+
+TrackingTrajectoryBuilder::TrackingTrajectoryBuilder(std::int64_t stamp_ns,
+                                                     std::int64_t period_ns)
+    : dt_(1.0e-9 * static_cast<double>(period_ns)) {
+  if (period_ns <= 0) throw std::invalid_argument("tracking period must be positive");
+  trajectory_.stamp_ns = stamp_ns;
+  trajectory_.period_ns = period_ns;
+}
+
+std::int64_t TrackingTrajectoryBuilder::next_time_ns() const {
+  return trajectory_.stamp_ns +
+         static_cast<std::int64_t>(trajectory_.points.size()) * trajectory_.period_ns;
+}
+
+void TrackingTrajectoryBuilder::push(TrackingPoint point) {
+  // Same midpoint-yaw body-velocity integration as the vehicle simulator.
+  const auto& c = point.command;
+  const double yaw_mid = point.body_yaw + 0.5 * c.yaw_rate * dt_;
+  x_ = point.x + (std::cos(yaw_mid) * c.vx - std::sin(yaw_mid) * c.vy) * dt_;
+  y_ = point.y + (std::sin(yaw_mid) * c.vx + std::cos(yaw_mid) * c.vy) * dt_;
+  body_yaw_ = wrap_angle(point.body_yaw + c.yaw_rate * dt_);
+  trajectory_.points.push_back(std::move(point));
+}
+
+void TrackingTrajectoryBuilder::copy_prefix(const TrackingTrajectory& previous,
+                                            std::int64_t until_ns) {
+  if (previous.period_ns != trajectory_.period_ns)
+    throw std::invalid_argument("tracking period changed between trajectories");
+  while (next_time_ns() < until_ns) push(previous.at(next_time_ns()));
+}
+
+void TrackingTrajectoryBuilder::hold_prefix(const TrackingPoint& point, std::int64_t until_ns) {
+  TrackingPoint hold = point;
+  hold.command = hold_command(point.command, point.mode, point.mode, point.body_yaw);
+  hold.segment = TrajectorySegment::Hold;
+  while (next_time_ns() < until_ns) push(hold);
+}
+
+void TrackingTrajectoryBuilder::append(const BodyCommand& command, DriveMode mode,
+                                       TrajectorySegment segment, ExecutionState execution,
+                                       std::uint64_t plan_id) {
+  if (trajectory_.points.empty()) throw std::logic_error("tracking trajectory has no start pose");
+  push({x_, y_, body_yaw_, command, mode, segment, execution, plan_id});
+}
+
+void TrackingTrajectoryBuilder::append_stop(JerkLimitedSafetyStop stop, DriveMode mode,
+                                            ExecutionState execution, std::uint64_t plan_id) {
+  while (!stop.stopped()) {
+    append(stop.sample_and_advance(dt_), mode, TrajectorySegment::Stop, execution, plan_id);
+  }
+  append(stop.sample(), mode, TrajectorySegment::Stop, execution, plan_id);
+}
+
+void TrackingTrajectoryBuilder::append_hold(DriveMode mode, ExecutionState execution,
+                                            std::uint64_t plan_id) {
+  if (trajectory_.points.empty()) throw std::logic_error("tracking trajectory has no start pose");
+  const auto& last = trajectory_.points.back();
+  append(hold_command(last.command, last.mode, mode, body_yaw_), mode,
+         TrajectorySegment::Hold, execution, plan_id);
 }
 
 LatestOnlyPlanningScheduler::LatestOnlyPlanningScheduler(

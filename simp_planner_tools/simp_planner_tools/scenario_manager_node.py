@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 from typing import Optional
@@ -13,7 +14,6 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as PathMessage
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from simp_planner_msgs.msg import DriveModeState
 from simp_planner_msgs.msg import ReferencePath as ReferencePathMessage
 from std_msgs.msg import Float64, String, UInt8
 
@@ -22,7 +22,7 @@ from .scenario_definition import (
     ScenarioDefinition,
     global_display_segments,
     load_scenario_definition,
-    rasterize_scenario_costmap,
+    rasterize_vehicle_costmap,
 )
 from .scenario_path import ScenarioPath
 
@@ -43,8 +43,16 @@ def yaw_to_quaternion(yaw: float) -> tuple[float, float, float, float]:
 class ScenarioState(Enum):
     RUNNING = auto()
     STOPPING = auto()
-    WAITING_MODE_CONFIRMATION = auto()
     COMPLETE = auto()
+
+
+@dataclass(frozen=True)
+class OdomPoseSnapshot:
+    stamp_sec: int
+    stamp_nanosec: int
+    x: float
+    y: float
+    body_yaw: float
 
 
 class ScenarioManagerNode(Node):
@@ -57,10 +65,14 @@ class ScenarioManagerNode(Node):
         self.declare_parameter("target_speed", -1.0)
         self.declare_parameter("frame_id", "odom")
         self.declare_parameter("path_back_length", 5.0)
-        self.declare_parameter("path_ahead_length", 45.0)
+        self.declare_parameter("path_ahead_length", 40.0)
         self.declare_parameter("path_update_distance", 1.0)
         self.declare_parameter("costmap_resolution", -1.0)
+        # Retained for compatibility with existing launch/config files. Local
+        # costmaps now have their own fixed sensor extent and do not use it.
         self.declare_parameter("costmap_margin", 10.0)
+        self.declare_parameter("costmap_size_m", 60.0)
+        self.declare_parameter("costmap_publish_hz", 10.0)
         self.declare_parameter("stop_speed_threshold", 0.03)
         self.declare_parameter("terminal_capture_distance", 0.20)
         self.declare_parameter("projection_search_back", 20)
@@ -78,6 +90,10 @@ class ScenarioManagerNode(Node):
             self.get_parameter("costmap_resolution").value
         )
         self.costmap_margin = float(self.get_parameter("costmap_margin").value)
+        self.costmap_size_m = float(self.get_parameter("costmap_size_m").value)
+        self.costmap_publish_hz = float(
+            self.get_parameter("costmap_publish_hz").value
+        )
         self.stop_speed_threshold = float(
             self.get_parameter("stop_speed_threshold").value
         )
@@ -113,6 +129,10 @@ class ScenarioManagerNode(Node):
             raise ValueError("path_update_distance must be positive")
         if self.costmap_resolution <= 0.0 or self.costmap_margin <= 0.0:
             raise ValueError("Costmap resolution and margin must be positive")
+        if self.costmap_size_m <= 0.0:
+            raise ValueError("costmap_size_m must be positive")
+        if self.costmap_publish_hz <= 0.0:
+            raise ValueError("costmap_publish_hz must be positive")
         static_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -136,19 +156,12 @@ class ScenarioManagerNode(Node):
             String, "/scenario/status", static_qos
         )
         self.create_subscription(Odometry, "/odom", self.odom_callback, 50)
-        self.create_subscription(
-            DriveModeState,
-            "/vehicle/drive_mode_state",
-            self.vehicle_mode_callback,
-            static_qos,
-        )
 
         self.phase_paths = [phase.path for phase in self.scenario.phases]
         self.phase_index = 0
         for index, path in enumerate(tuple(self.phase_paths)):
             self.phase_paths[index] = self.execution_path_for_phase(index, path)
         self.state = ScenarioState.RUNNING
-        self.mode_wait_start_time: Optional[float] = None
         self.last_projection: Optional[PathProjection] = None
         self.last_published_s: Optional[float] = None
         self.last_mode: Optional[int] = None
@@ -161,16 +174,16 @@ class ScenarioManagerNode(Node):
         self.current_remaining = math.nan
         self.current_stop_error = math.nan
         self.current_measured_speed = 0.0
+        self.costmap_odom_snapshot: Optional[OdomPoseSnapshot] = None
         self.received_odom = False
         self.startup_republish_count = 0
         self.current_map_yaw = math.nan
         self.current_motion_yaw = math.nan
-        self.vehicle_current_mode: Optional[int] = None
-        self.vehicle_requested_mode: Optional[int] = None
-        self.vehicle_transition_in_progress = False
-        self.vehicle_transition_complete = False
 
         self.heartbeat_timer = self.create_timer(0.5, self.publish_heartbeat)
+        self.costmap_timer = self.create_timer(
+            1.0 / self.costmap_publish_hz, self.publish_costmap
+        )
         self.publish_costmap()
         self.publish_global_path()
         self.publish_active_reference(0.0, force=True)
@@ -211,18 +224,12 @@ class ScenarioManagerNode(Node):
         return float(self.active_phase.cruise_speed)
 
     def current_target_speed(self) -> float:
-        if self.state in (
-            ScenarioState.WAITING_MODE_CONFIRMATION,
-            ScenarioState.COMPLETE,
-        ):
+        if self.state == ScenarioState.COMPLETE:
             return 0.0
         return self.active_cruise_speed()
 
     def current_mode(self) -> int:
         return int(self.active_phase.mode)
-
-    def elapsed_seconds(self) -> float:
-        return self.get_clock().now().nanoseconds * 1.0e-9
 
     def publish_command(self, *, force: bool = False) -> None:
         target_speed = self.current_target_speed()
@@ -250,28 +257,41 @@ class ScenarioManagerNode(Node):
         # subscribers.  Re-publish them for the first few heartbeats as an
         # additional startup safeguard and to make launch ordering irrelevant.
         if not self.received_odom and self.startup_republish_count < 10:
-            self.publish_costmap()
             self.publish_global_path()
             self.publish_active_reference(0.0, force=True)
             self.startup_republish_count += 1
         self.publish_status()
 
     def publish_costmap(self) -> None:
-        grid, origin_x, origin_y = rasterize_scenario_costmap(
+        snapshot = self.costmap_odom_snapshot
+        if snapshot is None:
+            return
+        grid, origin_x, origin_y, origin_yaw = rasterize_vehicle_costmap(
             self.scenario,
+            vehicle_x=snapshot.x,
+            vehicle_y=snapshot.y,
+            vehicle_yaw=snapshot.body_yaw,
             resolution=self.costmap_resolution,
-            margin=self.costmap_margin,
+            size_m=self.costmap_size_m,
         )
+
         message = OccupancyGrid()
-        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.stamp.sec = snapshot.stamp_sec
+        message.header.stamp.nanosec = snapshot.stamp_nanosec
         message.header.frame_id = self.frame_id
+        message.info.map_load_time.sec = snapshot.stamp_sec
+        message.info.map_load_time.nanosec = snapshot.stamp_nanosec
         message.info.resolution = self.costmap_resolution
         message.info.width = int(grid.shape[1])
         message.info.height = int(grid.shape[0])
         message.info.origin.position.x = origin_x
         message.info.origin.position.y = origin_y
-        message.info.origin.orientation.w = 1.0
-        message.data = grid.reshape(-1).astype(int).tolist()
+        qx, qy, qz, qw = yaw_to_quaternion(origin_yaw)
+        message.info.origin.orientation.x = qx
+        message.info.origin.orientation.y = qy
+        message.info.origin.orientation.z = qz
+        message.info.origin.orientation.w = qw
+        message.data = grid.reshape(-1).tolist()
         self.costmap_pub.publish(message)
 
     def publish_global_path(self) -> None:
@@ -320,7 +340,6 @@ class ScenarioManagerNode(Node):
         data_message.x = local.x.tolist()
         data_message.y = local.y.tolist()
         data_message.yaw = local.yaw.tolist()
-        data_message.curvature = local.kappa.tolist()
         data_message.mode = local.mode.tolist()
         data_message.closed_loop = False
         self.path_data_pub.publish(data_message)
@@ -382,18 +401,33 @@ class ScenarioManagerNode(Node):
             self.phase_paths[next_index] = self.execution_path_for_phase(
                 next_index, translated
             )
+        elif self.scenario.name in ("hdmap_crab1_switch", "hdmap_lap_switch", "fmtc_demo"):
+            # HD-map-authored crab/track geometry (real curvature, not a
+            # synthetic straight line): keep the authored shape and heading,
+            # only translate it so it starts exactly at the actual stop
+            # position -- same reasoning as reverse_switch above. All phases
+            # of these scenarios are already mutually consistent in one
+            # shared local frame, so this is just a safety correction for
+            # real stopping-precision drift.
+            nominal = self.scenario.phases[next_index].path
+            translated = nominal.translated(
+                stop_x - float(nominal.x[0]),
+                stop_y - float(nominal.y[0]),
+            )
+            self.phase_paths[next_index] = self.execution_path_for_phase(
+                next_index, translated
+            )
         self.phase_index = next_index
         self.phase_switch_count += 1
-        self.state = ScenarioState.WAITING_MODE_CONFIRMATION
-        self.mode_wait_start_time = self.elapsed_seconds()
+        self.state = ScenarioState.RUNNING
         self.last_projection = None
         self.last_published_s = None
         self.publish_active_reference(0.0, force=True)
         self.publish_global_path()
         self.publish_command(force=True)
         self.get_logger().info(
-            f"Stopped and requested phase '{self.active_phase.name}', "
-            f"requested_mode={self.current_mode()}; waiting for vehicle confirmation"
+            f"Stopped and started phase '{self.active_phase.name}', "
+            f"requested_mode={self.current_mode()}"
         )
 
     def update_scenario_state(
@@ -412,10 +446,7 @@ class ScenarioManagerNode(Node):
         self.current_stop_error = stop_s - float(projection.s)
         self.current_remaining = max(0.0, self.current_stop_error)
 
-        if self.state in (
-            ScenarioState.WAITING_MODE_CONFIRMATION,
-            ScenarioState.COMPLETE,
-        ):
+        if self.state == ScenarioState.COMPLETE:
             return
 
         # The active reference is clipped exactly at the phase stop target.
@@ -443,28 +474,6 @@ class ScenarioManagerNode(Node):
         if captured:
             self.switch_to_next_phase(x, y, body_yaw)
 
-    def vehicle_mode_callback(self, message: DriveModeState) -> None:
-        self.vehicle_current_mode = int(message.current_mode)
-        self.vehicle_requested_mode = int(message.requested_mode)
-        self.vehicle_transition_in_progress = bool(message.transition_in_progress)
-        self.vehicle_transition_complete = bool(message.transition_complete)
-        if (
-            self.state == ScenarioState.WAITING_MODE_CONFIRMATION
-            and self.vehicle_transition_complete
-            and not self.vehicle_transition_in_progress
-            and self.vehicle_current_mode == self.current_mode()
-        ):
-            self.state = ScenarioState.RUNNING
-            self.mode_wait_start_time = None
-            self.last_published_s = None
-            self.publish_active_reference(0.0, force=True)
-            self.publish_command(force=True)
-            self.get_logger().info(
-                f"Vehicle confirmed mode={self.vehicle_current_mode}. "
-                f"Starting phase '{self.active_phase.name}'."
-            )
-        self.publish_status()
-
     def publish_status(self) -> None:
         payload = {
             "scenario": self.scenario.name,
@@ -473,17 +482,12 @@ class ScenarioManagerNode(Node):
             "phase_count": len(self.scenario.phases),
             "phase_name": self.active_phase.name,
             "requested_drive_mode": self.current_mode(),
-            "vehicle_current_mode": self.vehicle_current_mode,
-            "vehicle_requested_mode": self.vehicle_requested_mode,
-            "vehicle_transition_in_progress": self.vehicle_transition_in_progress,
-            "vehicle_transition_complete": self.vehicle_transition_complete,
             "target_speed": self.current_target_speed(),
             "measured_speed": self.current_measured_speed,
             "remaining_to_terminal": self.current_remaining,
             "signed_stop_error": self.current_stop_error,
             "switch_s": self.active_phase.switch_s,
             "stop_request_distance": self.scenario.stop_request_distance,
-            "mode_confirmation_wait_sec": (0.0 if self.mode_wait_start_time is None else max(0.0, self.elapsed_seconds() - self.mode_wait_start_time)),
             "phase_switch_count": self.phase_switch_count,
             "path_publish_count": self.path_publish_count,
             "obstacle_count": len(self.scenario.obstacles),
@@ -513,6 +517,13 @@ class ScenarioManagerNode(Node):
             return
         speed = math.hypot(vx, vy)
         self.current_measured_speed = speed
+        self.costmap_odom_snapshot = OdomPoseSnapshot(
+            stamp_sec=int(message.header.stamp.sec),
+            stamp_nanosec=int(message.header.stamp.nanosec),
+            x=x,
+            y=y,
+            body_yaw=body_yaw,
+        )
         self.received_odom = True
 
         projection = self.active_path.project(

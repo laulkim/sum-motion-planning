@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>simp_controller</name>
+  <version>1.0.0</version>
+  <description>Plays back the planner's tracking trajectory at the command rate: picks the point for the current time and forwards its velocity and drive mode to the vehicle.</description>
+  <maintainer email="ske03005@cbnu.ac.kr">Jaepoong Lee</maintainer>
+  <license>Proprietary</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>simp_planner_msgs</depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

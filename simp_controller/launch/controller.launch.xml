@@ -1,0 +1,10 @@
+<launch>
+  <arg name="command_frequency_hz" default="100.0" />
+  <node
+    pkg="simp_controller"
+    exec="tracking_controller_node"
+    name="tracking_controller_node"
+    output="screen">
+    <param name="command_frequency_hz" value="$(var command_frequency_hz)" />
+  </node>
+</launch>

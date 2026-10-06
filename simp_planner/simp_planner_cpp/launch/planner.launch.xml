@@ -1,7 +1,12 @@
 <launch>
+  <arg name="costmap_update_period_sec" default="0.20" />
   <node
     pkg="simp_planner_cpp"
     exec="planner_node_cpp"
     name="planner_node"
-    output="screen" />
+    output="screen">
+    <param
+      name="costmap_update_period_sec"
+      value="$(var costmap_update_period_sec)" />
+  </node>
 </launch>
