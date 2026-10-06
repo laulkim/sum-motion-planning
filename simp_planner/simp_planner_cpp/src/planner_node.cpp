@@ -1413,7 +1413,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
       publish_trajectory(*plan);
       publish_plan_status(*plan, plan->compute_ms);
     } else {
-      publish_status(decision.status, 0.0, -1);
+      publish_status(decision.status, 0.0, -1,
+                     decision.action == CycleAction::Continue
+                         ? std::nullopt : std::optional<std::int64_t>(t0));
     }
     publish_execution_state_if_changed(
         execution_state_name(trajectory->at(now_ns()).execution));
@@ -1594,6 +1596,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
     stream << std::fixed << std::setprecision(6)
            << "{\"backend\":\"CPP_NATIVE\""
            << ",\"allocation_profile\":\"" << plan.allocation_profile << "\""
+           << ",\"trajectory_start_ns\":" << plan.start_ns
            << ",\"state\":\"RUNNING\""
            << ",\"block_reason\":\"NONE\""
            << ",\"mode_control\":{"
@@ -1716,14 +1719,18 @@ class PlannerNodeCpp final : public rclcpp::Node {
     status_pub_->publish(message);
   }
 
-  void publish_status(const std::string& status, double compute_ms, int candidate_id) {
+  // `trajectory_start_ns` is set when this cycle committed new trajectory
+  // content starting then; such content was not produced by an allocation.
+  void publish_status(const std::string& status, double compute_ms, int candidate_id,
+                      std::optional<std::int64_t> trajectory_start_ns = std::nullopt) {
     const auto mode_status = mode_status_snapshot();
     std_msgs::msg::String message;
     std::ostringstream stream;
     stream << std::fixed << std::setprecision(3)
            << "{\"backend\":\"CPP_NATIVE\""
-           << ",\"allocation_profile\":\"LATERAL_PRIORITY\""
-           << ",\"state\":\"" << status << "\""
+           << ",\"allocation_profile\":\"NONE\"";
+    if (trajectory_start_ns) stream << ",\"trajectory_start_ns\":" << *trajectory_start_ns;
+    stream << ",\"state\":\"" << status << "\""
            << ",\"block_reason\":\"" << status << "\""
            << ",\"mode_control\":{"
            << "\"requested_mode\":" << mode_status.requested_mode

@@ -8,7 +8,9 @@ import numpy as np
 from simp_planner_msgs.msg import TrackingControl, TrackingTrajectoryPoint
 
 from simp_planner_tools.tracking_shutdown_plot import (
-    COLUMNS, create_figures, motion_heading, motion_heading_rate, sample_row, show_recording)
+    ALLOCATION_COLUMNS, ALLOCATION_FILE, COLUMNS, VX_PRIORITY, VY_PRIORITY, allocation_event,
+    allocation_profiles, create_figures, motion_heading, motion_heading_rate, sample_row,
+    show_recording)
 
 
 def test_shutdown_figures_use_controller_snapshot(tmp_path):
@@ -38,7 +40,7 @@ def test_shutdown_figures_use_controller_snapshot(tmp_path):
     assert invalid[16:19] == (0.0, 0.0, 0.0)
     assert invalid[-1] == 0
     figures = create_figures(np.asarray([row, invalid]))
-    assert [len(figure.axes) for figure in figures] == [3, 8]
+    assert [len(figure.axes) for figure in figures] == [3, 10]
     np.testing.assert_allclose(figures[0].axes[0].lines[0].get_ydata(), [0.0, np.nan])
     np.testing.assert_allclose(figures[1].axes[1].lines[0].get_ydata(), [2.0, 0.0])
     assert figures[1].axes[0].lines[0].get_label() == "predicted"
@@ -52,6 +54,8 @@ def test_shutdown_figures_use_controller_snapshot(tmp_path):
     # Old CSVs remain identifiable as the old, unpredicted calculation.
     legacy = create_figures(np.asarray([row[:19]]), predicted=False)
     assert legacy[1].axes[0].lines[0].get_label() == "actual"
+    # No allocation record: the state graphs say so instead of drawing a guess.
+    assert not legacy[1].axes[8].lines and legacy[1].axes[8].texts
     for figure in legacy:
         plt.close(figure)
 
@@ -64,6 +68,10 @@ def test_single_sample_recording_saves_both_figures_without_display(tmp_path, mo
         writer = csv.writer(file)
         writer.writerow(COLUMNS)
         writer.writerow(sample_row(message, 0))
+    with (tmp_path / ALLOCATION_FILE).open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(ALLOCATION_COLUMNS)
+        writer.writerow((0, VY_PRIORITY))
     show_recording(path)
     for name in ("tracking_errors.png", "tracking_states_inputs.png"):
         assert (tmp_path / name).stat().st_size > 0
@@ -94,3 +102,29 @@ def test_motion_heading_and_rate():
     np.testing.assert_allclose(rate[1:3], 0.2)
     assert math.isnan(rate[3]) and math.isnan(rate[4])
     np.testing.assert_allclose(rate[5], 0.2)
+
+
+def test_allocation_state_graphs():
+    assert allocation_event('{"allocation_profile":"MINIMUM_VY","trajectory_start_ns":5}') == (
+        5, VX_PRIORITY)
+    # Statuses that committed no new trajectory content carry no event.
+    assert allocation_event('{"allocation_profile":"NONE","state":"STALE_PLAN_DISCARDED"}') is None
+    assert allocation_event("not json") is None
+
+    # The last-published content replaces earlier content from its own start on,
+    # even when it starts before content published earlier (shorter handover lead).
+    events = [(10, VY_PRIORITY), (20, "NONE"), (30, VX_PRIORITY), (25, VY_PRIORITY)]
+    assert allocation_profiles([5, 10, 22, 26, 35], events) == [
+        None, VY_PRIORITY, "NONE", VY_PRIORITY, VY_PRIORITY]
+
+    data = np.zeros((5, len(COLUMNS)))
+    data[:, 0] = np.arange(5) * 0.01
+    data[:, 19] = [5, 15, 25, 35, 45]
+    events = [(10, VY_PRIORITY), (20, VX_PRIORITY), (30, "NONE"), (40, VY_PRIORITY)]
+    figures = create_figures(data, allocation=events)
+    vy, vx = figures[1].axes[8], figures[1].axes[9]
+    assert (vy.get_ylabel(), vx.get_ylabel()) == ("Vy-priority", "Vx-priority")
+    np.testing.assert_allclose(vy.lines[0].get_ydata(), [np.nan, 1, 0, 0, 1])
+    np.testing.assert_allclose(vx.lines[0].get_ydata(), [np.nan, 0, 1, 0, 0])
+    for figure in figures:
+        plt.close(figure)

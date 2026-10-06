@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
 import os
 import signal
@@ -22,6 +23,14 @@ COLUMNS = (
 
 # Below this speed the motion direction atan2(vy, vx) is undefined.
 HEADING_MIN_SPEED = 0.05
+
+# Allocation profiles the planner selects between (see
+# allocate_with_oriented_collision_search). NONE marks trajectory content that
+# no allocation produced: stops, holds and spot-turn rotations.
+VY_PRIORITY = "LATERAL_PRIORITY"  # beta and vy carry the maneuver, body heading lags
+VX_PRIORITY = "MINIMUM_VY"        # body heading follows the motion, vy kept small
+ALLOCATION_COLUMNS = ("start_ns", "allocation_profile")
+ALLOCATION_FILE = "allocation.csv"
 
 
 def stamp_ns(stamp):
@@ -62,6 +71,37 @@ def motion_heading_rate(time, yaw_rate, vx, vy):
     return yaw_rate + beta_rate
 
 
+def allocation_event(status_json):
+    """(start_ns, profile) when a planner status reports newly committed
+    trajectory content, otherwise None."""
+    try:
+        status = json.loads(status_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(status, dict) or "trajectory_start_ns" not in status:
+        return None
+    return int(status["trajectory_start_ns"]), str(status.get("allocation_profile", "NONE"))
+
+
+def allocation_profiles(control_ns, events):
+    """Allocation profile of the trajectory content playing at each control time.
+
+    `events` are (start_ns, profile) in publish order. Content published later
+    replaces earlier content from its own start onward, so the profile at t is
+    the one from the last-published event starting at or before t; None before
+    the first event."""
+    starts, profiles = [], []
+    for start, profile in events:
+        while starts and starts[-1] >= start:
+            starts.pop()
+            profiles.pop()
+        starts.append(start)
+        profiles.append(profile)
+    index = np.searchsorted(np.asarray(starts, dtype=float), np.asarray(control_ns, dtype=float),
+                            side="right") - 1
+    return [profiles[i] if i >= 0 else None for i in index]
+
+
 def sample_row(message, origin_ns):
     # The controller owns prediction, reference selection and error calculation.
     state = [math.nan] * 15
@@ -81,7 +121,7 @@ def sample_row(message, origin_ns):
             stamp_ns(message.reference_stamp) if message.valid else math.nan, int(message.valid))
 
 
-def create_figures(data, predicted=True):
+def create_figures(data, predicted=True, allocation=None):
     import matplotlib.pyplot as plt
 
     data = np.atleast_2d(data)
@@ -97,7 +137,7 @@ def create_figures(data, predicted=True):
         ax.grid(True, alpha=0.3)
     axes[-1].set_xlabel("Elapsed time [s]")
 
-    states, axes = plt.subplots(4, 2, sharex=True, figsize=(14, 11), layout="constrained")
+    states, axes = plt.subplots(5, 2, sharex=True, figsize=(14, 13), layout="constrained")
     states.canvas.manager.set_window_title("Vehicle states and control inputs")
     states.suptitle("Controller snapshot: predicted pose and body-frame velocities" if predicted
                     else "Vehicle states and body-frame velocity commands")
@@ -131,9 +171,25 @@ def create_figures(data, predicted=True):
                                               data[:, 14]) * deg,
                     "--", label="reference")
     axes[3, 1].set_ylabel("chi_rate [deg/s]")
+    # Which allocation profile produced the command at each control time:
+    # one on/off state graph per profile (both off for stops, holds and turns).
+    profiles = (allocation_profiles(data[:, 19], allocation)
+                if allocation is not None and has_stamps else None)
+    for ax, name, label in ((axes[4, 0], VY_PRIORITY, "Vy-priority"),
+                            (axes[4, 1], VX_PRIORITY, "Vx-priority")):
+        ax.set_ylabel(label)
+        ax.set_ylim(-0.2, 1.2)
+        ax.set_yticks([0, 1], ["off", "on"])
+        if profiles is None:
+            ax.text(0.5, 0.5, "no allocation record", transform=ax.transAxes,
+                    ha="center", va="center")
+            continue
+        state = [math.nan if profile is None else float(profile == name) for profile in profiles]
+        ax.plot(time, state, drawstyle="steps-post", label=name)
     for row in axes:
         for ax in row:
-            ax.legend()
+            if ax.lines:
+                ax.legend()
             ax.grid(True, alpha=0.3)
     for ax in axes[-1]:
         ax.set_xlabel("Elapsed time [s]")
@@ -149,7 +205,14 @@ def show_recording(path):
 
     with path.open() as file:
         predicted = "predicted_x" in next(csv.reader(file))
-    figures = create_figures(np.loadtxt(path, delimiter=",", skiprows=1), predicted=predicted)
+    allocation = None
+    allocation_path = path.parent / ALLOCATION_FILE
+    if allocation_path.exists():
+        with allocation_path.open() as file:
+            allocation = [(int(row["start_ns"]), row["allocation_profile"])
+                          for row in csv.DictReader(file)]
+    figures = create_figures(np.loadtxt(path, delimiter=",", skiprows=1), predicted=predicted,
+                             allocation=allocation)
     for figure, name in zip(figures, ("tracking_errors.png", "tracking_states_inputs.png")):
         figure.savefig(path.parent / name, dpi=140)
     if interactive:
@@ -165,8 +228,9 @@ def main(args=None):
     import rclpy
     from rclpy.executors import ExternalShutdownException
     from rclpy.node import Node
-    from rclpy.qos import qos_profile_sensor_data
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
     from simp_planner_msgs.msg import TrackingControl
+    from std_msgs.msg import String
 
     rclpy.init(args=args)
     node = Node("tracking_shutdown_plot")
@@ -177,6 +241,9 @@ def main(args=None):
     file = path.open("w", newline="")
     writer = csv.writer(file)
     writer.writerow(COLUMNS)
+    allocation_file = (directory / ALLOCATION_FILE).open("w", newline="")
+    allocation_writer = csv.writer(allocation_file)
+    allocation_writer.writerow(ALLOCATION_COLUMNS)
     origin_ns = None
     count = 0
 
@@ -187,7 +254,16 @@ def main(args=None):
         writer.writerow(sample_row(message, origin_ns))
         count += 1
 
+    def receive_status(message):
+        event = allocation_event(message.data)
+        if event is not None:
+            allocation_writer.writerow(event)
+
     node.create_subscription(TrackingControl, "/tracker/control", receive_control, qos_profile_sensor_data)
+    # Every committed trajectory's start and allocation profile is needed, not
+    # only the latest status, so keep a queue.
+    node.create_subscription(String, "/planner/status", receive_status,
+                             QoSProfile(depth=50, reliability=ReliabilityPolicy.RELIABLE))
     node.get_logger().info(f"Ctrl+C 후 추종 플롯 표시 / 기록: {path}")
     try:
         rclpy.spin(node)
@@ -197,6 +273,7 @@ def main(args=None):
         # 터미널과 launch가 SIGINT를 연달아 보내도 저장/창 실행은 끝낸다.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         file.close()
+        allocation_file.close()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
