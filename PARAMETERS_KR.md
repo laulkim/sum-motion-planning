@@ -358,8 +358,8 @@ Body acceleration/jerk 배열은 계산되지만 위의 `3.2`, `9.0` 값과 비�
 | `VxPriority` | 0.65 / 0.70 | 0.80 / 0.85 | 25° / 22° | 1순위로 선택 가능 |
 
 1순위 profile은 planner 파라미터 `allocation_primary_profile`(기본 `LATERAL_PRIORITY`)로
-고른다. simulation launch는 시나리오의 `allocation_profile`(창고 `warehouse_logistics`는
-`VX_PRIORITY`)을 넘기고, launch 인자 `allocation_profile:=...`로 덮어쓸 수 있다. 1순위의
+고른다. simulation launch는 시나리오의 `allocation_profile`(현재 모든 시나리오
+`LATERAL_PRIORITY`)을 넘기고, launch 인자 `allocation_profile:=...`로 덮어쓸 수 있다. 1순위의
 4초 궤적이 충돌하면 `MinimumVy`로 한 번 더 시도한다. `VxPriority`는 `LateralPriority`보다
 차체가 진행 방향을 더 따라 돌아 slip(beta)이 작고 vx가 크다.
 

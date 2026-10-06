@@ -791,7 +791,6 @@ def build_warehouse_logistics_scenario() -> "ScenarioDefinition":
         terminal_margin=3.0,
         costmap_resolution=0.1,
         markings=tuple(markings),
-        allocation_profile="VX_PRIORITY",
     )
 
 
