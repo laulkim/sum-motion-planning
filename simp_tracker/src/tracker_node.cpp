@@ -12,7 +12,6 @@ class TrackerNode final : public rclcpp::Node {
     declare_parameter("kx", 0.3);
     declare_parameter("ky", 0.2);
     declare_parameter("ktheta", 0.2);
-    declare_parameter("max_prediction_sec", 0.05);
     declare_parameter("base_frame", "base_link");
     velocity_pub_ = create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 1);
     diagnostic_pub_ = create_publisher<simp_planner_msgs::msg::TrackingControl>(
@@ -58,11 +57,11 @@ class TrackerNode final : public rclcpp::Node {
     }
     // 잠금 해제 후에는 이번 cycle의 snapshot만 사용한다.
     const auto now_ns = get_clock()->now().nanoseconds();
-    const auto parameters = get_parameters({"kx", "ky", "ktheta", "max_prediction_sec", "base_frame"});
+    const auto parameters = get_parameters({"kx", "ky", "ktheta", "base_frame"});
     const simp_tracker::Gains gains{parameters[0].as_double(), parameters[1].as_double(),
                                      parameters[2].as_double()};
     auto output = simp_tracker::control_cycle(
-        snapshot, now_ns, gains, parameters[3].as_double(), parameters[4].as_string());
+        snapshot, now_ns, gains, parameters[3].as_string());
     if (output.requested_mode) {
       std_msgs::msg::UInt8 mode;
       mode.data = *output.requested_mode;

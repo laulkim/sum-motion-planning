@@ -166,20 +166,21 @@ def main():
             measured_x = 1.0 + 2.0 * (ns(diagnostic.odom_stamp) - moving_start) * 1.0e-9
             assert diagnostic.reference.x - measured_x > 0.01
 
-            # 궤적이 유효해도 odom이 오래되면 정지하고, 새 측위 수신 시 회복한다.
+            # 측위 갱신이 80ms 이상 중단돼도 궤적이 유효하면 계속 예측/제어한다.
             send_odom = False
-            wait_for(lambda: stopped(commands[-1][1]))
-            wait_for(lambda: diagnostics and not diagnostics[-1].valid
-                     and stopped(diagnostics[-1].command))
-            assert node.get_clock().now().nanoseconds < moving_start + 300000000, \
-                "stopped only after trajectory expired"
-            assert modes[-1] == 2, "stale odom changed mode relay"
+            count = len(commands)
+            wait_for(lambda: len(commands) >= count + 8)
+            assert all(abs(msg.linear.x - 2.0) < 1.0e-9 for _, msg in commands[count:]), \
+                "old odom triggered a time-limit stop"
+            wait_for(lambda: diagnostics and diagnostics[-1].valid
+                     and ns(diagnostics[-1].reference_stamp) - ns(diagnostics[-1].odom_stamp) > 50000000)
+            assert modes[-1] == 2, "old odom changed mode relay"
             send_odom = True
             publish_odom()
             wait_for(lambda: abs(commands[-1][1].linear.x - 2.0) < 1.0e-9)
             print(f"tracker ROS passed: {len(valid)} controls from one trajectory, median {median:.4f}s")
             print("timestamp ordering/equality and frame mismatch/recovery passed")
-            print("delayed-odom prediction, stale-odom stop and recovery passed")
+            print("delayed-odom prediction, unlimited old-odom prediction and refresh passed")
         except Exception:
             log.seek(0)
             print(log.read(), file=sys.stderr)

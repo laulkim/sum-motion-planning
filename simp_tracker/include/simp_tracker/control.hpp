@@ -80,7 +80,7 @@ inline geometry_msgs::msg::Twist lyapunov_control(const Point& reference,
 }
 
 inline Control control_cycle(const Inputs& snapshot, std::int64_t now_ns,
-                             const Gains& gains, double max_prediction_sec = 0.05,
+                             const Gains& gains,
                              const std::string& base_frame = "base_link") {
   Control output;  // 매 cycle의 기본 출력은 zero command다.
   if (!snapshot.trajectory) return output;
@@ -105,8 +105,7 @@ inline Control control_cycle(const Inputs& snapshot, std::int64_t now_ns,
       !std::isfinite(gains.kx) || !std::isfinite(gains.ky) || !std::isfinite(gains.ktheta) ||
       gains.kx <= 0.0 || gains.ky <= 0.0 || gains.ktheta <= 0.0) return output;
   const auto& stamp = odom.header.stamp;
-  if (stamp.sec < 0 || stamp.nanosec >= 1000000000 ||
-      !std::isfinite(max_prediction_sec) || max_prediction_sec <= 0.0) return output;
+  if (stamp.sec < 0 || stamp.nanosec >= 1000000000) return output;
   const auto odom_ns = std::int64_t(stamp.sec) * 1000000000 + stamp.nanosec;
   if (odom_ns > now_ns) return output;
   const auto& trajectory = *snapshot.trajectory;
@@ -118,9 +117,8 @@ inline Control control_cycle(const Inputs& snapshot, std::int64_t now_ns,
   const auto elapsed_ns = std::uint64_t(now_ns) - std::uint64_t(start_ns);
   const auto ahead_ns = (period_ns - elapsed_ns % period_ns) % period_ns;
   const auto prediction_ns = std::uint64_t(now_ns - odom_ns) + ahead_ns;
-  if (prediction_ns > max_prediction_sec * 1.0e9) return output;
   const double dt = prediction_ns * 1.0e-9;
-  // ponytail: 짧은 구간의 실측 body 속도를 유지한다. 전환 오차가 크면 속도 모델을 보강한다.
+  // ponytail: 실측 body 속도를 유지해 외삽한다. 가속/긴 지연의 오차가 크면 모델을 보강한다.
   const double yaw_mid = pose->yaw + 0.5 * velocity.angular.z * dt;
   const double c = std::cos(yaw_mid), s = std::sin(yaw_mid);
   pose->x += (c * velocity.linear.x - s * velocity.linear.y) * dt;

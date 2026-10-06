@@ -76,9 +76,10 @@ chi(tau) = chi0 + kappa*s(tau)
   `yaw_mid = yaw + yaw_rate * dt / 2` 방향으로 병진 이동을 적분한다.
   매 cycle 최신 odometry 원본에서 계산하고, 이전 예측을 누적하지 않는다.
   명령 속도나 목표 속도를 실제 속도 대신 사용하지 않는다.
-- `max_prediction_sec` 기본값은 0.05초이며 런타임 조정 가능하다. 측정 시각부터
-  선택한 point까지의 전체 예측 시간이 이 값을 초과하면 zero command다.
-  이는 초기 설정값으로, 실차 지연·운동 변화·허용 오차에 맞춰 검증해야 한다.
+- 예측 시간 상한은 없다. 측위가 오래돼도 유효한 궤적이 있으면 마지막 실측
+  body 속도를 유지해 선택한 point까지 예측한다. 50ms 초과로 zero command를
+  출력하던 조건과 `max_prediction_sec` parameter는 제거했다.
+  가속·속도 변경·긴 측위 지연에 따른 외삽 오차는 별도로 평가해야 한다.
   미래 시각·잘못된 timestamp·역순/동일 timestamp의 odometry는 수신 시 무시한다.
   무시한 메시지가 기존 odometry의 유효기간을 연장하지는 않는다.
   `base_frame` 기본값은 `base_link`이며 odometry의 `child_frame_id`와 같아야 한다.

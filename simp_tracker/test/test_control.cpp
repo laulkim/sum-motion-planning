@@ -114,7 +114,7 @@ int main() {
     wrong_frame.trajectory = b;
     frame_odom->child_frame_id = "sensor";
     zero(control_cycle(wrong_frame, 1000000001, Gains{}));
-    near(control_cycle(wrong_frame, 1000000001, Gains{}, 0.05, "sensor").velocity.linear.x, 99.0);
+    near(control_cycle(wrong_frame, 1000000001, Gains{}, "sensor").velocity.linear.x, 99.0);
     zero(control_cycle(latest, 1300000001, Gains{}));
     zero(control_cycle(latest, 999999999, Gains{}));
     zero(control_cycle(Inputs{}, 1000000000, Gains{}));
@@ -187,15 +187,27 @@ int main() {
       }
       near(moving->pose.pose.position.x, 0.0); // 예측을 odom 원본에 누적하지 않는다.
     }
-    near(control_cycle(prediction, 1014000000, Gains{}, 0.02).velocity.linear.x, 2.0);
-    const auto too_far = control_cycle(prediction, 1014000000, Gains{}, 0.019);
-    zero(too_far); // now까지는 14ms지만 선택한 점까지는 20ms다.
-    require(too_far.requested_mode == target.requested_mode, "prediction limit changed mode relay");
-    zero(control_cycle(prediction, 1060000000, Gains{})); // stale odom, valid trajectory
-    for (const double limit : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN(),
-                               std::numeric_limits<double>::infinity()}) {
-      zero(control_cycle(prediction, 1014000000, Gains{}, limit));
+    // 오래된 측위도 시간 상한으로 정지하지 않고 선택한 점까지 예측한다.
+    moving->pose.pose.orientation.z = 0.0;
+    moving->pose.pose.orientation.w = 1.0;
+    moving->twist.twist.angular.z = 0.0;
+    for (std::size_t i = 0; i < aligned->points.size(); ++i) {
+      auto& p = aligned->points[i];
+      p.x = 2.0 * i * 0.01;
+      p.y = 0.5 * i * 0.01;
+      p.body_yaw = p.yaw_rate = 0.0;
+      p.vx = 2.0;
+      p.vy = 0.5;
     }
+    for (const auto now : {1060000000LL, 1294000000LL}) {
+      const auto output = control_cycle(prediction, now, Gains{});
+      require(output.diagnostic.valid, "old odom must not trigger a time-limit stop");
+      near(output.velocity.linear.x, 2.0);
+      near(output.velocity.linear.y, 0.5);
+      near(output.diagnostic.ex, 0.0);
+      near(output.diagnostic.ey, 0.0);
+    }
+    zero(control_cycle(prediction, 1300000001, Gains{})); // 궤적 만료는 여전히 정지한다.
     moving->header.stamp.nanosec = 14000001;
     zero(control_cycle(prediction, 1014000000, Gains{})); // future odom, before reference
     moving->header.stamp.nanosec = 1000000000;
