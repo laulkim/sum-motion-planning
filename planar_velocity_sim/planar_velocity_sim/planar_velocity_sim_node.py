@@ -110,6 +110,9 @@ class PlanarVelocitySimNode(Node):
             self.get_logger().error(f"Unsupported drive-mode command: {requested}")
             return
         speed = math.hypot(self.applied_vx, self.applied_vy)
+        # The controller repeats the requested mode every command period; only
+        # a command that changes the vehicle's mode state is worth reporting.
+        before = self.mode_model.feedback()
         accepted = self.mode_model.command(
             requested, measured_speed=speed, now_sec=self.now_seconds()
         )
@@ -117,6 +120,8 @@ class PlanarVelocitySimNode(Node):
             self.get_logger().warning(
                 f"Rejected mode command {requested}: vehicle speed={speed:.3f} m/s"
             )
+            return
+        if self.mode_model.feedback() == before:
             return
         if self.mode_model.transition_in_progress:
             self.command_vx = 0.0

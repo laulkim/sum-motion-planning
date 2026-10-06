@@ -8,5 +8,8 @@ float64 vx
 float64 vy
 float64 yaw_rate
 
-# 차량에 그대로 보낼 모드 (DriveModeState 상수: FORWARD=0 … SPOT_TURN=4)
-uint8 mode
+# 모드 값은 DriveModeState 상수를 쓴다 (FORWARD=0 … SPOT_TURN=4).
+# 배열을 발행할 때 플래너가 마지막으로 확인한 차량의 현재 모드.
+uint8 current_mode
+# 이 점에서 플래너가 요청하는 모드. 컨트롤러가 그대로 차량에 보낸다.
+uint8 requested_mode

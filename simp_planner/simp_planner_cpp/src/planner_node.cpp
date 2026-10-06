@@ -177,7 +177,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
             declare_parameter<double>("planning_handover_margin_sec", 0.03),
             0.95,
             declare_parameter<double>("planning_handover_scale", 1.20)) {
-    trajectory_knot_dt_ = declare_parameter<double>("trajectory_knot_dt_sec", 0.10);
+    trajectory_knot_dt_ = declare_parameter<double>("trajectory_knot_dt_sec", 0.01);
+    trajectory_horizon_sec_ = declare_parameter<double>("trajectory_horizon_sec", 1.0);
     // The tracking trajectory carries no period of its own: its points are
     // command_frequency_hz apart, and the controller must use the same value.
     command_frequency_hz_ = declare_parameter<double>("command_frequency_hz", 100.0);
@@ -202,7 +203,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
       throw std::invalid_argument("invalid spot turn detection/clearance settings");
     }
     maneuver_ = SpotTurnManeuver(spot_turn_config_);
-    if (!(trajectory_knot_dt_ > 0.0) || !(command_frequency_hz_ > 0.0) ||
+    if (!(trajectory_knot_dt_ > 0.0) || !std::isfinite(trajectory_knot_dt_) ||
+        !(trajectory_horizon_sec_ >= trajectory_knot_dt_) ||
+        !std::isfinite(trajectory_horizon_sec_) || !(command_frequency_hz_ > 0.0) ||
         !(planning_period_sec_ > 0.0) || !(costmap_update_period_sec_ > 0.0) ||
         !std::isfinite(costmap_update_period_sec_)) {
       throw std::invalid_argument("planner timing parameters must be positive");
@@ -214,6 +217,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       throw std::invalid_argument("planning_period_sec must be a whole number of command periods");
     }
     config_.longitudinal.dt = trajectory_knot_dt_;
+    config_.longitudinal.horizon = trajectory_horizon_sec_;
     config_.longitudinal.execution_dt = command_dt_;
     footprint_circle_count_ = declare_parameter<int>("oriented_footprint_circle_count", 3);
     footprint_translation_step_m_ = declare_parameter<double>("oriented_footprint_translation_step_m", 0.20);
@@ -276,8 +280,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
 
     RCLCPP_INFO(get_logger(),
                 "Native C++ planner ready: tracking trajectory every %.3f s, "
-                "points every %.3f s, knot=%.3f s, allocation=LATERAL_PRIORITY",
-                planning_period_sec_, command_dt_, trajectory_knot_dt_);
+                "points every %.3f s, plan %.2f s at knot=%.3f s, allocation=LATERAL_PRIORITY",
+                planning_period_sec_, command_dt_, trajectory_horizon_sec_, trajectory_knot_dt_);
   }
 
  private:
@@ -1449,6 +1453,11 @@ class PlannerNodeCpp final : public rclcpp::Node {
     TrackingTrajectoryMsg message;
     message.header.stamp = rclcpp::Time(trajectory.stamp_ns, get_clock()->get_clock_type());
     message.header.frame_id = frame_id;
+    std::optional<DriveMode> vehicle_mode;
+    {
+      std::lock_guard<std::mutex> lock(input_mutex_);
+      vehicle_mode = mode_supervisor_.current_mode();
+    }
     message.points.resize(trajectory.points.size());
     for (std::size_t i = 0; i < trajectory.points.size(); ++i) {
       const auto& point = trajectory.points[i];
@@ -1459,7 +1468,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
       out.vx = point.command.vx;
       out.vy = point.command.vy;
       out.yaw_rate = point.command.yaw_rate;
-      out.mode = static_cast<std::uint8_t>(point.mode);
+      out.current_mode = static_cast<std::uint8_t>(vehicle_mode.value_or(point.mode));
+      out.requested_mode = static_cast<std::uint8_t>(point.mode);
     }
     tracking_pub_->publish(message);
     if (!diagnostics_pub_) return;
@@ -1807,7 +1817,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
   std::uint64_t plan_id_counter_{0};
   std::string execution_state_{"STARTUP"};
 
-  double trajectory_knot_dt_{0.10};
+  double trajectory_knot_dt_{0.01};
+  double trajectory_horizon_sec_{1.0};
   double command_frequency_hz_{100.0};
   double planning_period_sec_{0.10};
   std::int64_t planning_period_ns_{100000000};

@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(simp_planner_msgs REQUIRED)
 
@@ -18,6 +19,7 @@ target_include_directories(tracking_controller_node PRIVATE
 ament_target_dependencies(tracking_controller_node
   rclcpp
   geometry_msgs
+  nav_msgs
   std_msgs
   simp_planner_msgs
 )
@@ -25,12 +27,13 @@ target_compile_options(tracking_controller_node PRIVATE -Wall -Wextra -Wpedantic
 
 if(BUILD_TESTING)
   enable_testing()
-  add_executable(test_tracking_index test/test_tracking_index.cpp)
-  target_include_directories(test_tracking_index PRIVATE
+  add_executable(test_control test/test_control.cpp)
+  target_include_directories(test_control PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
-  target_compile_options(test_tracking_index PRIVATE -Wall -Wextra -Wpedantic)
-  add_test(NAME tracking_index_tests COMMAND test_tracking_index)
+  ament_target_dependencies(test_control geometry_msgs nav_msgs simp_planner_msgs)
+  target_compile_options(test_control PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME tracking_control_tests COMMAND test_control)
 endif()
 
 install(TARGETS

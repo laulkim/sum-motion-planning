@@ -60,17 +60,35 @@ class DriveModeTransitionModel:
 
     def command(self, requested_mode: int, measured_speed: float, now_sec: float) -> bool:
         requested_mode = int(requested_mode)
+
         if requested_mode not in VALID_DRIVE_MODES:
             raise ValueError("requested_mode must be in [0, 4]")
+
+        # 이미 같은 모드로 정상 주행 중이면 아무것도 하지 않는다.
+        if (
+            self.status == VehicleModeStatus.READY
+            and requested_mode == self.current_mode
+        ):
+            return True
+
+        # 이미 같은 모드로 전환 중이면 기존 전환을 그대로 유지한다.
+        if (
+            self.status == VehicleModeStatus.ALIGNING
+            and requested_mode == self.requested_mode
+        ):
+            return True
+
+        # 실제로 다른 모드로 변경할 때만 정지 상태를 요구한다.
         if measured_speed > self.stop_speed_threshold:
             return False
-        if self.status == VehicleModeStatus.ALIGNING and requested_mode == self.requested_mode:
-            return True
+
         self.requested_mode = requested_mode
+
         if requested_mode == self.current_mode:
             self.status = VehicleModeStatus.READY
             self.transition_start_sec = None
             return True
+
         self.status = VehicleModeStatus.ALIGNING
         self.transition_start_sec = float(now_sec)
         return True

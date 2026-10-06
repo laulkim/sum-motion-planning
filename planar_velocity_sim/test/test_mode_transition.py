@@ -27,6 +27,26 @@ def test_same_mode_command_completes_immediately():
     assert model.feedback().status == VehicleModeStatus.READY
 
 
+def test_same_mode_while_moving_is_noop():
+    model = DriveModeTransitionModel(initial_mode=0)
+    before = model.feedback()
+    assert model.command(0, measured_speed=3.0, now_sec=10.0)
+    assert model.feedback() == before
+    assert model.transition_start_sec is None
+    assert not model.command(2, measured_speed=3.0, now_sec=11.0)
+    assert model.feedback() == before
+
+
+def test_repeated_alignment_target_preserves_start_time():
+    model = DriveModeTransitionModel(initial_mode=0, transition_duration_sec=2.0)
+    assert model.command(2, measured_speed=0.0, now_sec=10.0)
+    for time_sec in (10.01, 10.5, 11.99):
+        assert model.command(2, measured_speed=3.0, now_sec=time_sec)
+        assert model.transition_start_sec == 10.0
+    assert model.update(12.0)
+    assert model.current_mode == 2
+
+
 def test_spot_turn_aligns_then_applies_rotation_and_returns_to_forward():
     model = DriveModeTransitionModel(initial_mode=0, transition_duration_sec=2.0)
     assert not model.command(4, measured_speed=0.2, now_sec=0.0)
