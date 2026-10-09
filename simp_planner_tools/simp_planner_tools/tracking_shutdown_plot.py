@@ -1,4 +1,4 @@
-"""종료 후 추종 오차와 상태/입력을 세 Matplotlib 창으로 표시한다."""
+"""종료 후 기존 추종 플롯과 회전별 명령/측정 이동 분석을 표시한다."""
 from __future__ import annotations
 
 import csv
@@ -109,11 +109,20 @@ def show_recording(path):
     interactive = bool(os.environ.get("DISPLAY"))
     matplotlib.use("TkAgg" if interactive else "Agg")
     import matplotlib.pyplot as plt
+    from .spot_turn_analysis import analyze_turns, create_turn_figures, read_series, write_summary
 
     with path.open() as file:
         predicted = "predicted_x" in next(csv.reader(file))
-    figures = create_figures(np.loadtxt(path, delimiter=",", skiprows=1), predicted=predicted)
+    data = np.atleast_2d(np.loadtxt(path, delimiter=",", skiprows=1))
+    figures = create_figures(data, predicted=predicted)
     for figure, name in zip(figures, ("tracking_errors.png", "tracking_states_inputs.png", "tracking_world_errors.png")):
+        figure.savefig(path.parent / name, dpi=140)
+    turns = analyze_turns(data, read_series(path.parent / "odometry.csv", 7),
+                          read_series(path.parent / "drive_mode.csv", 4))
+    write_summary(path.parent / "spot_turn_summary.csv", turns)
+    analysis = create_turn_figures(turns, predicted=predicted)
+    for index, figure in enumerate(analysis):
+        name = "spot_turn_summary.png" if index == 0 else f"spot_turn_{index:02d}.png"
         figure.savefig(path.parent / name, dpi=140)
     if interactive:
         plt.show()
@@ -128,8 +137,9 @@ def main(args=None):
     import rclpy
     from rclpy.executors import ExternalShutdownException
     from rclpy.node import Node
-    from rclpy.qos import qos_profile_sensor_data
-    from simp_planner_msgs.msg import TrackingControl
+    from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
+    from nav_msgs.msg import Odometry
+    from simp_planner_msgs.msg import DriveModeState, TrackingControl
 
     rclpy.init(args=args)
     node = Node("tracking_shutdown_plot")
@@ -137,9 +147,18 @@ def main(args=None):
     directory = directory / ("tracking_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "tracking.csv"
-    file = path.open("w", newline="")
-    writer = csv.writer(file)
-    writer.writerow(COLUMNS)
+    files = []
+
+    def recording(name, columns):
+        file = (directory / name).open("w", newline="")
+        files.append(file)
+        writer = csv.writer(file)
+        writer.writerow(columns)
+        return writer
+
+    writer = recording("tracking.csv", COLUMNS)
+    odom_writer = recording("odometry.csv", ("stamp_ns", "x", "y", "yaw", "vx", "vy", "omega"))
+    mode_writer = recording("drive_mode.csv", ("stamp_ns", "current_mode", "requested_mode", "status"))
     origin_ns = None
     count = 0
 
@@ -150,8 +169,25 @@ def main(args=None):
         writer.writerow(sample_row(message, origin_ns))
         count += 1
 
+    def receive_odometry(message):
+        p, q, v = message.pose.pose.position, message.pose.pose.orientation, message.twist.twist
+        norm = math.hypot(math.hypot(q.x, q.y), math.hypot(q.z, q.w))
+        if not math.isfinite(norm) or norm == 0:
+            return
+        x, y, z, w = q.x / norm, q.y / norm, q.z / norm, q.w / norm
+        yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        odom_writer.writerow((stamp_ns(message.header.stamp), p.x, p.y, yaw,
+                              v.linear.x, v.linear.y, v.angular.z))
+
+    def receive_mode(message):
+        mode_writer.writerow((stamp_ns(message.header.stamp), message.current_mode,
+                              message.requested_mode, message.status))
+
     node.create_subscription(TrackingControl, "/tracker/control", receive_control, qos_profile_sensor_data)
-    node.get_logger().info(f"Ctrl+C 후 추종 플롯 표시 / 기록: {path}")
+    node.create_subscription(Odometry, "/odom", receive_odometry, qos_profile_sensor_data)
+    node.create_subscription(DriveModeState, "/vehicle/drive_mode_state", receive_mode,
+                             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+    node.get_logger().info(f"Ctrl+C 후 추종 플롯 + spot-turn 분석 표시 / 기록: {directory}")
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
@@ -159,7 +195,8 @@ def main(args=None):
     finally:
         # 터미널과 launch가 SIGINT를 연달아 보내도 저장/창 실행은 끝낸다.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
-        file.close()
+        for file in files:
+            file.close()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
