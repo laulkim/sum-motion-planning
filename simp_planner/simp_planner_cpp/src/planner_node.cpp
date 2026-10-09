@@ -360,6 +360,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       chi = last_motion_chi_.value_or(body_yaw);
     }
     last_motion_chi_ = chi;
+    ReferencePathMsg::SharedPtr path_before_odom;
     {
       std::lock_guard<std::mutex> lock(input_mutex_);
       current_state_ = {msg->pose.pose.position.x, msg->pose.pose.position.y,
@@ -369,7 +370,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
       if (current_state_time_ns_ <= 0) current_state_time_ns_ = now_ns();
       odom_frame_ = msg->header.frame_id;
       received_odom_ = true;
+      path_before_odom = std::move(path_before_odom_);
     }
+    if (path_before_odom) path_callback(path_before_odom);
   }
 
   static bool same_reference_path(const ReferencePath& lhs,
@@ -590,6 +593,13 @@ class PlannerNodeCpp final : public rclcpp::Node {
         if (received_odom_ && !odom_frame_.empty() && frame != odom_frame_) {
           throw std::invalid_argument("reference path frame does not match odometry");
         }
+        if (!received_odom_) {
+          // 첫 odom 전에는 current_body_yaw_가 기본값(0)이라 아래 경계 제자리턴
+          // 판별이 틀린다 (예: 남쪽을 보고 출발하는 시나리오에서 가짜 제자리턴이
+          // 잡혀 reference_path_가 빈 채로 남는다). 첫 odom을 받은 뒤 다시 처리한다.
+          path_before_odom_ = msg;
+          return;
+        }
         if (maneuver_.state() != SpotTurnManeuverState::Inactive) {
           if (reference_mode != reference_mode_ || frame != path_frame_) deferred_reference_ = msg;
           return;
@@ -711,7 +721,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
             capture_time_ns < last_capture_time_ns) {
           return;
         }
-        have_path_and_state = received_path_ && received_odom_;
+        // 시작 경계 제자리턴 대기 중에는 received_path_만 서고 reference_path_는 빈다.
+        have_path_and_state = received_path_ && received_odom_ && reference_path_;
         if (have_path_and_state) {
           path_for_crop = reference_path_;
           state_for_crop = current_state_;
@@ -1781,6 +1792,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
   std::shared_ptr<ReferencePath> pending_post_turn_path_;
   SpotTurnManeuver maneuver_;
   ReferencePathMsg::SharedPtr deferred_reference_;
+  ReferencePathMsg::SharedPtr path_before_odom_;
   bool spot_turn_waiting_clearance_{false};
 
   std::shared_ptr<const ReferencePath> reference_path_;

@@ -165,25 +165,20 @@ def create_figures(data, predicted=True, allocation=None):
         axes[i, 1].plot(time, data[:, 13 + i] * scale, "--", label="reference")
         axes[i, 1].set_ylabel(input_label)
     # Motion direction chi = yaw + atan2(vy, vx) and its rate chi_dot = omega + beta_dot.
-    # beta_dot is differenced on each signal's own clock: odometry and reference
-    # stamps when recorded, the control time otherwise (old CSVs).
+    # beta_dot is differenced on the reference stamps when recorded, the control
+    # time otherwise (old CSVs).
     deg = 180 / math.pi
     has_stamps = data.shape[1] > 21
-    measured_time = data[:, 20] * 1e-9 if has_stamps else time
     reference_time = data[:, 21] * 1e-9 if has_stamps else time
     axes[3, 0].plot(time, motion_heading(data[:, 3], data[:, 10], data[:, 11]) * deg,
                     label="predicted" if predicted else "actual")
     axes[3, 0].plot(time, motion_heading(data[:, 6], data[:, 13], data[:, 14]) * deg,
-                    "--", label="reference")
+                    label="reference")
     axes[3, 0].set_ylabel("chi [deg]")
-    axes[3, 1].plot(time, motion_heading_rate(time, data[:, 18], data[:, 16], data[:, 17]) * deg,
-                    label="command")
-    axes[3, 1].plot(time, motion_heading_rate(measured_time, data[:, 12], data[:, 10],
-                                              data[:, 11]) * deg,
-                    label="measured at odom time" if predicted else "actual", alpha=0.7)
+    # command/measured chi_rate는 계단형 신호의 수치 미분이라 스파이크만 커서 reference만 그린다.
     axes[3, 1].plot(time, motion_heading_rate(reference_time, data[:, 15], data[:, 13],
                                               data[:, 14]) * deg,
-                    "--", label="reference")
+                    label="reference")
     axes[3, 1].set_ylabel("chi_rate [deg/s]")
     # Which allocation profile produced the command at each control time, as one
     # state graph: no allocation (stops, holds and turns), Vy-priority, Vx-priority.

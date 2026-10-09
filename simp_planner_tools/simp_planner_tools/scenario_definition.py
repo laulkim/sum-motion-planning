@@ -16,6 +16,8 @@ class ScenarioObstacle:
     length: float
     width: float
     yaw: float = 0.0
+    # RViz 표시용 종류일 뿐 costmap/플래너와는 무관하다: "pallet"(상자 쌓인 팔레트) | "wall"
+    kind: str = "pallet"
 
 
 @dataclass(frozen=True)
@@ -33,6 +35,15 @@ class ScenarioPhase:
     path: ScenarioPath
     cruise_speed: float
     switch_s: float | None = None
+    # 경로 거리 구간별 목표 속도 ((s_start, s_end, speed), ...). 구간 밖은 cruise_speed.
+    # 단계를 나누면 경계마다 정지하므로, 한 단계 안에서 속도만 바꿀 때 쓴다 (예: 램프 감속).
+    speed_zones: tuple[tuple[float, float, float], ...] = ()
+
+    def cruise_speed_at(self, s: float) -> float:
+        for start, end, speed in self.speed_zones:
+            if start <= s <= end:
+                return float(speed)
+        return float(self.cruise_speed)
 
     @property
     def mode(self) -> int:
@@ -40,6 +51,24 @@ class ScenarioPhase:
         if len(values) != 1:
             raise ValueError(f"Scenario phase '{self.name}' must use one drive mode")
         return int(values[0])
+
+
+@dataclass(frozen=True)
+class FloorMarking:
+    """RViz 바닥 표현 전용(구역 칠, 차선, 화살표, 글자). costmap/플래너와 무관하다.
+
+    kind: "area"   points = 볼록 다각형, 채워서 칠한다
+          "line"   points = 폴리라인, width 폭의 띠로 칠한다 (넓으면 램프 노면 같은 면)
+          "dashed" "line"과 같되 점선
+          "arrow"  points = (꼬리, 머리)
+          "label"  points = ((x, y),), text를 띄운다
+    color: 시각화 노드의 FLOOR_COLORS 이름
+    """
+    kind: str
+    points: tuple[tuple[float, float], ...]
+    color: str = "white"
+    width: float = 0.15
+    text: str = ""
 
 
 @dataclass(frozen=True)
@@ -53,6 +82,11 @@ class ScenarioDefinition:
     repeat: bool = False
     costmap_resolution: float = 0.20
     footprint_circle_count: int = 3
+    markings: tuple[FloorMarking, ...] = tuple()
+    start_delay: float = 0.0     # 첫 odom 수신 후 정지 상태로 기다렸다가 출발하는 시간 (s)
+    # 플래너 allocation 1순위 profile (충돌 시 MINIMUM_VY로 재시도). VX_PRIORITY는
+    # LATERAL_PRIORITY보다 slip(beta)을 작게 잡아 vx가 더 나온다.
+    allocation_profile: str = "LATERAL_PRIORITY"
 
     @property
     def default_speed(self) -> float:
@@ -71,6 +105,7 @@ def obstacle_on_path(
     length: float = 3.2,
     width: float = 2.0,
     yaw_offset: float = 0.0,
+    kind: str = "pallet",
 ) -> ScenarioObstacle:
     """Place a rectangular obstacle using the authored path tangent.
 
@@ -90,6 +125,7 @@ def obstacle_on_path(
         length=float(length),
         width=float(width),
         yaw=float(yaw + yaw_offset),
+        kind=kind,
     )
 
 
@@ -348,11 +384,414 @@ def wall_segments_along_path(
         segments.append(
             obstacle_on_path(
                 path, s, lateral_offset=lateral_offset,
-                length=segment_length, width=thickness,
+                length=segment_length, width=thickness, kind="wall",
             )
         )
         s += spacing
     return segments
+
+
+def _clothoid_turn_segment(
+    x0: float, y0: float, heading0: float, turn_angle: float, radius: float,
+    transition_length: float, mode: int, *, ds: float = 0.2,
+) -> ScenarioPath:
+    """곡률이 0 -> ±1/radius로 선형 증가(완화곡선), 유지(원호), 다시 0으로 감소하는 회전.
+
+    직선과 원호를 바로 붙이면 곡률이 계단식으로 튀므로 양 끝에 transition_length만큼
+    완화곡선을 둔다. 샘플 격자가 세 구간 경계를 정확히 지나므로 총 헤딩 변화는 turn_angle과
+    정확히 같다.
+    """
+    kappa_peak = math.copysign(1.0 / radius, turn_angle)
+    arc_length = abs(turn_angle) * radius - transition_length
+    if arc_length < 0.0:
+        raise ValueError("Clothoid transition is longer than the turn allows")
+    breaks = (0.0, transition_length, transition_length + arc_length,
+              2.0 * transition_length + arc_length)
+    s_values = np.concatenate([
+        np.linspace(start, end, max(2, int(math.ceil((end - start) / ds)) + 1))[1 if i else 0:]
+        for i, (start, end) in enumerate(zip(breaks, breaks[1:]))
+    ])
+    kappa = np.interp(s_values, breaks, (0.0, kappa_peak, kappa_peak, 0.0))
+    yaw = heading0 + np.r_[0.0, np.cumsum(0.5 * (kappa[1:] + kappa[:-1]) * np.diff(s_values))]
+    x = np.empty(len(s_values))
+    y = np.empty(len(s_values))
+    x[0], y[0] = x0, y0
+    for i in range(1, len(s_values)):
+        d = s_values[i] - s_values[i - 1]
+        mean_yaw = 0.5 * (yaw[i - 1] + yaw[i])
+        x[i] = x[i - 1] + d * math.cos(mean_yaw)
+        y[i] = y[i - 1] + d * math.sin(mean_yaw)
+    return ScenarioPath.from_arrays(x, y, yaw, kappa, np.full(len(x), mode, dtype=np.uint8))
+
+
+def _drive_segments(
+    x: float, y: float, heading: float, steps: tuple[tuple, ...], mode: int,
+) -> list[ScenarioPath]:
+    """("line", 길이) / ("turn", 각도deg, 원호반경, 완화곡선길이) 순서로 잇는 구간 목록.
+
+    각도 + = 좌회전. 모든 연결점에서 곡률이 연속이다.
+    """
+    segments: list[ScenarioPath] = []
+    for step in steps:
+        if step[0] == "line":
+            segment = _straight_segment(x, y, heading, step[1], mode)
+        else:
+            segment = _clothoid_turn_segment(
+                x, y, heading, math.radians(step[1]), step[2], step[3], mode)
+        segments.append(segment)
+        x, y, heading = float(segment.x[-1]), float(segment.y[-1]), float(segment.yaw[-1])
+    return segments
+
+
+def _chain_segments(segments: list[ScenarioPath]) -> ScenarioPath:
+    """연속 주행 구간들을 한 경로로 잇는다 (다음 구간 첫 점 = 앞 구간 끝 점이므로 중복점 제거)."""
+    return ScenarioPath.from_arrays(
+        np.concatenate([segments[0].x] + [segment.x[1:] for segment in segments[1:]]),
+        np.concatenate([segments[0].y] + [segment.y[1:] for segment in segments[1:]]),
+        np.concatenate([segments[0].yaw] + [segment.yaw[1:] for segment in segments[1:]]),
+        np.concatenate([segments[0].kappa] + [segment.kappa[1:] for segment in segments[1:]]),
+        np.concatenate([segments[0].mode] + [segment.mode[1:] for segment in segments[1:]]),
+    )
+
+
+def _box(
+    x_min: float, y_min: float, x_max: float, y_max: float, kind: str = "pallet",
+) -> ScenarioObstacle:
+    return ScenarioObstacle(
+        x=0.5 * (x_min + x_max), y=0.5 * (y_min + y_max),
+        length=x_max - x_min, width=y_max - y_min, kind=kind,
+    )
+
+
+def _offset_points(
+    path: ScenarioPath, lateral_offset: float, s_start: float, s_end: float,
+    *, step: float = 1.0, close: bool = False,
+) -> tuple[tuple[float, float], ...]:
+    """경로를 진행 방향 왼쪽으로 lateral_offset만큼 평행이동한 폴리라인 (오른쪽은 음수).
+
+    close=True면 마지막 점을 첫 점과 정확히 같게 둬서 닫힌 띠/점선이 이음매 없이 그려진다.
+    """
+    s_values = np.linspace(s_start, s_end, max(2, int(math.ceil((s_end - s_start) / step)) + 1))
+    yaw = np.interp(s_values, path.s, np.unwrap(path.yaw))
+    x = np.interp(s_values, path.s, path.x) - lateral_offset * np.sin(yaw)
+    y = np.interp(s_values, path.s, path.y) + lateral_offset * np.cos(yaw)
+    points = list(zip(x.tolist(), y.tolist()))
+    if close:
+        points[-1] = points[0]
+    return tuple(points)
+
+
+def _rect_points(
+    x_min: float, y_min: float, x_max: float, y_max: float,
+) -> tuple[tuple[float, float], ...]:
+    return ((x_min, y_min), (x_max, y_min), (x_max, y_max), (x_min, y_max))
+
+
+def _hatch_markings(
+    x_min: float, y_min: float, x_max: float, y_max: float, spacing: float, color: str,
+) -> list[FloorMarking]:
+    """사각형 안을 45도 빗금으로 채우는 선들 (x - y = offset)."""
+    markings: list[FloorMarking] = []
+    offset = x_min - y_max + spacing
+    while offset < x_max - y_min:
+        y_start, y_end = max(y_min, x_min - offset), min(y_max, x_max - offset)
+        if y_end > y_start:
+            markings.append(FloorMarking(
+                "line", ((y_start + offset, y_start), (y_end + offset, y_end)), color, 0.12))
+        offset += spacing
+    return markings
+
+
+def _convex_hull(points) -> tuple[tuple[float, float], ...]:
+    """점들의 볼록 껍질 (반시계 방향, Andrew monotone chain)."""
+    ordered = sorted(set((float(x), float(y)) for x, y in points))
+
+    def cross(o, a, b) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: list[tuple[float, float]] = []
+    upper: list[tuple[float, float]] = []
+    for point in ordered:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0.0:
+            lower.pop()
+        lower.append(point)
+    for point in reversed(ordered):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0.0:
+            upper.pop()
+        upper.append(point)
+    return tuple(lower[:-1] + upper[:-1])
+
+
+def build_warehouse_logistics_scenario() -> "ScenarioDefinition":
+    """물류센터 한 층 (도면 치수 기준). 진입램프(바깥 폭 약 37 m) / 사무실(10 m) / 하역장(폭 110 m =
+    기둥 11 m 간격 10칸, 깊이 12 m) / 창고(10 m) / 진출램프가 서->동으로 놓이고, 북쪽 일방통로
+    (폭 17 m)가 두 램프를 잇는다. 램프 바깥벽이 곧 건물 벽이다. 글자/화살표 표시는 두지 않는다.
+
+    램프: 세로로 긴 타원 트랙(직선 - 완화곡선 - 원호 - 완화곡선) 모양의 단일 차선(폭 6 m), 시계
+    방향. 차량은 차선 가운데를 달리고, 양쪽 벽은 주행선에서 차선 폭 절반만큼 떨어져 램프를
+    돌아 통로 입구까지 곧게 이어진다. 램프 꼭대기의 90도 회전이 끝나는 높이가 곧 통로
+    주행선이라 통로 구간은 일자로 곧다. 입구 위쪽 벽은 북쪽 벽에, 입구 아래쪽 벽은 사무실/
+    창고 벽에 붙어 램프-통로가 하나의 닫힌 벽으로 둘러싸인다. 램프 차선의 반대쪽 끝(직선
+    가운데에서 위)은 아래층과 이어지는 자리라 직선 위끝에서 막고, 그 위 빈 공간은 막힌 구역이다.
+
+      1 FORWARD  진입램프 동쪽 직선에서 출발, 270도 돌아 통로로 곧게 -> 도크 D4 앞
+      2 FORWARD  제자리턴(동->남) -> 하역장을 가로질러 D4 도크 면까지 19 m 정면 도킹
+      3 REVERSE  통로까지 후진
+      4 FORWARD  제자리턴(남->동) -> D7 앞까지 33 m
+      5 RIGHT    크랩(차체는 동쪽 그대로)으로 D7 도크 면까지 측면 도킹
+      6 LEFT     크랩으로 통로 복귀
+      7 FORWARD  통로 장애물 3개(북-남-북) 회피 -> 진출램프로 270도
+
+    경로 곡률은 전 구간 연속이다(직선과 회전 사이마다 완화곡선). 제자리턴은 phase 경계에서만
+    일어난다. 여유거리(차량 충돌원 3개, 반경 1.118 m 기준): 램프 바깥벽·코어벽 각 1.13 m,
+    도킹 정지 시 도크 면 0.88 m. 회피 대상은 마지막 phase의 통로 장애물 3개뿐이다.
+    """
+    north, south, east = 0.5 * math.pi, -0.5 * math.pi, 0.0
+    circle_reach = math.hypot(0.5, 1.0)              # 플래너 충돌원 반경 (3원, 3.0 x 2.0 m)
+
+    # 램프 트랙 치수는 "단일 차선 중심 = 주행선" 기준이다.
+    lane_width = 6.0
+    ramp_radius, ramp_transition, ramp_straight = 16.0, 8.0, 8.0
+    outer_face = 0.5 * lane_width                    # 주행선 -> 바깥벽 안쪽면 (왼쪽)
+    core_face = -0.5 * lane_width                    # 주행선 -> 코어벽 바깥면 (오른쪽)
+    wall = 0.3
+    aisle_north_gap, aisle_south_gap = 7.0, 10.0     # 통로 주행선 -> 북쪽 벽 / 남쪽 경계
+    bay_pitch, bay_count, loading_depth = 11.0, 10, 12.0   # 기둥 간격 / 도크 칸 수 / 하역장 깊이
+
+    half_turn = _clothoid_turn_segment(0.0, 0.0, 0.0, -math.pi, ramp_radius, ramp_transition, 0)
+    track_half_width = -0.5 * float(half_turn.y[-1])  # 트랙 중심 -> 동/서 직선 주행선
+    track_reach = float(np.max(half_turn.x))         # 직선 끝 -> 꼭대기(바닥) 주행선
+    # 꼭대기 90도 회전은 좌우 대칭이라 전진량 = 횡이동량
+    quarter_turn = _clothoid_turn_segment(
+        0.0, 0.0, 0.0, -0.5 * math.pi, ramp_radius, ramp_transition, 0)
+    quarter_turn_offset = float(quarter_turn.x[-1])
+    ramp_half_width = track_half_width + outer_face + wall
+
+    ramp_center_y = 0.5 * ramp_straight + track_reach + outer_face + wall + 0.5
+    aisle_y = ramp_center_y + 0.5 * ramp_straight + quarter_turn_offset   # 통로 주행선
+    height = aisle_y + aisle_north_gap               # 북쪽 벽 안쪽면
+    aisle_bottom_y = aisle_y - aisle_south_gap
+    dock_face_y = aisle_bottom_y - loading_depth
+    dock_stop_y = dock_face_y + 3.0                  # 정면 도킹: 앞 충돌원 ~ 도크 면 0.88 m
+    crab_stop_y = dock_face_y + 2.0                  # 크랩 도킹: 옆 충돌원 ~ 도크 면 0.88 m
+
+    entry_center = (ramp_half_width + 0.5, ramp_center_y)
+    room_left_x = entry_center[0] + ramp_half_width + wall    # 사무실 서쪽 벽
+    loading_x0 = room_left_x + 10.0
+    loading_x1 = loading_x0 + bay_count * bay_pitch
+    room_right_x = loading_x1 + 10.0                 # 창고 동쪽 벽
+    exit_center = (room_right_x + wall + ramp_half_width, ramp_center_y)
+    dock_xs = tuple(loading_x0 + (k + 0.5) * bay_pitch for k in range(bay_count))   # D1~D10
+    first_dock, second_dock = 3, 6                   # D4 정면 도킹, D7 크랩 도킹 (0부터 센 칸 번호)
+    first_dock_x, second_dock_x = dock_xs[first_dock], dock_xs[second_dock]
+    merge_dx = quarter_turn_offset - track_half_width   # 램프 중심 -> 꼭대기 회전 끝 x
+
+    def track_loop(center: tuple[float, float]) -> ScenarioPath:
+        """주행선 한 바퀴. 동쪽 직선 가운데에서 남쪽을 보고 출발 (시계 방향)."""
+        return _chain_segments(_drive_segments(
+            center[0] + track_half_width, center[1], south,
+            (("line", 0.5 * ramp_straight),
+             ("turn", -180.0, ramp_radius, ramp_transition),
+             ("line", ramp_straight),
+             ("turn", -180.0, ramp_radius, ramp_transition),
+             ("line", 0.5 * ramp_straight)), 0))
+
+    entry_route = _chain_segments(_drive_segments(
+        entry_center[0] + track_half_width, entry_center[1], south,
+        (("line", 0.5 * ramp_straight),
+         ("turn", -180.0, ramp_radius, ramp_transition),
+         ("line", ramp_straight),
+         ("turn", -90.0, ramp_radius, ramp_transition),
+         ("line", first_dock_x - entry_center[0] - merge_dx)), 0))
+
+    def dock_in(x: float) -> ScenarioPath:
+        return _straight_segment(x, aisle_y, south, aisle_y - dock_stop_y, 0)
+
+    def dock_out(x: float) -> ScenarioPath:
+        # 이동 방향은 북쪽, 차체(map_yaw)는 남쪽 그대로
+        path = _straight_segment(x, dock_stop_y, north, aisle_y - dock_stop_y, 1)
+        return ScenarioPath.from_arrays(
+            path.x, path.y, path.yaw, path.kappa, path.mode,
+            map_yaw=np.full(len(path.x), south),
+            heading_semantics="MAP_HEADING_PLUS_MODE_OFFSET",
+        )
+
+    aisle_to_second_dock = _straight_segment(
+        first_dock_x, aisle_y, east, second_dock_x - first_dock_x, 0)
+    # 크랩: 차체는 동쪽을 본 채로 오른쪽(남쪽)으로 들어갔다가 왼쪽(북쪽)으로 나온다
+    crab_in = _straight_segment(second_dock_x, aisle_y, south, aisle_y - crab_stop_y, 3)
+    crab_out = _straight_segment(second_dock_x, crab_stop_y, north, aisle_y - crab_stop_y, 2)
+    # 진출: 진입 꼭대기 회전의 좌우 대칭 -> 진출램프 동쪽 직선 위끝에 정확히 닿는다
+    exit_route = _chain_segments(_drive_segments(
+        second_dock_x, aisle_y, east,
+        (("line", exit_center[0] - merge_dx - second_dock_x),
+         ("turn", -90.0, ramp_radius, ramp_transition),
+         ("line", ramp_straight),
+         ("turn", -180.0, ramp_radius, ramp_transition),
+         ("line", 0.5 * ramp_straight)), 0))
+
+    # 목표 속도 (m/s): 일반 주행 / 램프 / 도킹(진입·복귀)
+    drive_speed, ramp_speed, docking_speed = 2.8, 2.3, 0.9
+    ramp_slowdown_lead = 5.0                         # 진출램프 회전 시작 전 미리 감속하는 거리
+    ramp_length = (0.5 * ramp_straight + half_turn.total_length + ramp_straight
+                   + quarter_turn.total_length)      # 램프 동쪽 직선 중간 ~ 꼭대기 90도 회전 끝
+    exit_turn_s = exit_center[0] - merge_dx - second_dock_x
+    entry_ramp_zone = ((0.0, ramp_length, ramp_speed),)
+    exit_ramp_zone = ((exit_turn_s - ramp_slowdown_lead, exit_route.total_length, ramp_speed),)
+
+    def phase(name: str, path: ScenarioPath, speed: float, last: bool = False,
+              zones: tuple[tuple[float, float, float], ...] = ()) -> ScenarioPhase:
+        return ScenarioPhase(name=name, path=path, cruise_speed=speed,
+                             switch_s=None if last else path.total_length, speed_zones=zones)
+
+    phases = (
+        phase("entry_ramp_to_dock_d4", entry_route, drive_speed, zones=entry_ramp_zone),
+        phase("dock_d4_in", dock_in(first_dock_x), docking_speed),
+        phase("dock_d4_out_reverse", dock_out(first_dock_x), docking_speed),
+        phase("aisle_to_dock_d7", aisle_to_second_dock, drive_speed),
+        phase("crab_dock_d7_in_right", crab_in, docking_speed),
+        phase("crab_dock_d7_out_left", crab_out, docking_speed),
+        phase("aisle_obstacles_to_exit_ramp", exit_route, drive_speed, last=True,
+              zones=exit_ramp_zone),
+    )
+
+    def ramp_structure(route: ScenarioPath, s_from: float, s_to: float,
+                       center: tuple[float, float], dead_end_x: float) -> tuple[list, list, float]:
+        """단일 차선 램프 하나의 벽과 바닥 표시, 통로 입구 x를 돌려준다.
+
+        route[s_from, s_to]가 램프 안 주행선(통로 입구까지)이다. 차선의 반대쪽 끝은 직선
+        가운데(center[1], x = dead_end_x)이고, 차선은 그 위로 직선 위끝까지 이어진 뒤 막힌다.
+        입구는 dead_end 쪽(통로 쪽) 바깥면에 있다.
+        """
+        side = 1.0 if dead_end_x > center[0] else -1.0          # +1: 통로가 동쪽(진입램프)
+        outer_x = dead_end_x + side * outer_face                # 통로 쪽 차선 바깥면
+        inner_x = dead_end_x - side * outer_face                # 코어 쪽 차선 면
+        mouth_x = outer_x + side * wall                         # 입구 = 램프 바깥벽 바깥면
+        straight_top = center[1] + 0.5 * ramp_straight
+
+        def box(x_a, y_a, x_b, y_b):
+            return _box(min(x_a, x_b), min(y_a, y_b), max(x_a, x_b), max(y_a, y_b), "wall")
+
+        ramp_walls = (
+            wall_segments_along_path(route, s_from, s_to, lateral_offset=outer_face + 0.15,
+                                     thickness=wall)
+            + wall_segments_along_path(route, s_from, s_to, lateral_offset=core_face - 0.15,
+                                       thickness=wall)
+            + [
+                # 통로 쪽 바깥벽: 직선 가운데부터 입구 아래까지 곧게 (막힌 구역의 바깥 경계)
+                box(outer_x, center[1] - 0.6, mouth_x, aisle_y + core_face),
+                # 코어 쪽 벽: 직선 가운데부터 위끝까지
+                box(inner_x - side * wall, center[1] - 0.6, inner_x, straight_top),
+                # 차선 끝 막음벽
+                box(inner_x - side * wall, straight_top, mouth_x, straight_top + wall),
+                # 입구 위쪽: 입구 북쪽 벽 ~ 통로 북쪽 벽
+                box(outer_x, aisle_y + outer_face, mouth_x, height + wall),
+            ]
+        )
+        loop = track_loop(center)
+        far_side_core = [point for point in _offset_points(route, core_face, s_from, s_to)
+                         if side * (point[0] - center[0]) <= 0.0]
+        ramp_markings = [
+            FloorMarking("area", _convex_hull(
+                _offset_points(route, outer_face + wall, s_from, s_to)
+                + _offset_points(route, core_face - wall, s_from, s_to)
+                + ((mouth_x, center[1]), (mouth_x, straight_top + wall),
+                   (inner_x - side * wall, straight_top + wall))), "floor"),
+            FloorMarking("line", _offset_points(route, 0.0, s_from, s_to), "ramp", lane_width),
+            FloorMarking("area", _rect_points(min(inner_x, outer_x), center[1],
+                                              max(inner_x, outer_x), straight_top), "ramp"),
+            FloorMarking("area", _convex_hull(
+                _offset_points(loop, core_face, 0.0, loop.total_length) + tuple(far_side_core)),
+                "core"),
+            # 차선 끝 위의 막힌 구역
+            FloorMarking("area", _rect_points(min(center[0], outer_x), straight_top + wall,
+                                              max(center[0], outer_x), aisle_y + core_face),
+                         "core"),
+        ]
+        for offset in (outer_face - 0.25, core_face + 0.25):
+            ramp_markings.append(FloorMarking(
+                "line", _offset_points(route, offset, s_from, s_to), "white"))
+            x = dead_end_x + side * offset     # 직선 가운데에서 위로: 왼쪽 = 통로 쪽
+            ramp_markings.append(FloorMarking(
+                "line", ((x, center[1]), (x, straight_top)), "white"))
+        return ramp_walls, ramp_markings, mouth_x
+
+    entry_open_s = ramp_length + (entry_center[0] + ramp_half_width
+                                  - (entry_center[0] + merge_dx))
+    exit_open_s = exit_turn_s - ((exit_center[0] - merge_dx) - (exit_center[0] - ramp_half_width))
+    walls, markings, entry_mouth_x = ramp_structure(
+        entry_route, 0.0, entry_open_s, entry_center, entry_center[0] + track_half_width)
+    exit_walls, exit_markings, exit_mouth_x = ramp_structure(
+        exit_route, exit_open_s, exit_route.total_length, exit_center,
+        exit_center[0] - track_half_width)
+    walls += exit_walls
+    markings += exit_markings
+
+    walls += [
+        _box(entry_mouth_x - wall, height, exit_mouth_x + wall, height + wall, "wall"),  # 북
+        # 통로 남쪽 벽: 진입램프 입구 ~ 사무실 윗벽 / 창고 윗벽 ~ 진출램프 입구
+        _box(entry_mouth_x - wall, aisle_bottom_y - wall, loading_x0, aisle_bottom_y, "wall"),
+        _box(loading_x1, aisle_bottom_y - wall, exit_mouth_x + wall, aisle_bottom_y, "wall"),
+        _box(room_left_x - wall, dock_face_y - 0.4, room_left_x, aisle_bottom_y, "wall"),
+        _box(room_right_x, dock_face_y - 0.4, room_right_x + wall, aisle_bottom_y, "wall"),
+        _box(room_left_x - wall, dock_face_y - 0.4, room_right_x + wall, dock_face_y,
+             "wall"),                                                          # 도크 면
+        _box(loading_x0 - wall, dock_face_y, loading_x0, aisle_bottom_y, "wall"),  # 사무실
+        _box(loading_x1, dock_face_y, loading_x1 + wall, aisle_bottom_y, "wall"),  # 창고
+    ]
+    # 하역장 입구 기둥 (도크 칸 경계마다, 1.2 m 각)
+    pillar_half = 0.6
+    walls += [_box(loading_x0 + bay_pitch * k - pillar_half, aisle_bottom_y - pillar_half,
+                   loading_x0 + bay_pitch * k + pillar_half, aisle_bottom_y + pillar_half, "wall")
+              for k in range(bay_count + 1)]
+
+    # 상차 대기 화물 (사용하는 도크와 그 양옆 칸을 뺀 도크 앞)
+    cargo = [_box(x - 1.2, dock_face_y + 0.6, x + 1.2, dock_face_y + 3.0)
+             for k, x in enumerate(dock_xs)
+             if min(abs(k - first_dock), abs(k - second_dock)) > 1]
+
+    def blocking(x: float, side: float, length: float, width: float, yaw_deg: float,
+                 intrusion: float) -> ScenarioObstacle:
+        """통로 주행선 side쪽(+1 북 / -1 남)에 놓되 차량 충돌원을 intrusion만큼 침범하는 장애물."""
+        yaw = math.radians(yaw_deg)
+        half_y = 0.5 * (length * abs(math.sin(yaw)) + width * abs(math.cos(yaw)))
+        return ScenarioObstacle(x=x, y=aisle_y + side * (circle_reach - intrusion + half_y),
+                                length=length, width=width, yaw=yaw)
+
+    # 마지막 phase 회피 대상: 북 - 남 - 북 순서라 차량이 남/북/남으로 번갈아 비켜 간다.
+    # 첫 번째는 진로를 조금만(0.3 m) 막아 여유 있게 비켜 가도록 한다.
+    avoidance = [
+        # 진출램프 입구(폭 6 m) 앞에서 다시 차선 가운데로 들어올 거리를 남긴다
+        blocking(second_dock_x + 14.0, +1.0, 3.0, 2.4, 12.0, intrusion=0.3),
+        blocking(second_dock_x + 25.0, -1.0, 4.2, 2.4, -18.0, intrusion=0.3),
+        blocking(second_dock_x + 36.0, +1.0, 3.0, 3.0, 25.0, intrusion=0.8),
+    ]
+
+    markings += [
+        FloorMarking("area", _rect_points(entry_mouth_x, aisle_bottom_y,
+                                          exit_mouth_x, height), "floor"),
+        FloorMarking("area", _rect_points(room_left_x, dock_face_y, room_right_x, aisle_bottom_y),
+                     "floor"),
+        FloorMarking("area", _rect_points(loading_x0, dock_face_y, loading_x1, aisle_bottom_y),
+                     "loading"),
+        FloorMarking("area", _rect_points(room_left_x, dock_face_y, loading_x0, aisle_bottom_y),
+                     "room"),
+        FloorMarking("area", _rect_points(loading_x1, dock_face_y, room_right_x, aisle_bottom_y),
+                     "room"),
+    ]
+    markings += _hatch_markings(loading_x0, dock_face_y + 0.8, loading_x1, aisle_bottom_y,
+                                2.0, "hatch")  # 레벨러 띠 위부터
+    markings += [FloorMarking("area", _rect_points(x - 1.2, dock_face_y, x + 1.2, dock_face_y + 0.8),
+                              "green") for x in dock_xs]
+
+    return ScenarioDefinition(
+        name="warehouse_logistics",
+        phases=phases,
+        obstacles=tuple(walls + cargo + avoidance),
+        terminal_margin=3.0,
+        costmap_resolution=0.1,
+        markings=tuple(markings),
+    )
 
 
 def load_scenario_definition(
@@ -1002,11 +1441,14 @@ def load_scenario_definition(
             terminal_margin=3.0,
         )
 
+    if name == "warehouse_logistics":
+        return build_warehouse_logistics_scenario()
+
     supported = (
         "stadium, crab_switch, spot_turn_course, reverse_switch, hdmap_crab1_switch, fmtc_demo, hdmap_lap_switch, s_curve, "
         "straight_long, obstacle_avoidance, terminal_safe_region, s_curve_obstacles, "
         "alternating_gate_corridor, curved_gate_maze, winding_obstacle_course, "
-        "winding_obstacle_course_wide_gates, parking_ramp_loop, "
+        "winding_obstacle_course_wide_gates, parking_ramp_loop, warehouse_logistics, "
         "narrow_22m_stop_corridor, narrow_28m_corridor, narrow_offset_corridor"
     )
     raise ValueError(f"Unsupported scenario '{scenario_name}'. Supported: {supported}")
