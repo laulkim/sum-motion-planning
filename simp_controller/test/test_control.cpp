@@ -3,6 +3,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <type_traits>
+#include "simp_controller/gain_scheduler.hpp"
 #include "simp_controller/control.hpp"
 
 using namespace simp_controller;
@@ -35,10 +36,108 @@ nav_msgs::msg::Odometry::SharedPtr make_odom() {
   odom->pose.pose.orientation.w = 1.0;
   return odom;
 }
+
+void test_gain_scheduling() {
+  const Gains nominal{0.3, 0.2, 0.2};
+  const struct { double vx, vy, yaw_rate, alpha; } cases[] = {
+      {1.0, 0.0, 0.3, 1.0},   // forward motion
+      {0.0, -1.0, 0.3, 1.0},  // lateral motion
+      {0.0, 0.0, 0.3, 0.0},   // spot turn, either yaw-rate sign
+      {0.0, 0.0, -0.3, 0.0},
+      {0.019, 0.0, 0.3, 0.0},
+      {0.02, 0.0, 0.3, 0.3},  // strict speed bounds
+      {0.0, -0.049, 0.3, 0.3},
+      {0.05, 0.0, 0.3, 0.7},
+      {0.0, 0.099, 0.3, 0.7},
+      {0.10, 0.0, 0.3, 1.0},
+      {0.04, 0.04, 0.3, 0.7}, // hypot, not either component alone
+      {-0.08, -0.08, 0.3, 1.0},
+      {0.0, 0.0, 0.1, 1.0},   // strict yaw-rate threshold
+      {0.0, 0.0, -0.1, 1.0},
+      {0.0, 0.0, 0.0, 1.0},   // stopped reference retains position feedback
+  };
+  for (const auto& item : cases) {
+    Point reference;
+    reference.vx = item.vx;
+    reference.vy = item.vy;
+    reference.yaw_rate = item.yaw_rate;
+    for (const auto mode : {0, 4}) {
+      reference.requested_mode = mode;
+      near(translational_gain_scale(reference), item.alpha);
+      const auto gains = scheduled_gains(reference, nominal);
+      near(gains.kx, item.alpha * nominal.kx);
+      near(gains.ky, item.alpha * nominal.ky);
+      near(gains.ktheta, nominal.ktheta);
+    }
+  }
+
+  auto trajectory = std::make_shared<Trajectory>();
+  trajectory->header.frame_id = "odom";
+  trajectory->header.stamp.sec = 1;
+  trajectory->points.resize(2);
+  auto& reference = trajectory->points[0];
+  reference.x = 2.0;
+  reference.y = -3.0;
+  reference.body_yaw = 0.2;
+  reference.yaw_rate = 0.3;
+  reference.requested_mode = 0;  // scheduling must not depend on SPOT_TURN
+  trajectory->points[1].vx = 1.0;  // unselected point must not affect gains
+  auto odom = make_odom();
+  odom->twist.twist.linear.x = 4.0;
+  odom->twist.twist.linear.y = 3.0;  // odometry must not set the gain scale
+  const Inputs inputs{trajectory, odom};
+  auto output = control_cycle(inputs, 1000000000, kPeriod, nominal);
+  require(output.tracking.valid, "zero scheduled gains must be valid");
+  near(output.tracking.error.ex, 2.0);
+  near(output.tracking.error.ey, -3.0);
+  near(output.tracking.error.etheta, 0.2);
+  near(output.velocity.linear.x, 0.0);
+  near(output.velocity.linear.y, 0.0);
+  near(output.velocity.angular.z, 0.3 + nominal.ktheta * 0.2);
+
+  // Ordinary forward/lateral references retain nominal feedback, even in mode 4.
+  reference.requested_mode = 4;
+  for (const bool lateral : {false, true}) {
+    reference.vx = lateral ? 0.0 : 1.0;
+    reference.vy = lateral ? -1.0 : 0.0;
+    output = control_cycle(inputs, 1000000000, kPeriod, nominal);
+    require(output.tracking.valid, "ordinary motion must remain valid");
+    near(output.velocity.linear.x,
+         reference.vx * std::cos(0.2) - reference.vy * std::sin(0.2) + nominal.kx * 2.0);
+    near(output.velocity.linear.y,
+         reference.vy * std::cos(0.2) + reference.vx * std::sin(0.2) - nominal.ky * 3.0);
+    near(output.velocity.angular.z, 0.3 + nominal.ktheta * 0.2);
+  }
+
+  // Nominal zero gains must also remain valid outside the scheduling region.
+  reference.vx = 1.0;
+  reference.vy = 0.0;
+  reference.yaw_rate = 0.0;
+  for (const Gains gains : {Gains{0.0, 0.0, 2.0}, Gains{0.0, 4.0, 2.0},
+                            Gains{3.0, 0.0, 2.0}}) {
+    output = control_cycle(inputs, 1000000000, kPeriod, gains);
+    require(output.tracking.valid, "zero nominal translational gain must be valid");
+    near(output.velocity.linear.x, std::cos(0.2) + gains.kx * 2.0);
+    near(output.velocity.linear.y, std::sin(0.2) - gains.ky * 3.0);
+    near(output.velocity.angular.z, gains.ktheta * 0.2);
+  }
+
+  // Validate nominal gains before scheduling, even when alpha would be zero.
+  reference.vx = 0.0;
+  reference.yaw_rate = 0.3;
+  for (const double invalid : {-1.0, std::numeric_limits<double>::quiet_NaN(),
+                              std::numeric_limits<double>::infinity()}) {
+    zero(control_cycle(inputs, 1000000000, kPeriod, Gains{invalid, 0.2, 0.2}));
+    zero(control_cycle(inputs, 1000000000, kPeriod, Gains{0.3, invalid, 0.2}));
+    zero(control_cycle(inputs, 1000000000, kPeriod, Gains{0.3, 0.2, invalid}));
+  }
+  zero(control_cycle(inputs, 1000000000, kPeriod, Gains{0.3, 0.2, 0.0}));
+}
 }  // namespace
 
 int main() {
   try {
+    test_gain_scheduling();
     Point reference;
     reference.x = 4.0;
     reference.y = 6.0;
@@ -235,7 +334,7 @@ int main() {
     near(odom_pose(odom)->yaw, kPi / 2);
     odom.pose.pose.orientation.w = std::numeric_limits<double>::infinity();
     require(!odom_pose(odom), "nonfinite quaternion accepted");
-    std::cout << "controller tracking: equations, midpoint prediction, ceil, snapshot and safety passed\n";
+    std::cout << "controller tracking: gain scheduling, equations, midpoint prediction, ceil, snapshot and safety passed\n";
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;

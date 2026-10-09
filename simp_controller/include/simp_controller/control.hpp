@@ -9,17 +9,17 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <simp_planner_msgs/msg/tracking_trajectory.hpp>
 
+#include "simp_controller/gain_scheduler.hpp"
+
 // Feedback tracking of the planner's TrackingTrajectory, ported from the
 // simp_tracker package (branch refactor/tracking-before-diagnostics). The
 // trajectory carries no period of its own: its points are `period_ns` apart,
 // the planner's command_frequency_hz.
 namespace simp_controller {
 using Trajectory = simp_planner_msgs::msg::TrackingTrajectory;
-using Point = simp_planner_msgs::msg::TrackingTrajectoryPoint;
 constexpr double kPi = 3.14159265358979323846;
 
 struct Pose { double x, y, yaw; };
-struct Gains { double kx{3.0}, ky{4.0}, ktheta{2.0}; };
 struct Error { double ex, ey, etheta; };
 struct Inputs {
   Trajectory::ConstSharedPtr trajectory;
@@ -113,7 +113,7 @@ inline Control control_cycle(const Inputs& snapshot, std::int64_t now_ns,
   if (!pose || !std::isfinite(velocity.linear.x) || !std::isfinite(velocity.linear.y) ||
       !std::isfinite(velocity.angular.z) ||
       !std::isfinite(gains.kx) || !std::isfinite(gains.ky) || !std::isfinite(gains.ktheta) ||
-      gains.kx <= 0.0 || gains.ky <= 0.0 || gains.ktheta <= 0.0) return output;
+      gains.kx < 0.0 || gains.ky < 0.0 || gains.ktheta <= 0.0) return output;
   const auto& stamp = odom.header.stamp;
   if (stamp.sec < 0 || stamp.nanosec >= 1000000000) return output;
   const auto odom_ns = std::int64_t(stamp.sec) * 1000000000 + stamp.nanosec;
@@ -134,7 +134,8 @@ inline Control control_cycle(const Inputs& snapshot, std::int64_t now_ns,
   pose->y += (s * velocity.linear.x + c * velocity.linear.y) * dt;
   pose->yaw = wrap_angle(pose->yaw + velocity.angular.z * dt);
   const auto error = tracking_error(reference, *pose);
-  const auto command = lyapunov_control(reference, error, gains);
+  const auto scheduled = scheduled_gains(reference, gains);
+  const auto command = lyapunov_control(reference, error, scheduled);
   if (std::isfinite(command.linear.x) && std::isfinite(command.linear.y) &&
       std::isfinite(command.angular.z)) {
     output.velocity = command;
