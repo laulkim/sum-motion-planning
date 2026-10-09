@@ -129,7 +129,9 @@ class PlanarVelocitySimNode(Node):
     def queue_reference(self, now_sec: float) -> None:
         for response, reference in zip(
             self.responses,
-            (self.command_vx, self.command_vy, self.command_yaw_rate),
+            self.mode_model.applied_velocity(
+                self.command_vx, self.command_vy, self.command_yaw_rate
+            ),
         ):
             response.command(reference, now_sec)
 
@@ -153,10 +155,12 @@ class PlanarVelocitySimNode(Node):
         if self.mode_model.feedback() == before:
             return
         if self.mode_model.transition_in_progress:
-            self.reset_response(self.now_seconds())
             self.command_vx = 0.0
             self.command_vy = 0.0
             self.command_yaw_rate = 0.0
+            # Stop through the identified response; retain actual velocity and
+            # commands already in flight during the channel dead time.
+            self.queue_reference(self.now_seconds())
             self.get_logger().info(
                 f"Mode transition started: {self.mode_model.current_mode} -> {requested}"
             )
@@ -170,11 +174,6 @@ class PlanarVelocitySimNode(Node):
             self.x, self.y, self.yaw,
             self.applied_vx, self.applied_vy, self.applied_yaw_rate,
         )
-
-    def reset_response(self, now_sec: float) -> None:
-        for response in self.responses:
-            response.reset(now_sec)
-        self.applied_vx = self.applied_vy = self.applied_yaw_rate = 0.0
 
     def now_seconds(self) -> float:
         return self.get_clock().now().nanoseconds * 1.0e-9
@@ -197,25 +196,18 @@ class PlanarVelocitySimNode(Node):
             return
 
         now_sec = now.nanoseconds * 1.0e-9
-        # Hold at zero for the whole interval ending at transition completion;
-        # ALIGNING references are held without accumulating delayed events.
-        was_aligning = self.mode_model.transition_in_progress
         completed = self.mode_model.update(now_sec)
         if completed:
             self.get_logger().info(
                 f"Mode transition complete: current_mode={self.mode_model.current_mode}"
             )
             self.publish_mode_state()
+            self.queue_reference(now_sec)
 
-        if was_aligning:
-            self.reset_response(now_sec)
-            if completed:
-                # Resume the latest reference with fresh dead time after READY.
-                self.queue_reference(now_sec)
-        else:
-            self.applied_vx, self.applied_vy, self.applied_yaw_rate = (
-                response.update(now_sec) for response in self.responses
-            )
+        # ALIGNING gates the input reference, never the actual response state.
+        self.applied_vx, self.applied_vy, self.applied_yaw_rate = (
+            response.update(now_sec) for response in self.responses
+        )
         self.x, self.y, self.yaw = integrate_body_velocity(
             self.x,
             self.y,

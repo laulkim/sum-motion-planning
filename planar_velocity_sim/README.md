@@ -38,11 +38,13 @@ the current sample. The node's `x, y, yaw` and `applied_*` fields remain current
 ground truth; odometry is the delayed observation.
 
 Drive-mode acceptance uses actual translational speed, not delayed odometry.
-ALIGNING immediately zeros actual velocity and clears response histories, so
-neither residual response nor queued references can move the vehicle during
-alignment. References received while ALIGNING are retained as the latest
-command, as before. On completion they resume from zero response with fresh
-channel dead time. Mode feedback is not subject to GNSS sensor delay.
+ALIGNING sets the response input reference to zero without resetting actual
+velocity or clearing delayed commands. Commands already in flight can still
+arrive, then actual velocity decays according to the channel dead time and time
+constant. Residual motion continues to integrate ground-truth pose and appears
+in delayed odometry. References received while ALIGNING are retained as the
+latest command. On completion they resume through the same continuous response
+state and channel dead time. Mode feedback is not subject to GNSS sensor delay.
 
 Example:
 
