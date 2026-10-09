@@ -44,17 +44,15 @@ void test_gain_scheduling() {
       {0.0, -1.0, 0.3, 1.0},  // lateral motion
       {0.0, 0.0, 0.3, 0.0},   // spot turn, either yaw-rate sign
       {0.0, 0.0, -0.3, 0.0},
-      {0.019, 0.0, 0.3, 0.0},
-      {0.02, 0.0, 0.3, 0.3},  // strict speed bounds
-      {0.0, -0.049, 0.3, 0.3},
-      {0.05, 0.0, 0.3, 0.7},
-      {0.0, 0.099, 0.3, 0.7},
-      {0.10, 0.0, 0.3, 1.0},
-      {0.04, 0.04, 0.3, 0.7}, // hypot, not either component alone
-      {-0.08, -0.08, 0.3, 1.0},
-      {0.0, 0.0, 0.1, 1.0},   // strict yaw-rate threshold
-      {0.0, 0.0, -0.1, 1.0},
+      {0.019, 0.0, 0.3, 1.0}, // slow translation retains nominal gains
+      {0.03, 0.0, 0.3, 1.0},
+      {0.0, -0.07, 0.3, 1.0},
+      {1e-12, 0.0, 0.3, 1.0}, // even tiny nonzero references are translation
+      {0.0, -1e-12, 0.3, 1.0},
+      {0.0, 0.0, 1e-12, 0.0}, // no minimum yaw-rate threshold
+      {-0.0, 0.0, -1e-12, 0.0},
       {0.0, 0.0, 0.0, 1.0},   // stopped reference retains position feedback
+      {-0.0, 0.0, -0.0, 1.0},
   };
   for (const auto& item : cases) {
     Point reference;
@@ -95,7 +93,16 @@ void test_gain_scheduling() {
   near(output.velocity.linear.y, 0.0);
   near(output.velocity.angular.z, 0.3 + nominal.ktheta * 0.2);
 
+  // A stopped reference restores position feedback, even with the same errors.
+  reference.yaw_rate = 0.0;
+  output = control_cycle(inputs, 1000000000, kPeriod, nominal);
+  require(output.tracking.valid, "stopped reference must remain valid");
+  near(output.velocity.linear.x, nominal.kx * 2.0);
+  near(output.velocity.linear.y, nominal.ky * -3.0);
+  near(output.velocity.angular.z, nominal.ktheta * 0.2);
+
   // Ordinary forward/lateral references retain nominal feedback, even in mode 4.
+  reference.yaw_rate = 0.3;
   reference.requested_mode = 4;
   for (const bool lateral : {false, true}) {
     reference.vx = lateral ? 0.0 : 1.0;
