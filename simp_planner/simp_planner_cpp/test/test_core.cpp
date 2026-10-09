@@ -160,6 +160,47 @@ void test_nominal_planning_and_allocation() {
   require(max_heading_error <= 1e-12, "allocator heading identity mismatch");
 }
 
+// Trajectory values come from the path function at the travelled distance, not
+// from linear interpolation of the 0.5 m grid: across the old grid nodes the
+// curvature rate must stay the derivative of curvature, the heading must turn
+// at the curvature, and each position step must match the distance travelled.
+void test_arc_length_path_values_are_consistent() {
+  simp_planner::EnvConfig config;
+  config.longitudinal.dt = 0.01;
+  config.longitudinal.execution_dt = 0.01;
+  config.longitudinal.horizon = 2.0;
+  simp_planner::PathVelocityPlanner planner(config, straight_path(), empty_costmap());
+  simp_planner::PlannerState state;
+  state.y = 1.0;
+  state.speed = 2.0;
+  const auto result = planner.plan(state, {}, {2.0, simp_planner::DriveMode::Forward});
+  require(result.selected_path.has_value() && result.selected_path->function,
+          "arc-length test has no path function");
+  require(result.trajectory.safe(), "arc-length test trajectory unsafe");
+  const auto& motion = result.motion;
+  const auto& progress = result.trajectory.progress;
+  require(progress.back() > 4.0 * config.lateral.spatial_ds,
+          "arc-length test does not cross several grid nodes");
+
+  double max_kappa = 0.0;
+  for (std::size_t i = 0; i + 1 < motion.t.size(); ++i) {
+    max_kappa = std::max(max_kappa, std::abs(motion.kappa[i]));
+    const double dl = progress[i + 1] - progress[i];
+    if (dl < 1.0e-4) continue;
+    const double kappa_slope = (motion.kappa[i + 1] - motion.kappa[i]) / dl;
+    const double kappa_l_mean = 0.5 * (motion.kappa_s[i] + motion.kappa_s[i + 1]);
+    require(std::abs(kappa_slope - kappa_l_mean) <= 1.0e-4 + 1.0e-3 * std::abs(kappa_l_mean),
+            "curvature rate is not the derivative of curvature");
+    const double heading_rate = (motion.chi[i + 1] - motion.chi[i]) / dl;
+    const double kappa_mean = 0.5 * (motion.kappa[i] + motion.kappa[i + 1]);
+    require(std::abs(heading_rate - kappa_mean) <= 1.0e-5,
+            "heading does not turn at the path curvature");
+    const double step = std::hypot(motion.x[i + 1] - motion.x[i], motion.y[i + 1] - motion.y[i]);
+    require(std::abs(step - dl) <= 1.0e-6, "position step does not match travelled distance");
+  }
+  require(max_kappa > 1.0e-3, "arc-length test path has no curvature to check");
+}
+
 void test_stationary_hold() {
   simp_planner::EnvConfig config;
   simp_planner::PathVelocityPlanner planner(config, straight_path(), empty_costmap());
@@ -831,6 +872,7 @@ int main() {
     test_math_and_projection();
     test_rotated_costmap_registration();
     test_nominal_planning_and_allocation();
+    test_arc_length_path_values_are_consistent();
     test_stationary_hold();
     test_runtime_execution_and_handover();
     test_lateral_priority_allocation();

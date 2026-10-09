@@ -171,21 +171,21 @@ double jerk_integrated_distance(double speed, double acceleration,
   return duration * multiply_add(quadratic, duration, speed);
 }
 
-ProfileResult septic_boundary_profile(const std::vector<double>& q,
-                                      double length,
-                                      double p0,
-                                      double dp0,
-                                      double ddp0,
-                                      double dddp0,
-                                      double p1) {
-  const double L = std::max(length, 1.0e-6);
-  std::array<double, 8> c;
-  std::array<double, 7> dc;
-  std::array<double, 6> ddc;
-  std::array<double, 5> dddc;
-  double inv_L, inv_L2, inv_L3;
-  {
-    ScopedBlockTimer polynomial_fit_timer(g_planning_block_timings.candidate_polynomial_fit_ms);
+struct ProfilePoint {
+  double p{0.0};
+  double dp{0.0};
+  double ddp{0.0};
+  double dddp{0.0};
+};
+
+// 7차 경계 다항식: q in [0, L]에서 (p0, dp0, ddp0, dddp0) -> (p1, 0, 0, 0),
+// q > L에서는 p1을 유지한다.
+class SepticSegment {
+ public:
+  SepticSegment() = default;
+  SepticSegment(double length, double p0, double dp0, double ddp0, double dddp0, double p1)
+      : length_(std::max(length, 1.0e-6)), p1_(p1) {
+    const double L = length_;
     const double b0 = p0;
     const double b1 = dp0 * L;
     const double b2 = 0.5 * ddp0 * L * L;
@@ -200,117 +200,142 @@ ProfileResult septic_boundary_profile(const std::vector<double>& q,
     const double b5 = -84.0 * rhs[0] + 39.0 * rhs[1] - 7.0 * rhs[2] + 0.5 * rhs[3];
     const double b6 = 70.0 * rhs[0] - 34.0 * rhs[1] + 6.5 * rhs[2] - 0.5 * rhs[3];
     const double b7 = -20.0 * rhs[0] + 10.0 * rhs[1] - 2.0 * rhs[2] + rhs[3] / 6.0;
-    c = {{b0, b1, b2, b3, b4, b5, b6, b7}};
-    dc = {{b1, 2.0 * b2, 3.0 * b3, 4.0 * b4,
-           5.0 * b5, 6.0 * b6, 7.0 * b7}};
-    ddc = {{2.0 * b2, 6.0 * b3, 12.0 * b4,
-            20.0 * b5, 30.0 * b6, 42.0 * b7}};
-    dddc = {{6.0 * b3, 24.0 * b4, 60.0 * b5,
-             120.0 * b6, 210.0 * b7}};
-    inv_L = 1.0 / L;
-    inv_L2 = inv_L * inv_L;
-    inv_L3 = inv_L2 * inv_L;
+    c_ = {{b0, b1, b2, b3, b4, b5, b6, b7}};
+    dc_ = {{b1, 2.0 * b2, 3.0 * b3, 4.0 * b4,
+            5.0 * b5, 6.0 * b6, 7.0 * b7}};
+    ddc_ = {{2.0 * b2, 6.0 * b3, 12.0 * b4,
+             20.0 * b5, 30.0 * b6, 42.0 * b7}};
+    dddc_ = {{6.0 * b3, 24.0 * b4, 60.0 * b5,
+              120.0 * b6, 210.0 * b7}};
+    inv_L_ = 1.0 / L;
+    inv_L2_ = inv_L_ * inv_L_;
+    inv_L3_ = inv_L2_ * inv_L_;
   }
 
-  ProfileResult result;
-  result.p.resize(q.size());
-  result.dp.resize(q.size());
-  result.ddp.resize(q.size());
-  result.dddp.resize(q.size());
-  {
-    ScopedBlockTimer sample_points_timer(g_planning_block_timings.candidate_sample_points_ms);
-    for (std::size_t k = 0; k < q.size(); ++k) {
-      const bool active = q[k] <= L;
-      if (!active) {
-        result.p[k] = p1;
-        result.dp[k] = 0.0;
-        result.ddp[k] = 0.0;
-        result.dddp[k] = 0.0;
-        continue;
-      }
-      const double tau = clamp_value(q[k] / L, 0.0, 1.0);
-      result.p[k] = evaluate_polynomial_horner(c, tau);
-      result.dp[k] = evaluate_polynomial_horner(dc, tau) * inv_L;
-      result.ddp[k] = evaluate_polynomial_horner(ddc, tau) * inv_L2;
-      result.dddp[k] = evaluate_polynomial_horner(dddc, tau) * inv_L3;
+  ProfilePoint at(double q) const {
+    if (!(q <= length_)) return {p1_, 0.0, 0.0, 0.0};
+    const double tau = clamp_value(q / length_, 0.0, 1.0);
+    return {evaluate_polynomial_horner(c_, tau),
+            evaluate_polynomial_horner(dc_, tau) * inv_L_,
+            evaluate_polynomial_horner(ddc_, tau) * inv_L2_,
+            evaluate_polynomial_horner(dddc_, tau) * inv_L3_};
+  }
+
+ private:
+  double length_{1.0e-6};
+  double p1_{0.0};
+  std::array<double, 8> c_{};
+  std::array<double, 7> dc_{};
+  std::array<double, 6> ddc_{};
+  std::array<double, 5> dddc_{};
+  double inv_L_{0.0};
+  double inv_L2_{0.0};
+  double inv_L3_{0.0};
+};
+
+// 후보 경로의 횡오프셋 프로파일 p(q). 격자 샘플링(sample)과 이동거리 기반 경로
+// 계산(at)이 같은 식을 쓰도록 한 곳에 둔다.
+class LateralProfile {
+ public:
+  // hold_length 동안 p0를 유지한 뒤 return_length에 걸쳐 p1로 돌아간다. q_offset은
+  // 래치된 maneuver에서 이미 지나온 길이다 (프로파일 q = q_offset + 국소 q).
+  static LateralProfile hold_then_return(double q_offset, double hold_length,
+                                         double return_length, double p0, double dp0,
+                                         double ddp0, double dddp0, double p1) {
+    LateralProfile profile;
+    profile.q_offset_ = q_offset;
+    profile.hold_length_ = std::max(hold_length, 0.0);
+    return_length = std::max(return_length, 1.0e-6);
+    if (profile.hold_length_ <= 1.0e-9) {
+      profile.second_ = SepticSegment(return_length, p0, dp0, ddp0, dddp0, p1);
+    } else {
+      profile.has_hold_ = true;
+      profile.first_ = SepticSegment(profile.hold_length_, p0, dp0, ddp0, dddp0, p0);
+      profile.second_ = SepticSegment(return_length, p0, 0.0, 0.0, 0.0, p1);
     }
+    return profile;
   }
-  return result;
-}
 
-ProfileResult hold_then_return_profile(const std::vector<double>& q,
-                                       double hold_length,
-                                       double return_length,
-                                       double p0,
-                                       double dp0,
-                                       double ddp0,
-                                       double dddp0,
-                                       double p1) {
-  hold_length = std::max(hold_length, 0.0);
-  return_length = std::max(return_length, 1.0e-6);
-  if (hold_length <= 1.0e-9) {
-    return septic_boundary_profile(q, return_length, p0, dp0, ddp0, dddp0, p1);
-  }
-  const auto first = septic_boundary_profile(q, hold_length, p0, dp0, ddp0, dddp0, p0);
-  std::vector<double> shifted(q.size());
-  for (std::size_t i = 0; i < q.size(); ++i) shifted[i] = std::max(q[i] - hold_length, 0.0);
-  const auto second = septic_boundary_profile(shifted, return_length, p0, 0.0, 0.0, 0.0, p1);
-  ProfileResult out;
-  out.p.resize(q.size()); out.dp.resize(q.size()); out.ddp.resize(q.size()); out.dddp.resize(q.size());
-  for (std::size_t i = 0; i < q.size(); ++i) {
-    const bool use_first = q[i] <= hold_length;
-    out.p[i] = use_first ? first.p[i] : second.p[i];
-    out.dp[i] = use_first ? first.dp[i] : second.dp[i];
-    out.ddp[i] = use_first ? first.ddp[i] : second.ddp[i];
-    out.dddp[i] = use_first ? first.dddp[i] : second.dddp[i];
-  }
-  return out;
-}
-
-ProfileResult terminal_position_profile(const std::vector<double>& q,
-                                        double length,
-                                        double p0,
-                                        double dp0,
-                                        double ddp0,
-                                        double dddp0,
-                                        double p1,
-                                        double blend) {
-  const double L = std::max(length, 1.0e-6);
-  double c4;
-  {
-    ScopedBlockTimer polynomial_fit_timer(g_planning_block_timings.candidate_polynomial_fit_ms);
+  // 4차(종단 위치만 맞춤)와 7차 경계 다항식을 blend로 섞는다.
+  static LateralProfile terminal_position(double length, double p0, double dp0,
+                                          double ddp0, double dddp0, double p1,
+                                          double blend) {
+    LateralProfile profile;
+    profile.terminal_ = true;
+    const double L = std::max(length, 1.0e-6);
     const double L2 = L * L;
     const double L4 = L2 * L2;
-    c4 = (p1 - p0 - dp0 * L - 0.5 * ddp0 * L * L
-         - (1.0 / 6.0) * dddp0 * L * L * L) /
-         L4;
+    profile.length_ = L;
+    profile.c4_ = (p1 - p0 - dp0 * L - 0.5 * ddp0 * L * L
+                  - (1.0 / 6.0) * dddp0 * L * L * L) /
+                  L4;
+    profile.p0_ = p0;
+    profile.dp0_ = dp0;
+    profile.ddp0_ = ddp0;
+    profile.dddp0_ = dddp0;
+    profile.blend_ = clamp_value(blend, 0.0, 1.0);
+    profile.second_ = SepticSegment(L, p0, dp0, ddp0, dddp0, p1);
+    return profile;
   }
-  const auto seventh = septic_boundary_profile(q, L, p0, dp0, ddp0, dddp0, p1);
-  const double b = clamp_value(blend, 0.0, 1.0);
-  ProfileResult out;
-  out.p.resize(q.size()); out.dp.resize(q.size()); out.ddp.resize(q.size()); out.dddp.resize(q.size());
-  {
-    ScopedBlockTimer sample_points_timer(g_planning_block_timings.candidate_sample_points_ms);
-    for (std::size_t i = 0; i < q.size(); ++i) {
-      const double qc = clamp_value(q[i], 0.0, L);
-      double p4 = multiply_add(c4, qc, dddp0 / 6.0);
-      p4 = multiply_add(p4, qc, 0.5 * ddp0);
-      p4 = multiply_add(p4, qc, dp0);
-      p4 = multiply_add(p4, qc, p0);
-      double dp4 = multiply_add(4.0 * c4, qc, 0.5 * dddp0);
-      dp4 = multiply_add(dp4, qc, ddp0);
-      dp4 = multiply_add(dp4, qc, dp0);
+
+  ProfilePoint at(double local_q) const {
+    const double q = q_offset_ + local_q;
+    if (terminal_) {
+      const double qc = clamp_value(q, 0.0, length_);
+      double p4 = multiply_add(c4_, qc, dddp0_ / 6.0);
+      p4 = multiply_add(p4, qc, 0.5 * ddp0_);
+      p4 = multiply_add(p4, qc, dp0_);
+      p4 = multiply_add(p4, qc, p0_);
+      double dp4 = multiply_add(4.0 * c4_, qc, 0.5 * dddp0_);
+      dp4 = multiply_add(dp4, qc, ddp0_);
+      dp4 = multiply_add(dp4, qc, dp0_);
       const double ddp4 = multiply_add(
-          multiply_add(12.0 * c4, qc, dddp0), qc, ddp0);
-      const double dddp4 = multiply_add(24.0 * c4, qc, dddp0);
-      out.p[i] = (1.0 - b) * p4 + b * seventh.p[i];
-      out.dp[i] = (1.0 - b) * dp4 + b * seventh.dp[i];
-      out.ddp[i] = (1.0 - b) * ddp4 + b * seventh.ddp[i];
-      out.dddp[i] = (1.0 - b) * dddp4 + b * seventh.dddp[i];
+          multiply_add(12.0 * c4_, qc, dddp0_), qc, ddp0_);
+      const double dddp4 = multiply_add(24.0 * c4_, qc, dddp0_);
+      const auto seventh = second_.at(q);
+      const double b = blend_;
+      return {(1.0 - b) * p4 + b * seventh.p,
+              (1.0 - b) * dp4 + b * seventh.dp,
+              (1.0 - b) * ddp4 + b * seventh.ddp,
+              (1.0 - b) * dddp4 + b * seventh.dddp};
     }
+    if (!has_hold_) return second_.at(q);
+    if (q <= hold_length_) return first_.at(q);
+    return second_.at(std::max(q - hold_length_, 0.0));
   }
-  return out;
-}
+
+  ProfileResult sample(const std::vector<double>& local_q) const {
+    ScopedBlockTimer sample_points_timer(g_planning_block_timings.candidate_sample_points_ms);
+    ProfileResult result;
+    result.p.resize(local_q.size());
+    result.dp.resize(local_q.size());
+    result.ddp.resize(local_q.size());
+    result.dddp.resize(local_q.size());
+    for (std::size_t i = 0; i < local_q.size(); ++i) {
+      const auto point = at(local_q[i]);
+      result.p[i] = point.p;
+      result.dp[i] = point.dp;
+      result.ddp[i] = point.ddp;
+      result.dddp[i] = point.dddp;
+    }
+    return result;
+  }
+
+ private:
+  bool terminal_{false};
+  bool has_hold_{false};
+  double q_offset_{0.0};
+  double hold_length_{0.0};
+  SepticSegment first_;
+  SepticSegment second_;
+  double length_{1.0e-6};
+  double c4_{0.0};
+  double p0_{0.0};
+  double dp0_{0.0};
+  double ddp0_{0.0};
+  double dddp0_{0.0};
+  double blend_{1.0};
+};
 
 void distance_transform_1d(const std::vector<double>& f,
                            std::vector<double>& d) {
@@ -541,6 +566,322 @@ std::vector<double> truncate_q_at_path_length(const std::vector<double>& q,
   return out;
 }
 
+struct ReferenceSample {
+  double x{0.0};
+  double y{0.0};
+  double psi{0.0};
+  double kappa{0.0};
+  double kappa_s{0.0};
+  double kappa_ss{0.0};
+};
+
+// ReferencePath::evaluate()와 같은 선형 보간이지만 헤딩을 감싸지 않고(연속),
+// 보간된 kappa_s의 기울기(kappa_ss)도 함께 돌려준다.
+ReferenceSample sample_reference(const ReferencePath& path, double s) {
+  const auto& s_values = path.s();
+  s = clamp_value(s, path.s_min(), path.s_max());
+  const std::size_t i = lower_interval(s_values, s);
+  const double ds = std::max(s_values[i + 1] - s_values[i], 1.0e-15);
+  const double alpha = clamp_value((s - s_values[i]) / ds, 0.0, 1.0);
+  const auto lerp = [i, alpha](const std::vector<double>& values) {
+    return (1.0 - alpha) * values[i] + alpha * values[i + 1];
+  };
+  ReferenceSample out;
+  out.x = lerp(path.x());
+  out.y = lerp(path.y());
+  out.psi = lerp(path.psi());
+  out.kappa = lerp(path.kappa());
+  out.kappa_s = lerp(path.kappa_s());
+  out.kappa_ss = (path.kappa_s()[i + 1] - path.kappa_s()[i]) / ds;
+  return out;
+}
+
+// 레퍼런스 끝(real_end_s) 너머의 가상 연장. evaluate_reference_with_virtual_extension()과
+// 같은 곡률(blend_length에 걸쳐 끝점 곡률변화율을 0으로)을 쓰되, 헤딩은 닫힌 식으로,
+// 위치는 [0, blend_length]의 위치 표 + 3점 Gauss 적분, 그 뒤는 원호 식으로 계산한다.
+struct VirtualExtension {
+  bool enabled{false};
+  double x{0.0};
+  double y{0.0};
+  double psi{0.0};
+  double kappa{0.0};
+  double kappa_s{0.0};
+  double blend_length{1.0e-3};
+  std::vector<double> d_nodes;
+  std::vector<double> x_nodes;
+  std::vector<double> y_nodes;
+};
+
+double virtual_heading(const VirtualExtension& extension, double d) {
+  const double B = extension.blend_length;
+  if (d <= B) {
+    return extension.psi + extension.kappa * d
+        + extension.kappa_s * (0.5 * d * d - d * d * d / (6.0 * B));
+  }
+  const double heading_at_blend_end = extension.psi + extension.kappa * B
+      + extension.kappa_s * B * B / 3.0;
+  return heading_at_blend_end + (extension.kappa + 0.5 * extension.kappa_s * B) * (d - B);
+}
+
+void integrate_virtual_position(const VirtualExtension& extension, double from, double to,
+                                double& x, double& y) {
+  constexpr double kGaussNode = 0.77459666924148337704;  // sqrt(3/5)
+  constexpr std::array<double, 3> kGaussWeight{{5.0 / 9.0, 8.0 / 9.0, 5.0 / 9.0}};
+  const double half = 0.5 * (to - from);
+  const double mid = 0.5 * (to + from);
+  const std::array<double, 3> nodes{{mid - kGaussNode * half, mid, mid + kGaussNode * half}};
+  for (std::size_t k = 0; k < nodes.size(); ++k) {
+    const double heading = virtual_heading(extension, nodes[k]);
+    x += half * kGaussWeight[k] * std::cos(heading);
+    y += half * kGaussWeight[k] * std::sin(heading);
+  }
+}
+
+void virtual_position(const VirtualExtension& extension, double d, double& x, double& y) {
+  const double B = extension.blend_length;
+  const double blended = std::min(d, B);
+  if (blended >= extension.d_nodes.back()) {
+    x = extension.x_nodes.back();
+    y = extension.y_nodes.back();
+  } else {
+    const std::size_t j = lower_interval(extension.d_nodes, blended);
+    x = extension.x_nodes[j];
+    y = extension.y_nodes[j];
+    if (blended > extension.d_nodes[j]) {
+      integrate_virtual_position(extension, extension.d_nodes[j], blended, x, y);
+    }
+  }
+  if (d <= B) return;
+  // blend 이후는 곡률이 일정한 원호(곡률 0이면 직선): 현 길이와 현 방향으로 이동한다.
+  const double run = d - B;
+  const double half_turn = 0.5 * (extension.kappa + 0.5 * extension.kappa_s * B) * run;
+  const double chord = std::abs(half_turn) < 1.0e-6
+      ? run * (1.0 - half_turn * half_turn / 6.0)
+      : run * std::sin(half_turn) / half_turn;
+  const double direction = virtual_heading(extension, B) + half_turn;
+  x += chord * std::cos(direction);
+  y += chord * std::sin(direction);
+}
+
+ReferenceSample virtual_reference(const VirtualExtension& extension, double d,
+                                  bool need_position) {
+  const double B = extension.blend_length;
+  ReferenceSample out;
+  if (d <= B) {
+    out.kappa = extension.kappa + extension.kappa_s * (d - 0.5 * d * d / B);
+    out.kappa_s = extension.kappa_s * (1.0 - d / B);
+    out.kappa_ss = -extension.kappa_s / B;
+  } else {
+    out.kappa = extension.kappa + 0.5 * extension.kappa_s * B;
+  }
+  out.psi = virtual_heading(extension, d);
+  if (need_position) virtual_position(extension, d, out.x, out.y);
+  return out;
+}
+
+}  // namespace
+
+// 후보 경로의 연속 함수 표현. q는 후보 시작점 기준 레퍼런스 진행거리, l은 후보 경로를
+// 따라 실제로 이동한 거리다. 격자 노드마다 l(q)와 dl/dq를 저장해 두고 노드 사이는
+// 3차 Hermite로 이어서, 이동거리 l이 주어지면 q를 바로 찾고 그 q에서 레퍼런스와
+// 횡오프셋 프로파일로 경로 값을 직접 계산한다 (격자 값의 선형 보간을 쓰지 않는다).
+struct SpatialPathFunction {
+  std::shared_ptr<const ReferencePath> reference;
+  LateralProfile profile;
+  double reference_s0{0.0};    // q = 0의 레퍼런스 s (fr.s)
+  double real_end_s{0.0};      // 이 s를 넘으면 가상 연장 구간
+  double heading_shift{0.0};   // 2pi 정수배: 시작 헤딩을 차량 chi 근처에 맞춘다
+  VirtualExtension virtual_extension;
+  std::vector<double> q_nodes;
+  std::vector<double> l_nodes;
+  std::vector<double> dl_dq_nodes;
+  // 새 프로파일(래치되지 않은 경우)만: l = 0의 헤딩/곡률/곡률변화율을 실측 상태로
+  // 맞추고, start_correction_length에 걸쳐 5차 Hermite 기저로 부드럽게 0으로 줄인다.
+  bool start_correction{false};
+  double start_correction_length{0.0};
+  double heading_correction{0.0};
+  double kappa_correction{0.0};
+  double kappa_l_correction{0.0};
+};
+
+namespace {
+
+ReferenceSample function_reference(const SpatialPathFunction& function, double q,
+                                   bool need_position) {
+  const double s = function.reference_s0 + q;
+  if (!function.virtual_extension.enabled || s <= function.real_end_s + 1.0e-12) {
+    return sample_reference(*function.reference, s);
+  }
+  return virtual_reference(function.virtual_extension, s - function.real_end_s, need_position);
+}
+
+double path_dl_dq(const SpatialPathFunction& function, double q) {
+  const auto reference = function_reference(function, q, false);
+  const auto profile = function.profile.at(q);
+  const double A = 1.0 - reference.kappa * profile.p;
+  return std::sqrt(std::max(A * A + profile.dp * profile.dp, 1.0e-10));
+}
+
+struct OffsetPathPoint {
+  double x{0.0};
+  double y{0.0};
+  double psi{0.0};
+  double kappa{0.0};
+  double kappa_l{0.0};
+  double dl_dq{1.0};
+};
+
+// q에서의 후보 경로 값. 곡률은 격자 생성과 같은 식이고, kappa_l은 그 식을 q로
+// 미분해 dl/dq로 나눈 해석값이다 (격자 차분 아님).
+OffsetPathPoint offset_path_point(const SpatialPathFunction& function, double q,
+                                  bool need_pose) {
+  const auto r = function_reference(function, q, need_pose);
+  const auto p = function.profile.at(q);
+  const double A = 1.0 - r.kappa * p.p;
+  const double B = p.dp;
+  const double A_q = -r.kappa_s * p.p - r.kappa * p.dp;
+  const double A_qq = -r.kappa_ss * p.p - 2.0 * r.kappa_s * p.dp - r.kappa * p.ddp;
+  const double D = std::max(A * A + B * B, 1.0e-10);
+  const double sqrt_D = std::sqrt(D);
+  const double D_three_halves = D * sqrt_D;
+  const double D_q = 2.0 * (A * A_q + B * p.ddp);
+  const double N = r.kappa * D + A * p.ddp - B * A_q;
+  const double N_q = r.kappa_s * D + r.kappa * D_q + A * p.dddp - B * A_qq;
+  OffsetPathPoint out;
+  out.dl_dq = sqrt_D;
+  out.kappa = N / D_three_halves;
+  out.kappa_l = (N_q / D_three_halves - 1.5 * N * D_q / (D_three_halves * D)) / sqrt_D;
+  if (need_pose) {
+    out.x = r.x - p.p * std::sin(r.psi);
+    out.y = r.y + p.p * std::cos(r.psi);
+    out.psi = r.psi + std::atan2(p.dp, A) + function.heading_shift;
+  }
+  return out;
+}
+
+// 이동거리 l -> q: l을 감싸는 노드 구간에서 l(q)의 3차 Hermite를 Newton으로 푼다.
+double function_q_at_arc_length(const SpatialPathFunction& function, double l) {
+  const auto& q = function.q_nodes;
+  const auto& L = function.l_nodes;
+  const auto& g = function.dl_dq_nodes;
+  if (l <= L.front()) return q.front();
+  if (l >= L.back()) return q.back();
+  const std::size_t i = lower_interval(L, l);
+  const double h = q[i + 1] - q[i];
+  const double span = L[i + 1] - L[i];
+  if (h <= 1.0e-12 || span <= 1.0e-12) return q[i];
+  double t = clamp_value((l - L[i]) / span, 0.0, 1.0);
+  for (int iteration = 0; iteration < 6; ++iteration) {
+    const double t2 = t * t;
+    const double t3 = t2 * t;
+    const double value = (2.0 * t3 - 3.0 * t2 + 1.0) * L[i] + (t3 - 2.0 * t2 + t) * h * g[i]
+        + (-2.0 * t3 + 3.0 * t2) * L[i + 1] + (t3 - t2) * h * g[i + 1] - l;
+    const double slope = (6.0 * t2 - 6.0 * t) * L[i] + (3.0 * t2 - 4.0 * t + 1.0) * h * g[i]
+        + (-6.0 * t2 + 6.0 * t) * L[i + 1] + (3.0 * t2 - 2.0 * t) * h * g[i + 1];
+    if (!(slope > 1.0e-12)) break;
+    const double next = clamp_value(t - value / slope, 0.0, 1.0);
+    const bool converged = std::abs(next - t) <= 1.0e-12;
+    t = next;
+    if (converged) break;
+  }
+  return q[i] + t * h;
+}
+
+// q -> 이동거리 l (같은 3차 Hermite).
+double function_arc_length_at_q(const SpatialPathFunction& function, double query_q) {
+  const auto& q = function.q_nodes;
+  const auto& L = function.l_nodes;
+  const auto& g = function.dl_dq_nodes;
+  if (query_q <= q.front()) return L.front();
+  if (query_q >= q.back()) return L.back();
+  const std::size_t i = lower_interval(q, query_q);
+  const double h = std::max(q[i + 1] - q[i], 1.0e-15);
+  const double t = clamp_value((query_q - q[i]) / h, 0.0, 1.0);
+  const double t2 = t * t;
+  const double t3 = t2 * t;
+  return (2.0 * t3 - 3.0 * t2 + 1.0) * L[i] + (t3 - 2.0 * t2 + t) * h * g[i]
+      + (-2.0 * t3 + 3.0 * t2) * L[i + 1] + (t3 - t2) * h * g[i + 1];
+}
+
+// 시작점 보정. 곡률 보정은 kappa_l 보정의 적분과 맞물리도록 같은 기저로 넣어서,
+// 보정 후에도 kappa_l = d(kappa)/dl이 유지된다. 헤딩 보정은 곡률에 넣지 않는다
+// (예전 격자 방식과 같음).
+void apply_start_correction(const SpatialPathFunction& function, double l,
+                            double* psi, double& kappa, double& kappa_l) {
+  if (!function.start_correction || !(l < function.start_correction_length)) return;
+  const double length = function.start_correction_length;
+  const double u = clamp_value(l / length, 0.0, 1.0);
+  const double u2 = u * u;
+  const double u3 = u2 * u;
+  const double u4 = u3 * u;
+  const double u5 = u4 * u;
+  // h0: 1 -> 0, h1: 기울기 1 -> 0 (양 끝 1, 2계 미분 0인 5차 Hermite 기저)
+  const double h0 = 1.0 - 10.0 * u3 + 15.0 * u4 - 6.0 * u5;
+  const double h0_u = -30.0 * u2 + 60.0 * u3 - 30.0 * u4;
+  const double h1 = u - 6.0 * u3 + 8.0 * u4 - 3.0 * u5;
+  const double h1_u = 1.0 - 18.0 * u2 + 32.0 * u3 - 15.0 * u4;
+  if (psi != nullptr) *psi += function.heading_correction * h0;
+  kappa += function.kappa_correction * h0 + function.kappa_l_correction * length * h1;
+  kappa_l += function.kappa_correction * h0_u / length + function.kappa_l_correction * h1_u;
+}
+
+std::shared_ptr<SpatialPathFunction> build_spatial_path_function(
+    const std::shared_ptr<const ReferencePath>& reference,
+    const LateralProfile& profile,
+    double reference_s0,
+    double real_end_s,
+    double virtual_blend_length,
+    const std::vector<double>& q,
+    double vehicle_chi) {
+  auto function = std::make_shared<SpatialPathFunction>();
+  function->reference = reference;
+  function->profile = profile;
+  function->reference_s0 = reference_s0;
+  function->real_end_s = clamp_value(real_end_s, reference->s_min(), reference->s_max());
+  if (reference_s0 + q.back() > function->real_end_s + 1.0e-12) {
+    auto& extension = function->virtual_extension;
+    const auto end = sample_reference(*reference, function->real_end_s);
+    extension.enabled = true;
+    extension.x = end.x;
+    extension.y = end.y;
+    extension.psi = end.psi;
+    extension.kappa = end.kappa;
+    extension.kappa_s = end.kappa_s;
+    extension.blend_length = std::max(virtual_blend_length, 1.0e-3);
+    const int steps = std::max(1, static_cast<int>(std::ceil(extension.blend_length / 0.5)));
+    extension.d_nodes.resize(static_cast<std::size_t>(steps) + 1);
+    extension.x_nodes.resize(extension.d_nodes.size());
+    extension.y_nodes.resize(extension.d_nodes.size());
+    extension.d_nodes[0] = 0.0;
+    extension.x_nodes[0] = extension.x;
+    extension.y_nodes[0] = extension.y;
+    for (std::size_t j = 1; j < extension.d_nodes.size(); ++j) {
+      extension.d_nodes[j] = extension.blend_length * static_cast<double>(j) / steps;
+      double x = extension.x_nodes[j - 1];
+      double y = extension.y_nodes[j - 1];
+      integrate_virtual_position(extension, extension.d_nodes[j - 1], extension.d_nodes[j], x, y);
+      extension.x_nodes[j] = x;
+      extension.y_nodes[j] = y;
+    }
+  }
+  function->q_nodes = q;
+  function->dl_dq_nodes.resize(q.size());
+  function->l_nodes.assign(q.size(), 0.0);
+  for (std::size_t i = 0; i < q.size(); ++i) {
+    function->dl_dq_nodes[i] = path_dl_dq(*function, q[i]);
+  }
+  // 노드 사이 이동거리는 Simpson 적분 (현 길이 합이 아니라 실제 경로 길이)
+  for (std::size_t i = 1; i < q.size(); ++i) {
+    const double h = q[i] - q[i - 1];
+    const double middle = path_dl_dq(*function, 0.5 * (q[i - 1] + q[i]));
+    function->l_nodes[i] = function->l_nodes[i - 1]
+        + h / 6.0 * (function->dl_dq_nodes[i - 1] + 4.0 * middle + function->dl_dq_nodes[i]);
+  }
+  const double start_heading = offset_path_point(*function, q.front(), true).psi;
+  function->heading_shift = 2.0 * kPi * std::round((vehicle_chi - start_heading) / (2.0 * kPi));
+  return function;
+}
+
 std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
     const PlannerState& state,
     const PlannerAction& previous_action,
@@ -549,7 +890,7 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
     double lateral_length,
     double preview_length,
     const EnvConfig& cfg,
-    const ReferencePath& reference,
+    const std::shared_ptr<const ReferencePath>& reference_path,
     int candidate_id,
     double start_delay = 0.0,
     bool terminal_position_only = false,
@@ -557,6 +898,7 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
     int curvature_retry_depth = 0,
     bool hard_preview_limit = false) {
   ++g_planning_call_counts.spatial_candidate_generation_attempts;
+  const ReferencePath& reference = *reference_path;
   double real_end_s, remaining_real;
   InitialSpatialBoundary boundary;
   double profile_elapsed, profile_total_length, total_lateral_length;
@@ -576,30 +918,31 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
     total_lateral_length = std::max(profile_total_length - profile_elapsed, 0.0);
   }
 
-  auto evaluate_profile = [&](const std::vector<double>& local_q) {
+  LateralProfile lateral_profile;
+  {
+    ScopedBlockTimer polynomial_fit_timer(g_planning_block_timings.candidate_polynomial_fit_ms);
     if (!maneuver_profile) {
-      return (terminal_position_only && start_delay <= 1.0e-9)
-          ? terminal_position_profile(local_q, lateral_length, boundary.n0,
-                                      boundary.n1, boundary.n2, boundary.n3,
-                                      n_target, cfg.terminal.position_profile_blend)
-          : hold_then_return_profile(local_q, start_delay, lateral_length,
-                                     boundary.n0, boundary.n1, boundary.n2,
-                                     boundary.n3, n_target);
+      lateral_profile = (terminal_position_only && start_delay <= 1.0e-9)
+          ? LateralProfile::terminal_position(lateral_length, boundary.n0,
+                                              boundary.n1, boundary.n2, boundary.n3,
+                                              n_target, cfg.terminal.position_profile_blend)
+          : LateralProfile::hold_then_return(0.0, start_delay, lateral_length,
+                                             boundary.n0, boundary.n1, boundary.n2,
+                                             boundary.n3, n_target);
+    } else {
+      lateral_profile = LateralProfile::hold_then_return(
+          profile_elapsed,
+          maneuver_profile->start_delay,
+          maneuver_profile->lateral_length,
+          maneuver_profile->n0,
+          maneuver_profile->n1,
+          maneuver_profile->n2,
+          maneuver_profile->n3,
+          maneuver_profile->target);
     }
-
-    std::vector<double> global_q(local_q.size());
-    for (std::size_t i = 0; i < local_q.size(); ++i) {
-      global_q[i] = profile_elapsed + local_q[i];
-    }
-    return hold_then_return_profile(
-        global_q,
-        maneuver_profile->start_delay,
-        maneuver_profile->lateral_length,
-        maneuver_profile->n0,
-        maneuver_profile->n1,
-        maneuver_profile->n2,
-        maneuver_profile->n3,
-        maneuver_profile->target);
+  }
+  auto evaluate_profile = [&lateral_profile](const std::vector<double>& local_q) {
+    return lateral_profile.sample(local_q);
   };
   double base_extent, q_extent;
   std::vector<double> q;
@@ -703,6 +1046,7 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
 
   std::vector<double> psi(arc.size()), kappa(arc.size());
   std::vector<double> kappa_l;
+  std::shared_ptr<SpatialPathFunction> path_function;
   {
     ScopedBlockTimer curvature_cartesian_timer(g_planning_block_timings.candidate_curvature_cartesian_ms);
     {
@@ -714,6 +1058,12 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
       psi = unwrap_angles(psi);
       const double branch_shift = 2.0 * kPi * std::round((state.chi - psi.front()) / (2.0 * kPi));
       for (double& value : psi) value += branch_shift;
+      path_function = build_spatial_path_function(
+          reference_path, lateral_profile, fr.s, real_end_s,
+          cfg.simulation.virtual_extension_blend_length, q, state.chi);
+      // 궤적이 쓰는 이동거리와 맞도록 격자 arc도 현 길이 합이 아니라 경로 함수의
+      // 실제 길이(l 표)로 바꾼다.
+      arc = path_function->l_nodes;
     }
     ScopedBlockTimer kappa_timer(g_planning_block_timings.candidate_kappa_ms);
     for (std::size_t i = 0; i < arc.size(); ++i) {
@@ -741,9 +1091,17 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
     kappa.front() = (1.0 - motion_weight) * fr.kappa
         + motion_weight * measured_curvature;
     kappa_l.front() = boundary.desired_kappa_l;
+    // 경로 함수에도 같은 시작값을 걸고, 첫 격자 간격만큼에 걸쳐 부드럽게 풀어 준다.
+    const auto start = offset_path_point(*path_function, q.front(), true);
+    path_function->start_correction = true;
+    path_function->start_correction_length = std::min(
+        std::max(cfg.lateral.spatial_ds, 1.0e-3), path_function->l_nodes.back());
+    path_function->heading_correction = wrap_angle(psi.front() - start.psi);
+    path_function->kappa_correction = kappa.front() - start.kappa;
+    path_function->kappa_l_correction = kappa_l.front() - start.kappa_l;
   }
   const double real_end_q = std::min(remaining_real, q.back());
-  const double real_end_l = interp_scalar(q, arc, real_end_q);
+  const double real_end_l = function_arc_length_at_q(*path_function, real_end_q);
   const double real_end_n = interp_scalar(q, profile.p, real_end_q);
   const double real_end_psi = interp_scalar(q, psi, real_end_q);
   double end_x, end_y, ref_end_psi, end_kappa, end_kappa_s;
@@ -773,7 +1131,7 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
           std::max(cfg.constraints.curvature_max, 1.0e-6)));
       return generate_spatial_path_candidate(state, previous_action, fr, n_target,
           std::min(lateral_length * scale, cfg.lateral.max_length), preview_length,
-          cfg, reference, candidate_id, start_delay, terminal_position_only,
+          cfg, reference_path, candidate_id, start_delay, terminal_position_only,
           maneuver_profile, curvature_retry_depth + 1, hard_preview_limit);
     }
   }
@@ -822,6 +1180,7 @@ std::optional<SpatialPathCandidate> generate_spatial_path_candidate(
   candidate.real_end_n = real_end_n;
   candidate.real_end_heading_error = real_end_heading_error;
   candidate.virtual_extension_length = virtual_extension_length;
+  candidate.function = std::move(path_function);
   return candidate;
 }
 
@@ -829,10 +1188,10 @@ struct PathSample {
   double x{0.0}; double y{0.0}; double psi{0.0}; double kappa{0.0}; double kappa_l{0.0};
 };
 
-// A path sample is always looked up by the same query arc-length across
-// several parallel arrays (x, y, psi, kappa, kappa_l, ...). Resolving the
-// bracketing index/blend weight once and reusing it avoids repeating the
-// same std::upper_bound() search once per array.
+// Grid fallback only (a candidate without a path function): a path sample is
+// looked up by the same query arc-length across several parallel arrays.
+// Resolving the bracketing index/blend weight once and reusing it avoids
+// repeating the same std::upper_bound() search once per array.
 struct InterpIndex {
   std::size_t index{0};
   double alpha{0.0};
@@ -852,38 +1211,73 @@ double apply_interp_index(const std::vector<double>& y, const InterpIndex& idx) 
   return (1.0 - idx.alpha) * y[idx.index] + idx.alpha * y[idx.index + 1];
 }
 
-PathSample interpolate_path(const SpatialPathCandidate& path, double progress) {
+// 이동거리 l(후보 경로를 따라 실제로 간 거리)에서의 경로 값. 격자 값을 선형
+// 보간하지 않고, l -> q를 푼 뒤 그 q에서 경로 함수를 직접 계산한다.
+PathSample path_sample_at(const SpatialPathCandidate& path, double progress) {
   const double query = clamp_value(progress, 0.0, path.arc_length.back());
-  const InterpIndex idx = resolve_interp_index(path.arc_length, query);
-  return {apply_interp_index(path.x, idx), apply_interp_index(path.y, idx),
-          apply_interp_index(path.psi, idx), apply_interp_index(path.kappa, idx),
-          apply_interp_index(path.kappa_l, idx)};
+  if (!path.function) {
+    const InterpIndex idx = resolve_interp_index(path.arc_length, query);
+    return {apply_interp_index(path.x, idx), apply_interp_index(path.y, idx),
+            apply_interp_index(path.psi, idx), apply_interp_index(path.kappa, idx),
+            apply_interp_index(path.kappa_l, idx)};
+  }
+  const auto& function = *path.function;
+  auto point = offset_path_point(function, function_q_at_arc_length(function, query), true);
+  apply_start_correction(function, query, &point.psi, point.kappa, point.kappa_l);
+  return {point.x, point.y, point.psi, point.kappa, point.kappa_l};
 }
 
 // Lighter-weight variant for callers (curve_speed_limit) that only need
 // curvature and its arc-length derivative, not full pose (x, y, heading) --
-// skips computing/interpolating the three unused arrays entirely.
+// skips the reference position, heading and trigonometry entirely.
 struct CurvatureSample {
   double kappa{0.0};
   double kappa_l{0.0};
 };
 
-CurvatureSample interpolate_curvature(const SpatialPathCandidate& path, double progress) {
+CurvatureSample curvature_sample_at(const SpatialPathCandidate& path, double progress) {
   const double query = clamp_value(progress, 0.0, path.arc_length.back());
-  const InterpIndex idx = resolve_interp_index(path.arc_length, query);
-  return {apply_interp_index(path.kappa, idx), apply_interp_index(path.kappa_l, idx)};
+  if (!path.function) {
+    const InterpIndex idx = resolve_interp_index(path.arc_length, query);
+    return {apply_interp_index(path.kappa, idx), apply_interp_index(path.kappa_l, idx)};
+  }
+  const auto& function = *path.function;
+  auto point = offset_path_point(function, function_q_at_arc_length(function, query), false);
+  apply_start_correction(function, query, nullptr, point.kappa, point.kappa_l);
+  return {point.kappa, point.kappa_l};
 }
 
-double interpolate_reference_progress(const SpatialPathCandidate& path, double progress) {
-  return interp_scalar(path.arc_length, path.q_ref,
-                       clamp_value(progress, 0.0, path.arc_length.back()));
+// 이동거리 l에 해당하는 레퍼런스 진행거리 q.
+double reference_progress_at(const SpatialPathCandidate& path, double progress) {
+  const double query = clamp_value(progress, 0.0, path.arc_length.back());
+  if (!path.function) return interp_scalar(path.arc_length, path.q_ref, query);
+  return function_q_at_arc_length(*path.function, query);
 }
 
+// dq/dl = 1 / sqrt((1 - kappa_ref n)^2 + n'^2), 경로 함수에서 바로 계산한다.
 double reference_progress_rate(const SpatialPathCandidate& path, double progress) {
   if (path.arc_length.size() < 2) return 1.0;
-  const auto rate = gradient(path.q_ref, path.arc_length, false);
-  return clamp_value(interp_scalar(path.arc_length, rate,
-      clamp_value(progress, 0.0, path.arc_length.back())), 0.20, 1.20);
+  const double query = clamp_value(progress, 0.0, path.arc_length.back());
+  if (!path.function) {
+    const auto rate = gradient(path.q_ref, path.arc_length, false);
+    return clamp_value(interp_scalar(path.arc_length, rate, query), 0.20, 1.20);
+  }
+  const auto& function = *path.function;
+  const double q = function_q_at_arc_length(function, query);
+  return clamp_value(1.0 / path_dl_dq(function, q), 0.20, 1.20);
+}
+
+// 레퍼런스 진행거리 q에서의 횡오프셋과 이동거리.
+double lateral_offset_at_reference_progress(const SpatialPathCandidate& path, double q) {
+  const double query = std::min(q, path.q_ref.back());
+  if (!path.function) return interp_scalar(path.q_ref, path.lateral_offset, query);
+  return path.function->profile.at(clamp_value(query, path.q_ref.front(), path.q_ref.back())).p;
+}
+
+double arc_length_at_reference_progress(const SpatialPathCandidate& path, double q) {
+  const double query = std::min(q, path.q_ref.back());
+  if (!path.function) return interp_scalar(path.q_ref, path.arc_length, query);
+  return function_arc_length_at_q(*path.function, query);
 }
 
 struct TerminalControlCommand {
@@ -1433,17 +1827,14 @@ TerminalGoalRegionEvaluation evaluate_terminal_goal_region(
   TerminalGoalRegionEvaluation result;
   const double terminal_goal_q = std::max(
       path.real_end_q - cfg.longitudinal.stop_target_offset, 0.0);
-  result.absolute_lateral_offset = std::abs(interp_scalar(
-      path.q_ref, path.lateral_offset,
-      std::min(terminal_goal_q, path.q_ref.back())));
+  result.absolute_lateral_offset = std::abs(
+      lateral_offset_at_reference_progress(path, terminal_goal_q));
   if (costmap == nullptr || path.arc_length.empty()) {
     result.minimum_clearance = 1.0e6;
     return result;
   }
 
-  const double goal_l = interp_scalar(
-      path.q_ref, path.arc_length,
-      std::min(terminal_goal_q, path.q_ref.back()));
+  const double goal_l = arc_length_at_reference_progress(path, terminal_goal_q);
   const double half_length = 0.5 * cfg.vehicle.length;
   const double radius = 0.5 * cfg.vehicle.width + cfg.vehicle.footprint_margin;
   const double sample_step = std::max(
@@ -1457,7 +1848,7 @@ TerminalGoalRegionEvaluation evaluate_terminal_goal_region(
     const double query_l = clamp_value(
         goal_l - half_length + 2.0 * half_length * alpha,
         0.0, path.arc_length.back());
-    const auto sample = interpolate_path(path, query_l);
+    const auto sample = path_sample_at(path, query_l);
     result.minimum_clearance = std::min(
         result.minimum_clearance,
         costmap->clearance_single_circle(sample.x, sample.y, radius));
@@ -1658,7 +2049,7 @@ double curve_speed_limit(const SpatialPathCandidate& path, double progress,
   for (int i = 0; i < 61; ++i) {
     const double alpha = static_cast<double>(i) / 60.0;
     const double sample_s = progress + alpha * (std::max(progress, s1) - progress);
-    const auto sample = interpolate_curvature(path, sample_s);
+    const auto sample = curvature_sample_at(path, sample_s);
     const double v_kappa = std::sqrt(cfg.constraints.a_lat_max /
                                      (std::abs(sample.kappa) + 1.0e-5));
     const double v_kappa_rate = std::cbrt(
@@ -1707,7 +2098,7 @@ TimeTrajectory generate_open_loop_trajectory(
   for (int k = 0; k < N; ++k) {
     const std::size_t index = static_cast<std::size_t>(k);
     const double l_progress = trajectory.progress[index];
-    const double q_progress = interpolate_reference_progress(path, l_progress);
+    const double q_progress = reference_progress_at(path, l_progress);
     const double v = std::max(trajectory.states[index].speed, 0.0);
     const double a = trajectory.states[index].acceleration;
     const double remaining_s = terminal_goal_q - q_progress;
@@ -1795,7 +2186,7 @@ TimeTrajectory generate_open_loop_trajectory(
     ScopedBlockTimer state_calculation_timer(
         g_planning_block_timings.trajectory_state_calculation_ms);
     l_next = l_progress + distance;
-    q_next = interpolate_reference_progress(path, l_next);
+    q_next = reference_progress_at(path, l_next);
     const bool terminal_tolerance_extension = terminal_mode_active
         && q_next <= terminal_goal_q + tc.longitudinal_tolerance + 1.0e-9;
     // Near the terminal point, the current state can already lie a few
@@ -1818,7 +2209,7 @@ TimeTrajectory generate_open_loop_trajectory(
       }
       break;
     }
-    const auto sample = interpolate_path(path, l_next);
+    const auto sample = path_sample_at(path, l_next);
     PlannerState next;
     next.x = sample.x;
     next.y = sample.y;
@@ -1859,8 +2250,8 @@ TimeTrajectory generate_open_loop_trajectory(
   ScopedBlockTimer state_calculation_post_loop_timer(
       g_planning_block_timings.trajectory_state_calculation_ms);
   for (std::size_t i = 0; i < state_count; ++i) {
-    reference_progress[i] = interpolate_reference_progress(path, trajectory.progress[i]);
-    const auto sample = interpolate_path(path, trajectory.progress[i]);
+    reference_progress[i] = reference_progress_at(path, trajectory.progress[i]);
+    const auto sample = path_sample_at(path, trajectory.progress[i]);
     trajectory_kappa[i] = sample.kappa;
     trajectory_kappa_l[i] = sample.kappa_l;
     const double v = trajectory.states[i].speed;
@@ -1898,7 +2289,7 @@ TimeTrajectory generate_open_loop_trajectory(
         speed = 0.0; acceleration = 0.0;
         progress = trajectory.progress[static_cast<std::size_t>(k + 1)];
       }
-      const auto sample = interpolate_path(path, progress);
+      const auto sample = path_sample_at(path, progress);
       const double heading_rate = speed * sample.kappa;
       const double heading_acceleration = acceleration * sample.kappa
           + speed * speed * sample.kappa_l;
@@ -2018,9 +2409,8 @@ TimeTrajectory generate_open_loop_trajectory(
   const auto terminal_goal_region = enforce_obstacle_collision
       ? evaluate_terminal_goal_region(path, cfg, costmap, maximum_speed)
       : TerminalGoalRegionEvaluation{true, 1.0e6,
-          std::abs(interp_scalar(path.q_ref, path.lateral_offset,
-              std::min(std::max(path.real_end_q - cfg.longitudinal.stop_target_offset, 0.0),
-                       path.q_ref.back())))};
+          std::abs(lateral_offset_at_reference_progress(path,
+              std::max(path.real_end_q - cfg.longitudinal.stop_target_offset, 0.0)))};
   trajectory.terminal_spatial_valid = !terminal_constraint_active
       || terminal_goal_region.safe;
   trajectory.terminal_braking_active = terminal_mode_active;
@@ -2098,7 +2488,7 @@ PlannerMotionTrajectory build_allocator_trajectory(
     motion.t[i] = static_cast<double>(i) * dt;
     const auto& state = trajectory.states[i];
     if (selected_path) {
-      const auto sample = interpolate_path(*selected_path, trajectory.progress[i]);
+      const auto sample = path_sample_at(*selected_path, trajectory.progress[i]);
       motion.x[i] = sample.x; motion.y[i] = sample.y; motion.chi[i] = sample.psi;
       motion.kappa[i] = sample.kappa; motion.kappa_s[i] = sample.kappa_l;
     } else {
@@ -2152,7 +2542,7 @@ TimeTrajectory stationary_time_trajectory(const PlannerState& state,
 }  // namespace
 PathVelocityPlanner::PathVelocityPlanner(EnvConfig config, ReferencePath path,
                                          std::optional<Costmap2D> costmap)
-    : config_(std::move(config)), path_(std::move(path)), costmap_(std::move(costmap)) {
+    : config_(std::move(config)), path_(std::make_shared<const ReferencePath>(std::move(path))), costmap_(std::move(costmap)) {
   speed_cap_probe_interval_ = std::max(
       1, static_cast<int>(std::llround(1.8 / std::max(config_.longitudinal.dt, 1.0e-6))));
 }
@@ -2217,7 +2607,7 @@ PlannerContinuityState PathVelocityPlanner::export_continuity_state(
   PlannerContinuityState result;
   result.lateral_target_hint = lateral_target_hint_;
   if (maneuver_profile_ && maneuver_start_s_) {
-    const auto projection = path_.project(state.x, state.y, state.chi);
+    const auto projection = path_->project(state.x, state.y, state.chi);
     auto profile = *maneuver_profile_;
     const double total_length = profile.start_delay + profile.lateral_length;
     profile.elapsed_length = clamp_value(
@@ -2239,7 +2629,7 @@ void PathVelocityPlanner::import_continuity_state(
     const PlannerContinuityState& continuity, const PlannerState& state) {
   lateral_target_hint_ = continuity.lateral_target_hint;
   if (continuity.maneuver_profile) {
-    const auto projection = path_.project(state.x, state.y, state.chi);
+    const auto projection = path_->project(state.x, state.y, state.chi);
     maneuver_profile_ = continuity.maneuver_profile;
     const double total_length = maneuver_profile_->start_delay
         + maneuver_profile_->lateral_length;
@@ -2298,7 +2688,7 @@ std::vector<double> PathVelocityPlanner::speed_trials(double requested_speed) co
 TimeTrajectory PathVelocityPlanner::emergency_stop(
     const PlannerState& state, const PlannerAction& previous_action,
     double target_speed, bool terminal_stop_required, const FrenetProjection& fr) {
-  const double remaining = std::max(path_.s_max() - config_.simulation.path_end_margin - fr.s, 0.2);
+  const double remaining = std::max(path_->s_max() - config_.simulation.path_end_margin - fr.s, 0.2);
   const double preview = std::min(config_.constraints.v_max * config_.longitudinal.horizon,
                                   remaining);
   auto path = generate_spatial_path_candidate(state, previous_action, fr, fr.n,
@@ -2337,7 +2727,7 @@ PlanResult PathVelocityPlanner::plan_at_speed(
     const std::vector<double>& excluded_lateral_targets,
     const FrenetProjection& fr) {
   const auto start_time = std::chrono::steady_clock::now();
-  const double real_end_s = path_.s_max() - config_.simulation.path_end_margin;
+  const double real_end_s = path_->s_max() - config_.simulation.path_end_margin;
   const double terminal_goal_s = std::max(real_end_s - config_.longitudinal.stop_target_offset, 0.0);
   const double remaining_to_goal = std::max(terminal_goal_s - fr.s, 0.0);
   const double preview_length = reachable_spatial_preview_length(state.speed, config_);
@@ -2372,9 +2762,9 @@ PlanResult PathVelocityPlanner::plan_at_speed(
           ? 0.5 : static_cast<double>(i) / static_cast<double>(sample_count - 1);
       const double query_s = clamp_value(
           terminal_goal_s - half_length + 2.0 * half_length * alpha,
-          path_.s_min(), real_end_s);
+          path_->s_min(), real_end_s);
       double x = 0.0, y = 0.0, psi = 0.0, kappa = 0.0, kappa_s = 0.0;
-      path_.evaluate(query_s, x, y, psi, kappa, kappa_s);
+      path_->evaluate(query_s, x, y, psi, kappa, kappa_s);
       (void)psi;
       (void)kappa;
       (void)kappa_s;
@@ -2776,7 +3166,7 @@ PlanResult PathVelocityPlanner::plan_at_speed(
     if (transition_required) {
       if (!same_maneuver) {
         const auto boundary = initial_spatial_boundaries(
-            state, previous_action, fr, config_, path_);
+            state, previous_action, fr, config_, *path_);
         maneuver_profile_ = ManeuverProfileState{
             item.path.n_target,
             0.0,
@@ -2956,7 +3346,7 @@ PlanResult PathVelocityPlanner::plan(const PlannerState& state,
     fr = *known_projection;
   } else {
     ScopedBlockTimer projection_timer(g_planning_block_timings.candidate_projection_ms);
-    fr = path_.project(state.x, state.y, state.chi);
+    fr = path_->project(state.x, state.y, state.chi);
   }
 
   // Short phases and high requested speeds may be position-feasible only at a

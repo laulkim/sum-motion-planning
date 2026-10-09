@@ -427,6 +427,10 @@ class Costmap2D {
   std::vector<double> distance_field_;
 };
 
+// 후보 경로를 이동거리(arc length)로 직접 계산하는 함수 표현 (core.cpp).
+// 0.5 m 격자 배열은 충돌 스크리닝/비용용이고, 궤적 값은 이 함수에서 뽑는다.
+struct SpatialPathFunction;
+
 struct SpatialPathCandidate {
   int candidate_id{-1};
   double n_target{0.0};
@@ -451,6 +455,7 @@ struct SpatialPathCandidate {
   double real_end_n{0.0};
   double real_end_heading_error{0.0};
   double virtual_extension_length{0.0};
+  std::shared_ptr<const SpatialPathFunction> function;
 };
 
 struct TimeTrajectory {
@@ -701,7 +706,7 @@ class PathVelocityPlanner {
                                const PlannerState& state);
 
   const EnvConfig& config() const { return config_; }
-  const ReferencePath& path() const { return path_; }
+  const ReferencePath& path() const { return *path_; }
   const std::optional<Costmap2D>& costmap() const { return costmap_; }
 
  private:
@@ -724,7 +729,8 @@ class PathVelocityPlanner {
   std::vector<double> speed_trials(double requested_speed) const;
 
   EnvConfig config_;
-  ReferencePath path_;
+  // 후보 경로 함수가 레퍼런스를 계속 참조하므로 공유 소유한다.
+  std::shared_ptr<const ReferencePath> path_;
   std::optional<Costmap2D> costmap_;
   std::optional<double> lateral_target_hint_;
   std::optional<double> last_feasible_speed_cap_;
