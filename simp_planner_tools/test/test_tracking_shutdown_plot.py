@@ -51,7 +51,7 @@ def test_shutdown_figures_use_controller_snapshot(tmp_path):
         plt.close(figure)
 
 
-def test_single_sample_recording_saves_three_figures_without_display(tmp_path, monkeypatch):
+def test_single_sample_recording_saves_plots_and_empty_turn_summary(tmp_path, monkeypatch):
     monkeypatch.delenv("DISPLAY", raising=False)
     message = TrackingControl(valid=True)
     path = tmp_path / "tracking.csv"
@@ -60,7 +60,8 @@ def test_single_sample_recording_saves_three_figures_without_display(tmp_path, m
         writer.writerow(COLUMNS)
         writer.writerow(sample_row(message, 0))
     show_recording(path)
-    for name in ("tracking_errors.png", "tracking_states_inputs.png", "tracking_world_errors.png"):
+    for name in ("tracking_errors.png", "tracking_states_inputs.png", "tracking_world_errors.png",
+                 "spot_turn_summary.png", "spot_turn_summary.csv"):
         assert (tmp_path / name).stat().st_size > 0
     assert not plt.get_fignums()
 
