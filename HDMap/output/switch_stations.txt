@@ -1,0 +1,7 @@
+큰트랙 기준 크랩 switch station (S_switch)
+scenario_definition.py의 ScenarioPhase.switch_s 입력값과 동일한 의미.
+(큰트랙 총 길이 1077.55 m)
+
+크랩1: S_switch = 279.19 m (진입 커넥터 길이 16.16 m, heading -38.1 deg)
+크랩2: S_switch = 462.98 m (진입 커넥터 길이 11.95 m, heading -38.8 deg)
+크랩3: S_switch = 689.75 m (진입 커넥터 길이 11.07 m, heading 142.1 deg)
