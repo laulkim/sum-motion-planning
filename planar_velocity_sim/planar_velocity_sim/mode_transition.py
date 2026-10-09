@@ -30,7 +30,8 @@ class DriveModeTransitionModel:
     """Vehicle-side mode transition model.
 
     A mode command is accepted only at standstill. During the transition the
-    vehicle is held at zero velocity. The current mode changes only after the
+    velocity reference is held at zero; the downstream vehicle response can
+    retain residual actual motion. The current mode changes only after the
     configured dwell has elapsed.
     """
 
@@ -114,6 +115,7 @@ class DriveModeTransitionModel:
     def applied_velocity(
         self, vx: float, vy: float, yaw_rate: float
     ) -> tuple[float, float, float]:
+        """Gate the velocity reference before downstream vehicle dynamics."""
         if self.status == VehicleModeStatus.ALIGNING:
             return 0.0, 0.0, 0.0
         return float(vx), float(vy), float(yaw_rate)

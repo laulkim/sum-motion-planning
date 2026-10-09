@@ -30,9 +30,9 @@ class TrackingControllerNode final : public rclcpp::Node {
       throw std::invalid_argument("command_frequency_hz must be finite and positive");
     }
     period_ns_ = static_cast<std::int64_t>(std::llround(1.0e9 / command_frequency_hz));
-    declare_parameter("kx", 0.3);
-    declare_parameter("ky", 0.2);
-    declare_parameter("ktheta", 0.2);
+    declare_parameter("kx", 1.0);
+    declare_parameter("ky", 2.0);
+    declare_parameter("ktheta", 1.0);
     declare_parameter("base_frame", "base_link");
 
     auto static_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();

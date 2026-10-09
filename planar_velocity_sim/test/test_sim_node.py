@@ -24,7 +24,8 @@ def simulator(monkeypatch):
     ))
     monkeypatch.setattr(node, "get_clock", lambda: clock)
     node.last_update_time = clock.now()
-    node.reset_response(0.0)
+    for response in node.responses:
+        response.reset(0.0)
     node.sensor = SensorDelay(node.sensor.delay_sec)
     node.sensor.update(0.0, node.actual_state())
     odometry = []
@@ -75,31 +76,62 @@ def test_actual_pose_and_delayed_odometry(simulator):
     assert node.x > odometry[-1].pose.pose.position.x
 
 
-def test_aligning_forces_actual_zero_and_clears_old_response(simulator):
+def test_aligning_stops_through_response_and_integrates_residual_motion(simulator):
     node, clock, odometry = simulator
     command(node, vx=0.02, vy=0.01, yaw_rate=0.2)
     tick(node, clock, 0.04)
-    assert node.applied_vx > 0.0 and node.applied_yaw_rate > 0.0
-    # Accepted using actual velocity below the standstill threshold.
+    before = node.actual_state()
     node.mode_command_callback(UInt8(data=2))
     assert node.mode_model.transition_in_progress
-    assert node.actual_state()[3:] == (0.0, 0.0, 0.0)
-    pose = node.actual_state()[:3]
-    for t in (0.05, 0.16, 0.8, 2.03):
-        clock.sec = t
-        command(node, vx=1.0, vy=2.0, yaw_rate=0.5)
-        node.update()
-        assert node.actual_state()[:3] == pytest.approx(pose)
-        assert node.actual_state()[3:] == (0.0, 0.0, 0.0)
-        assert all(not response.pending for response in node.responses)
+    assert node.actual_state() == before  # no instantaneous velocity reset
+    clock.sec = 0.05
+    command(node, vx=1.0, vy=2.0, yaw_rate=0.5)  # retained, not applied yet
+    node.update()
+    vy_response = node.responses[1]
+    # vx/yaw stop commands still have 20 ms dead time; vy decays immediately.
+    assert node.applied_vx > before[3]
+    assert node.applied_yaw_rate > before[5]
+    assert node.applied_vy == pytest.approx(before[4] * math.exp(-0.01 / vy_response.tau_sec))
+    assert node.x > before[0] and node.y > before[1] and node.yaw > before[2]
+    tick(node, clock, 0.06)
+    at_stop = node.actual_state()[3:]
+    tick(node, clock, 0.07)
+    for actual, previous, response in zip(node.actual_state()[3:], at_stop, node.responses):
+        assert actual == pytest.approx(previous * math.exp(-0.01 / response.tau_sec))
+        assert actual > 0.0
+    assert all(response.reference == 0.0 for response in node.responses)
+    # Delayed odometry eventually reports the residual motion, not a reset pose.
+    tick(node, clock, 0.15)
+    assert odometry[-1].pose.pose.position.x > before[0]
+    assert odometry[-1].twist.twist.linear.x > 0.0
     tick(node, clock, 2.04)
     assert not node.mode_model.transition_in_progress
-    assert node.actual_state()[3:] == (0.0, 0.0, 0.0)
+    settled_vx = node.applied_vx
     tick(node, clock, 2.05)
-    assert node.applied_vx == node.applied_yaw_rate == 0.0
+    assert node.applied_vx <= settled_vx  # resumed vx is still in dead time
     assert node.applied_vy > 0.0
     tick(node, clock, 2.07)
     assert node.applied_vx > 0.0 and node.applied_yaw_rate > 0.0
+
+
+def test_aligning_preserves_commands_already_in_dead_time(simulator):
+    node, clock, odometry = simulator
+    command(node, vx=0.02)
+    tick(node, clock, 0.03)
+    clock.sec = 0.035
+    command(node, vx=1.0)  # will arrive at 55 ms
+    tick(node, clock, 0.04)
+    before = node.applied_vx
+    node.mode_command_callback(UInt8(data=2))  # zero will arrive at 60 ms
+    assert node.mode_model.transition_in_progress
+    tick(node, clock, 0.057)
+    assert node.applied_vx > before  # in-flight command was not erased
+    tick(node, clock, 0.06)
+    at_stop = node.applied_vx
+    tick(node, clock, 0.07)
+    assert node.applied_vx == pytest.approx(
+        at_stop * math.exp(-0.01 / node.responses[0].tau_sec)
+    )
 
 
 def test_mode_change_checks_actual_speed_not_delayed_sensor(simulator):
