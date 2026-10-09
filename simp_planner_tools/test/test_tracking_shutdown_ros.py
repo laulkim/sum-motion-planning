@@ -1,4 +1,4 @@
-"""Controller snapshot → CSV → Ctrl+C → two PNGs, with real ROS processes."""
+"""Controller snapshot → CSV → Ctrl+C → three PNGs, with real ROS processes."""
 import csv
 import os
 from pathlib import Path
@@ -29,7 +29,8 @@ def test_controller_recording_survives_sigint(tmp_path, monkeypatch):
     processes = []
     with (tmp_path / "processes.log").open("w") as log:
         try:
-            for command in ([str(executable)],
+            for command in ([str(executable), "--ros-args", "-p", "kx:=0.3",
+                             "-p", "ky:=0.2", "-p", "ktheta:=0.2"],
                             [sys.executable, "-m", "simp_planner_tools.tracking_shutdown_plot",
                              "--ros-args", "-p", f"output_dir:={tmp_path}"]):
                 processes.append(subprocess.Popen(command, stdout=log, stderr=log, start_new_session=True))
@@ -69,7 +70,7 @@ def test_controller_recording_survives_sigint(tmp_path, monkeypatch):
             assert recorder.wait(timeout=10) == 0
             directory = next(tmp_path.glob("tracking_*"))
             wait_for(lambda: all((directory / name).exists() for name in
-                                 ("tracking_errors.png", "tracking_states_inputs.png")))
+                                 ("tracking_errors.png", "tracking_states_inputs.png", "tracking_world_errors.png")))
             with (directory / "tracking.csv").open() as file:
                 rows = list(csv.DictReader(file))
             valid = [row for row in rows if row["valid"] == "1"]

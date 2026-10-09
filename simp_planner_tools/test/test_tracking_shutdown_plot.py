@@ -37,7 +37,7 @@ def test_shutdown_figures_use_controller_snapshot(tmp_path):
     assert invalid[16:19] == (0.0, 0.0, 0.0)
     assert invalid[-1] == 0
     figures = create_figures(np.asarray([row, invalid]))
-    assert [len(figure.axes) for figure in figures] == [3, 6]
+    assert [len(figure.axes) for figure in figures] == [3, 6, 3]
     np.testing.assert_allclose(figures[0].axes[0].lines[0].get_ydata(), [0.0, np.nan])
     np.testing.assert_allclose(figures[1].axes[1].lines[0].get_ydata(), [2.0, 0.0])
     assert figures[1].axes[0].lines[0].get_label() == "predicted"
@@ -51,7 +51,7 @@ def test_shutdown_figures_use_controller_snapshot(tmp_path):
         plt.close(figure)
 
 
-def test_single_sample_recording_saves_both_figures_without_display(tmp_path, monkeypatch):
+def test_single_sample_recording_saves_three_figures_without_display(tmp_path, monkeypatch):
     monkeypatch.delenv("DISPLAY", raising=False)
     message = TrackingControl(valid=True)
     path = tmp_path / "tracking.csv"
@@ -60,6 +60,43 @@ def test_single_sample_recording_saves_both_figures_without_display(tmp_path, mo
         writer.writerow(COLUMNS)
         writer.writerow(sample_row(message, 0))
     show_recording(path)
-    for name in ("tracking_errors.png", "tracking_states_inputs.png"):
+    for name in ("tracking_errors.png", "tracking_states_inputs.png", "tracking_world_errors.png"):
         assert (tmp_path / name).stat().st_size > 0
     assert not plt.get_fignums()
+
+
+def test_world_errors_are_direct_differences_even_when_stopped_or_rotating():
+    message = TrackingControl(valid=True)
+    message.predicted_x, message.predicted_y = 1.0, 2.0
+    message.reference = TrackingTrajectoryPoint(x=2.0, y=4.0)
+    message.ex, message.ey = -3.0, 5.0  # existing controller plot stays verbatim
+    # vx, vy, reference yaw, predicted yaw, expected yaw error in degrees.
+    cases = [
+        (1, 0, 0, 0, 0),
+        (0, 1, math.pi / 2, 0, 90),
+        (-1, 0, math.pi, math.pi, 0),
+        (0, 0, 0, 0, 0),  # stationary: no artificial gap
+        (0, 0, 1, 0, math.degrees(1)),  # spot turn: no artificial gap
+        (1, 0, -math.pi + 0.1, math.pi - 0.1, math.degrees(0.2)),
+    ]
+    rows = []
+    for vx, vy, yaw_ref, yaw_pred, _ in cases:
+        message.reference.vx, message.reference.vy = float(vx), float(vy)
+        message.reference.body_yaw, message.predicted_yaw = float(yaw_ref), float(yaw_pred)
+        message.reference.yaw_rate = 0.3 if yaw_ref == 1 else 0.0
+        rows.append(sample_row(message, 0))
+    message.valid = False
+    rows.append(sample_row(message, 0))
+    figures = create_figures(np.asarray(rows))
+    try:
+        np.testing.assert_allclose(figures[0].axes[0].lines[0].get_ydata(),
+                                   [-3] * len(cases) + [np.nan])
+        np.testing.assert_allclose(figures[2].axes[0].lines[0].get_ydata(),
+                                   [1] * len(cases) + [np.nan])
+        np.testing.assert_allclose(figures[2].axes[1].lines[0].get_ydata(),
+                                   [2] * len(cases) + [np.nan])
+        np.testing.assert_allclose(figures[2].axes[2].lines[0].get_ydata(),
+                                   [case[4] for case in cases] + [np.nan], atol=1e-12)
+    finally:
+        for figure in figures:
+            plt.close(figure)
