@@ -8,6 +8,8 @@ from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
+from planar_velocity_sim.vehicle_response import RESPONSE_PARAMETER_DEFAULTS
+
 from simp_planner_tools.scenario_definition import load_scenario_definition
 
 # Relative to this package's own installed share directory (see setup.py),
@@ -80,6 +82,10 @@ def _resolved_nodes(context):
             output="screen",
             parameters=[
                 {
+                    **{
+                        name: float(LaunchConfiguration(name).perform(context))
+                        for name in RESPONSE_PARAMETER_DEFAULTS
+                    },
                     "initial_x": float(first_path.x[0]),
                     "initial_y": float(first_path.y[0]),
                     "initial_yaw": initial_body_yaw,
@@ -251,6 +257,10 @@ def generate_launch_description() -> LaunchDescription:
                 "use_rviz", default_value="false",
                 description="Auto-launch rviz2 with the bundled simp_planner.rviz config.",
             ),
+            *[
+                DeclareLaunchArgument(name, default_value=str(default))
+                for name, default in RESPONSE_PARAMETER_DEFAULTS.items()
+            ],
             OpaqueFunction(function=_resolved_nodes),
         ]
     )

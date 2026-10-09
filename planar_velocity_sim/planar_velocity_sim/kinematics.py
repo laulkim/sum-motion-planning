@@ -16,7 +16,7 @@ def integrate_body_velocity(
     yaw_rate: float,
     dt: float,
 ) -> tuple[float, float, float]:
-    """Midpoint integration of a planar body-frame velocity command."""
+    """Midpoint integration of a planar actual body-frame velocity."""
     if dt < 0.0:
         raise ValueError("dt must be non-negative")
     yaw_mid = float(yaw) + 0.5 * float(yaw_rate) * float(dt)

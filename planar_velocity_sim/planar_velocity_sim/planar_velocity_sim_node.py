@@ -9,15 +9,19 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
 from simp_planner_msgs.msg import DriveModeState
 from std_msgs.msg import UInt8
 
 from .kinematics import integrate_body_velocity
 from .mode_transition import DriveModeTransitionModel, VALID_DRIVE_MODES
+from .vehicle_response import (
+    FirstOrderResponse, RESPONSE_PARAMETER_DEFAULTS, SensorDelay,
+)
 
 
 class PlanarVelocitySimNode(Node):
-    """Integrate body-frame commands and report vehicle-confirmed drive mode."""
+    """Integrate actual body velocity and publish delayed sensor odometry."""
 
     def __init__(self) -> None:
         super().__init__("planar_velocity_sim")
@@ -36,6 +40,9 @@ class PlanarVelocitySimNode(Node):
         self.declare_parameter("mode_state_topic", "/vehicle/drive_mode_state")
         self.declare_parameter("odom_frame", "odom")
         self.declare_parameter("base_frame", "base_link")
+
+        for name, default in RESPONSE_PARAMETER_DEFAULTS.items():
+            self.declare_parameter(name, default)
 
         update_rate_hz = float(self.get_parameter("update_rate_hz").value)
         mode_state_rate_hz = float(self.get_parameter("mode_state_rate_hz").value)
@@ -95,6 +102,18 @@ class PlanarVelocitySimNode(Node):
         )
 
         self.last_update_time = self.get_clock().now()
+        start_sec = self.last_update_time.nanoseconds * 1.0e-9
+        self.responses = [
+            FirstOrderResponse(
+                gain=float(self.get_parameter(f"{channel}_gain").value),
+                tau_sec=float(self.get_parameter(f"{channel}_tau_sec").value),
+                delay_sec=float(self.get_parameter(f"{channel}_delay_sec").value),
+                now_sec=start_sec,
+            )
+            for channel in ("vx", "vy", "yaw_rate")
+        ]
+        self.sensor = SensorDelay(float(self.get_parameter("sensor_delay_sec").value))
+        self.sensor.update(start_sec, self.actual_state())
         self.update_timer = self.create_timer(1.0 / update_rate_hz, self.update)
         self.mode_timer = self.create_timer(1.0 / mode_state_rate_hz, self.publish_mode_state)
         self.publish_mode_state()
@@ -103,6 +122,16 @@ class PlanarVelocitySimNode(Node):
         self.command_vx = float(message.linear.x)
         self.command_vy = float(message.linear.y)
         self.command_yaw_rate = float(message.angular.z)
+        if self.mode_model.transition_in_progress:
+            return
+        self.queue_reference(self.now_seconds())
+
+    def queue_reference(self, now_sec: float) -> None:
+        for response, reference in zip(
+            self.responses,
+            (self.command_vx, self.command_vy, self.command_yaw_rate),
+        ):
+            response.command(reference, now_sec)
 
     def mode_command_callback(self, message: UInt8) -> None:
         requested = int(message.data)
@@ -124,13 +153,28 @@ class PlanarVelocitySimNode(Node):
         if self.mode_model.feedback() == before:
             return
         if self.mode_model.transition_in_progress:
+            self.reset_response(self.now_seconds())
             self.command_vx = 0.0
             self.command_vy = 0.0
             self.command_yaw_rate = 0.0
             self.get_logger().info(
                 f"Mode transition started: {self.mode_model.current_mode} -> {requested}"
             )
+        else:
+            # Returning to the current mode cancels ALIGNING immediately.
+            self.queue_reference(self.now_seconds())
         self.publish_mode_state()
+
+    def actual_state(self) -> tuple[float, ...]:
+        return (
+            self.x, self.y, self.yaw,
+            self.applied_vx, self.applied_vy, self.applied_yaw_rate,
+        )
+
+    def reset_response(self, now_sec: float) -> None:
+        for response in self.responses:
+            response.reset(now_sec)
+        self.applied_vx = self.applied_vy = self.applied_yaw_rate = 0.0
 
     def now_seconds(self) -> float:
         return self.get_clock().now().nanoseconds * 1.0e-9
@@ -152,18 +196,26 @@ class PlanarVelocitySimNode(Node):
         if dt <= 0.0:
             return
 
-        completed = self.mode_model.update(now.nanoseconds * 1.0e-9)
+        now_sec = now.nanoseconds * 1.0e-9
+        # Hold at zero for the whole interval ending at transition completion;
+        # ALIGNING references are held without accumulating delayed events.
+        was_aligning = self.mode_model.transition_in_progress
+        completed = self.mode_model.update(now_sec)
         if completed:
             self.get_logger().info(
                 f"Mode transition complete: current_mode={self.mode_model.current_mode}"
             )
             self.publish_mode_state()
 
-        self.applied_vx, self.applied_vy, self.applied_yaw_rate = (
-            self.mode_model.applied_velocity(
-                self.command_vx, self.command_vy, self.command_yaw_rate
+        if was_aligning:
+            self.reset_response(now_sec)
+            if completed:
+                # Resume the latest reference with fresh dead time after READY.
+                self.queue_reference(now_sec)
+        else:
+            self.applied_vx, self.applied_vy, self.applied_yaw_rate = (
+                response.update(now_sec) for response in self.responses
             )
-        )
         self.x, self.y, self.yaw = integrate_body_velocity(
             self.x,
             self.y,
@@ -174,17 +226,24 @@ class PlanarVelocitySimNode(Node):
             dt,
         )
 
+        measurement = self.sensor.update(now_sec, self.actual_state())
+        if measurement is None:
+            return
+        measured_sec, (x, y, yaw, vx, vy, yaw_rate) = measurement
         odom = Odometry()
-        odom.header.stamp = now.to_msg()
+        # Acquisition time, not delivery time: consumers can see sensor age.
+        odom.header.stamp = Time(
+            nanoseconds=round(measured_sec * 1.0e9), clock_type=now.clock_type
+        ).to_msg()
         odom.header.frame_id = self.odom_frame
         odom.child_frame_id = self.base_frame
-        odom.pose.pose.position.x = self.x
-        odom.pose.pose.position.y = self.y
-        odom.pose.pose.orientation.z = math.sin(0.5 * self.yaw)
-        odom.pose.pose.orientation.w = math.cos(0.5 * self.yaw)
-        odom.twist.twist.linear.x = self.applied_vx
-        odom.twist.twist.linear.y = self.applied_vy
-        odom.twist.twist.angular.z = self.applied_yaw_rate
+        odom.pose.pose.position.x = x
+        odom.pose.pose.position.y = y
+        odom.pose.pose.orientation.z = math.sin(0.5 * yaw)
+        odom.pose.pose.orientation.w = math.cos(0.5 * yaw)
+        odom.twist.twist.linear.x = vx
+        odom.twist.twist.linear.y = vy
+        odom.twist.twist.angular.z = yaw_rate
         self.odom_pub.publish(odom)
 
 
