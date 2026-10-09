@@ -1,4 +1,4 @@
-"""종료 후 추종 오차와 상태/입력을 두 Matplotlib 창으로 표시한다."""
+"""종료 후 추종 오차와 상태/입력을 세 Matplotlib 창으로 표시한다."""
 from __future__ import annotations
 
 import csv
@@ -77,7 +77,30 @@ def create_figures(data, predicted=True):
             ax.grid(True, alpha=0.3)
     for ax in axes[-1]:
         ax.set_xlabel("Elapsed time [s]")
-    return errors, states
+    # Direct differences in the shared world/odom frame, including standstill.
+    # Display only: controller feedback remains in its original body frame.
+    yaw_difference = data[:, 6] - data[:, 3]
+    world_errors = (
+        data[:, 4] - data[:, 1],
+        data[:, 5] - data[:, 2],
+        np.arctan2(np.sin(yaw_difference), np.cos(yaw_difference)),
+    )
+    world_frame, axes = plt.subplots(3, 1, sharex=True, figsize=(11, 8), layout="constrained")
+    world_frame.canvas.manager.set_window_title("World-frame tracking errors")
+    world_frame.suptitle("World-frame errors (reference minus predicted pose)" if predicted
+                            else "World-frame errors (reference minus measured pose)")
+    for ax, values, label, scale in zip(
+        axes, world_errors, ("x_ref - x_predicted [m]" if predicted else "x_ref - x_measured [m]",
+                             "y_ref - y_predicted [m]" if predicted else "y_ref - y_measured [m]",
+                             "yaw error [deg]"),
+        (1, 1, 180 / math.pi),
+    ):
+        ax.plot(time, values * scale)
+        ax.axhline(0, color="black", linewidth=0.6)
+        ax.set_ylabel(label)
+        ax.grid(True, alpha=0.3)
+    axes[-1].set_xlabel("Elapsed time [s]")
+    return errors, states, world_frame
 
 
 def show_recording(path):
@@ -90,7 +113,7 @@ def show_recording(path):
     with path.open() as file:
         predicted = "predicted_x" in next(csv.reader(file))
     figures = create_figures(np.loadtxt(path, delimiter=",", skiprows=1), predicted=predicted)
-    for figure, name in zip(figures, ("tracking_errors.png", "tracking_states_inputs.png")):
+    for figure, name in zip(figures, ("tracking_errors.png", "tracking_states_inputs.png", "tracking_world_errors.png")):
         figure.savefig(path.parent / name, dpi=140)
     if interactive:
         plt.show()
