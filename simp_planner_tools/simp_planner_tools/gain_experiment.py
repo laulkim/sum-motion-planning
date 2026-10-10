@@ -40,8 +40,14 @@ def provenance():
     modules = (sim, response, scenario_definition, scenario_manager_node, tracking_shutdown_plot, gain_evaluation, gain_lut)
     sources = {module.__name__: hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest() for module in modules}
     sources["experiment_runner"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-    launch = Path(get_package_share_directory("simp_planner_tools")) / "launch/simulation.launch.py"
+    share = Path(get_package_share_directory("simp_planner_tools"))
+    launch = share / "launch/simulation.launch.py"
     sources["simulation_launch"] = hashlib.sha256(launch.read_bytes()).hexdigest()
+    for prefix, directory, pattern in (("sim", Path(sim.__file__).parent, "*.py"),
+                                       ("tools", Path(__file__).parent, "*.py"),
+                                       ("maps", share / "maps", "*.csv")):
+        for path in sorted(directory.rglob(pattern)):
+            sources[prefix + "/" + str(path.relative_to(directory))] = hashlib.sha256(path.read_bytes()).hexdigest()
     result = subprocess.run(["git", "rev-parse", "HEAD"], text=True, capture_output=True)
     return {"commit": result.stdout.strip(), "binaries": binaries, "sources": sources,
             "common_signature": digest({"planner": binaries["simp_planner_cpp"], "sources": sources})}
