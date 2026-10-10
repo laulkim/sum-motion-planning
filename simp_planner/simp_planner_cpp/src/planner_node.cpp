@@ -1071,10 +1071,12 @@ class PlannerNodeCpp final : public rclcpp::Node {
     return {CycleAction::Plan, *current, ExecutionState::ActivePlan, "", {}};
   }
 
-  // Plans from `start` at t0. On anything but a usable plan, rewrites
-  // `decision` to what the cycle should send instead and returns nullptr.
+  // Plans from `start` at t0; `previous` is the point commanded just before
+  // it. On anything but a usable plan, rewrites `decision` to what the cycle
+  // should send instead and returns nullptr.
   std::shared_ptr<ExecutablePlan> plan_cycle(const InputSnapshot& input,
                                              const TrackingPoint& start,
+                                             const TrackingPoint& previous,
                                              std::int64_t t0,
                                              CycleDecision& decision) {
     const auto keep = [&decision](std::string status) {
@@ -1089,7 +1091,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       const auto handover_start = std::chrono::steady_clock::now();
       const auto handover = standstill
           ? standstill_handover(start, input.drive_mode)
-          : handover_from_point(start);
+          : handover_from_point(start, previous);
       const double handover_prediction_ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - handover_start).count();
 
@@ -1332,11 +1334,13 @@ class PlannerNodeCpp final : public rclcpp::Node {
       return;
     }
     const TrackingPoint start = committed ? committed->at(t0) : seed_point(*input);
+    // The interval ending at t0, whose rates the new plan's first step continues.
+    const TrackingPoint previous = committed ? committed->at(t0 - committed->period_ns) : start;
     {
       // Odometry only seeds the very first point. From then on the planner's
       // state is the committed trajectory at the next handover time.
       std::lock_guard<std::mutex> lock(input_mutex_);
-      current_state_ = handover_from_point(start).state;
+      current_state_ = handover_from_point(start, previous).state;
       current_body_yaw_ = start.body_yaw;
       current_state_time_ns_ = t0;
     }
@@ -1357,7 +1361,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       // The turn just finished, or a callback ran, while deciding.
       input = snapshot();
       if (!input) return;
-      plan = plan_cycle(*input, start, t0, decision);
+      plan = plan_cycle(*input, start, previous, t0, decision);
     }
     if (decision.action == CycleAction::Continue && !committed) {
       publish_status(decision.status, 0.0, -1);

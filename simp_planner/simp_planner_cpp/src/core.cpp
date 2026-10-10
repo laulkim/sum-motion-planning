@@ -2090,6 +2090,13 @@ TimeTrajectory generate_open_loop_trajectory(
   trajectory.speed_reference.assign(static_cast<std::size_t>(N + 1),
                                     std::numeric_limits<double>::quiet_NaN());
   trajectory.states.front() = initial_state;
+  // The motion follows the path from its first point, so its heading rate
+  // there is v times the path's curvature, as at every later state. The path's
+  // front curvature can differ from the handover's (start blending, or a
+  // latched profile keeping its own), and the allocator and the runtime command
+  // must both see this same value.
+  trajectory.states.front().motion_heading_rate =
+      std::max(initial_state.speed, 0.0) * path_sample_at(path, 0.0).kappa;
   TerminalFeedbackController terminal_controller(cfg);
   g_planning_block_timings.trajectory_initial_state_target_ms +=
       std::chrono::duration<double, std::milli>(

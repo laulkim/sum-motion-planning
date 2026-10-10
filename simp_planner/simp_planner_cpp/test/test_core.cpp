@@ -201,6 +201,32 @@ void test_arc_length_path_values_are_consistent() {
   require(max_kappa > 1.0e-3, "arc-length test path has no curvature to check");
 }
 
+// At low speed the path's front curvature blends the measured curvature with
+// the reference, so it differs from the handover's heading rate / speed. The
+// allocator trajectory must still carry heading rate = v * path curvature at
+// every state, including the first: the runtime command uses v * kappa, and a
+// different first value turns the gap into a yaw-rate zigzag at every replan.
+void test_first_heading_rate_follows_path_curvature() {
+  simp_planner::EnvConfig config;
+  config.longitudinal.dt = 0.01;
+  config.longitudinal.execution_dt = 0.01;
+  config.longitudinal.horizon = 2.0;
+  simp_planner::PathVelocityPlanner planner(config, straight_path(), empty_costmap());
+  simp_planner::PlannerState state;
+  state.y = 1.0;
+  state.speed = 0.3;
+  state.motion_heading_rate = 0.03;
+  const auto result = planner.plan(state, {}, {2.0, simp_planner::DriveMode::Forward});
+  require(result.selected_path.has_value(), "heading-rate test has no selected path");
+  const auto& motion = result.motion;
+  require(std::abs(motion.kappa.front() - state.motion_heading_rate / state.speed) > 1.0e-3,
+          "heading-rate test path starts at the measured curvature; nothing to check");
+  for (std::size_t i = 0; i < motion.t.size(); ++i) {
+    require(std::abs(motion.motion_heading_rate[i] - motion.speed[i] * motion.kappa[i]) <= 1.0e-9,
+            "allocator heading rate is not speed times path curvature");
+  }
+}
+
 void test_stationary_hold() {
   simp_planner::EnvConfig config;
   simp_planner::PathVelocityPlanner planner(config, straight_path(), empty_costmap());
@@ -237,6 +263,86 @@ void test_runtime_execution_and_handover() {
           "handover speed mismatch");
   require(simp_planner::align_time_ns(151000001, 0.01) == 160000000,
           "time alignment mismatch");
+}
+
+// Replanning the same motion from a handover point must continue the
+// allocation unchanged. If the handover passes the rates of the interval that
+// starts there, the new plan recomputes that interval and resets the yaw
+// acceleration toward zero, which shows up as a yaw jerk spike.
+void test_handover_replan_continues_allocation() {
+  constexpr int count = 401;
+  constexpr double dt = 0.01;
+  constexpr double speed = 3.0;
+  simp_planner::PlannerMotionTrajectory trajectory;
+  std::vector<simp_planner::PlannerAction> actions;
+  double chi = 0.0;
+  for (int i = 0; i < count; ++i) {
+    const double t = static_cast<double>(i) * dt;
+    const double heading_rate = 0.4 * std::sin(2.0 * t);
+    const double heading_acceleration = 0.8 * std::cos(2.0 * t);
+    trajectory.t.push_back(t);
+    trajectory.x.push_back(0.0);
+    trajectory.y.push_back(0.0);
+    trajectory.chi.push_back(chi);
+    trajectory.kappa.push_back(heading_rate / speed);
+    trajectory.kappa_s.push_back(0.0);
+    trajectory.speed.push_back(speed);
+    trajectory.acceleration.push_back(0.0);
+    trajectory.longitudinal_jerk.push_back(0.0);
+    trajectory.motion_heading_rate.push_back(heading_rate);
+    trajectory.motion_heading_acceleration.push_back(heading_acceleration);
+    trajectory.drive_mode.push_back(simp_planner::DriveMode::Forward);
+    actions.push_back({0.0, heading_acceleration});
+    chi += heading_rate * dt;
+  }
+  const auto original = simp_planner::allocate_trajectory(trajectory);
+
+  // Hand over where the yaw acceleration is too large for the jerk limit to
+  // reset in one step, so a wrong handover cannot pass by accident.
+  std::size_t handover = 50;
+  for (std::size_t i = 50; i < 250; ++i) {
+    if (std::abs(original.yaw_acceleration[i]) > std::abs(original.yaw_acceleration[handover]))
+      handover = i;
+  }
+  require(std::abs(original.yaw_acceleration[handover]) > 0.1,
+          "handover test motion has too little yaw acceleration");
+
+  const auto point_at = [&](std::size_t i) {
+    simp_planner::TrackingPoint point;
+    point.command = simp_planner::sample_body_command(original, actions, trajectory.t[i], dt);
+    return point;
+  };
+  const auto handover_state =
+      simp_planner::handover_from_point(point_at(handover), point_at(handover - 1));
+  require(handover_state.allocator_state.has_value(), "handover allocator state missing");
+
+  simp_planner::PlannerMotionTrajectory remaining;
+  const auto tail = [handover](const auto& values) {
+    return std::decay_t<decltype(values)>(values.begin() + static_cast<std::ptrdiff_t>(handover),
+                                          values.end());
+  };
+  for (std::size_t i = handover; i < trajectory.t.size(); ++i)
+    remaining.t.push_back(trajectory.t[i] - trajectory.t[handover]);
+  remaining.x = tail(trajectory.x);
+  remaining.y = tail(trajectory.y);
+  remaining.chi = tail(trajectory.chi);
+  remaining.kappa = tail(trajectory.kappa);
+  remaining.kappa_s = tail(trajectory.kappa_s);
+  remaining.speed = tail(trajectory.speed);
+  remaining.acceleration = tail(trajectory.acceleration);
+  remaining.longitudinal_jerk = tail(trajectory.longitudinal_jerk);
+  remaining.motion_heading_rate = tail(trajectory.motion_heading_rate);
+  remaining.motion_heading_acceleration = tail(trajectory.motion_heading_acceleration);
+  remaining.drive_mode = tail(trajectory.drive_mode);
+
+  const auto replanned = simp_planner::allocate_trajectory(
+      remaining, simp_planner::AllocationLimits{}, handover_state.allocator_state);
+  for (std::size_t j = 0; j + 1 < remaining.t.size(); ++j) {
+    require(std::abs(replanned.yaw_rate[j] - original.yaw_rate[handover + j]) < 1.0e-9,
+            "replan from the handover point does not continue the yaw rate");
+    require(std::abs(replanned.beta[j] - original.beta[handover + j]) < 1.0e-9,
+            "replan from the handover point does not continue beta");
+  }
 }
 
 
@@ -873,8 +979,10 @@ int main() {
     test_rotated_costmap_registration();
     test_nominal_planning_and_allocation();
     test_arc_length_path_values_are_consistent();
+    test_first_heading_rate_follows_path_curvature();
     test_stationary_hold();
     test_runtime_execution_and_handover();
+    test_handover_replan_continues_allocation();
     test_lateral_priority_allocation();
     test_drive_mode_feedback_supervisor();
     test_terminal_monotonic_braking_with_positive_jerk();

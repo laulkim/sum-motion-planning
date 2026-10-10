@@ -562,8 +562,10 @@ BodyCommand hold_command(const BodyCommand& previous, DriveMode previous_mode,
   return hold;
 }
 
-PredictedHandoverState handover_from_point(const TrackingPoint& point) {
+PredictedHandoverState handover_from_point(const TrackingPoint& point,
+                                           const TrackingPoint& previous) {
   const auto& command = point.command;
+  const auto& rates = previous.command;
   PlannerState state;
   state.x = point.x;
   state.y = point.y;
@@ -572,8 +574,8 @@ PredictedHandoverState handover_from_point(const TrackingPoint& point) {
   state.acceleration = command.planned_acceleration;
   state.motion_heading_rate = command.motion_heading_rate;
   PlannerAction last_action{command.planned_jerk, command.planned_heading_acceleration};
-  AllocatorInitialState allocator_state{command.beta, command.beta_rate,
-                                         command.yaw_rate, command.yaw_acceleration};
+  AllocatorInitialState allocator_state{command.beta, rates.beta_rate,
+                                         rates.yaw_rate, rates.yaw_acceleration};
   return {state, point.body_yaw, last_action, allocator_state, command};
 }
 
