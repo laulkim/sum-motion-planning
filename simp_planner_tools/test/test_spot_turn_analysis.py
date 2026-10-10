@@ -108,8 +108,15 @@ def test_turn_panels_display_raw_center_path():
             plt.close(figure)
 
 
-def test_viewer_saves_existing_plots_summary_and_turn_panel(tmp_path, monkeypatch):
+@pytest.mark.parametrize("interactive", [False, True])
+def test_viewer_saves_analysis_but_shows_only_three_tracking_figures(tmp_path, monkeypatch, interactive):
     monkeypatch.delenv("DISPLAY", raising=False)
+    if interactive:
+        monkeypatch.setenv("DISPLAY", ":test")
+        monkeypatch.setattr(matplotlib, "use", lambda backend: None)  # Keep Agg while testing the GUI path.
+    shown = []
+    monkeypatch.setattr(plt, "show", lambda: shown.append(
+        [len(plt.figure(number).axes) for number in plt.get_fignums()]))
     data, odom, modes = recording()
     for name, array, columns in (
         ("tracking.csv", data, COLUMNS),
@@ -124,4 +131,5 @@ def test_viewer_saves_existing_plots_summary_and_turn_panel(tmp_path, monkeypatc
     for name in ("tracking_errors.png", "tracking_states_inputs.png", "tracking_world_errors.png",
                  "spot_turn_summary.png", "spot_turn_01.png", "spot_turn_summary.csv"):
         assert (tmp_path / name).stat().st_size > 0
+    assert shown == ([[3, 6, 3]] if interactive else [])
     assert not plt.get_fignums()

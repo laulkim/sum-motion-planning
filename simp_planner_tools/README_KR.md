@@ -1,8 +1,9 @@
 # Ctrl+C 후 추종 그래프
 
 `simulation.launch.py`는 `tracking_shutdown_plot` 기록 노드도 실행합니다.
-시뮬레이션을 실행한 뒤 Ctrl+C를 누르면 기존 추종 그래프 3개와 spot-turn 요약창,
-회전 구간별 확대창을 표시합니다. 기록과 PNG도 함께 저장합니다.
+시뮬레이션을 실행한 뒤 Ctrl+C를 누르면 추종 오차, 상태·제어 입력, 월드프레임 오차의
+세 창만 표시합니다. 원본 CSV 기록과 spot-turn 요약·회전별 분석 CSV/PNG는 계속 저장하므로
+나중에 실제 odometry 기반 footprint overlay를 만들 수 있습니다. 추가 분석창은 표시하지 않습니다.
 
 ```bash
 cd ~/ros2_ws
@@ -31,14 +32,14 @@ ros2 launch simp_planner_tools simulation.launch.py \
 | `spot_turn_01.png` 등 | 회전별 4×2개 확대 패널 |
 | `viewer.log` | 종료 후 뷰어의 출력과 오류 |
 
-## Spot-turn 분석 화면과 지표
+## Spot-turn 분석 파일과 지표
 
 선택된 Planner reference가 정확히 `vx=0, vy=0, yaw_rate!=0`인 유효 제어 구간을 찾습니다.
 mode 기록이 있으면 제어 시각 이하의 timestamp를 가진 최신 상태가 SPOT_TURN/READY인 구간만 분석합니다.
 움직이면서 회전하는 일반 곡선과 yaw-rate가 zero인 hold는 제외합니다.
-각 구간의 시작을 시간 zero로 맞춰 두 브랜치의 창과 수치를 비교할 수 있습니다.
+각 구간의 시작을 시간 zero로 맞춰 두 브랜치의 분석 파일과 수치를 비교할 수 있습니다.
 
-회전별 확대창은 다음 순서의 4×2 패널입니다.
+저장되는 회전별 확대 PNG는 다음 순서의 4×2 패널입니다.
 
 | 왼쪽 | 오른쪽 |
 | --- | --- |
@@ -47,7 +48,7 @@ mode 기록이 있으면 제어 시각 이하의 timestamp를 가진 최신 상�
 | 첫 odom 표본 대비 XY 중심 이동 | 중심 거리와 누적 이동 거리 |
 | 회전 후 위치 오차 norm | 회전 후 reference/command/측정 병진 속도 norm |
 
-요약창의 command integral은 `∫hypot(vx_cmd,vy_cmd) dt`이며,
+요약 PNG의 command integral은 `∫hypot(vx_cmd,vy_cmd) dt`이며,
 명령이 다음 제어 시각까지 유지된다는 zero-order hold로 계산합니다.
 중심 이동은 predicted pose로 추정하지 않고 raw odom의 **취득 timestamp**로 구간을 맞춥니다.
 최대 중심 변위와 최종 변위를 함께 표시하고, odom 위치 표본 사이 이동 거리를 누적합니다.
@@ -60,7 +61,7 @@ mode 기록이 있으면 제어 시각 이하의 timestamp를 가진 최신 상�
 회전 후 분석은 최대 3초이며 다음 회전이 시작되면 잘라냅니다.
 ALIGNING과 다음 정상 주행이 포함될 수 있으므로 command peak를 settling time이나 overshoot로
 자동 판정하지 않습니다. reference speed를 함께 보면서 보정 출력과 정상 주행을 구분합니다.
-창과 CSV에서 위치 오차는 계속 reference − predicted 기준이고 측정 중심 이동과 별개입니다.
+분석 PNG와 CSV에서 위치 오차는 계속 reference − predicted 기준이고 측정 중심 이동과 별개입니다.
 추가 지표는 yaw 최대 오차/RMSE, 회전 중 vx/vy command peak/RMS,
 회전 후 position RMSE와 병진 command peak입니다.
 
