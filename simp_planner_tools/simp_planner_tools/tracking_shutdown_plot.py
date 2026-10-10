@@ -193,6 +193,10 @@ def main(args=None):
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
+    except RuntimeError:
+        # SIGINT can invalidate the context while the executor builds its wait set.
+        if rclpy.ok():
+            raise
     finally:
         # 터미널과 launch가 SIGINT를 연달아 보내도 저장/창 실행은 끝낸다.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
