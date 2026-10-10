@@ -416,6 +416,8 @@ def compare(fixed, lut, output):
         import matplotlib.pyplot as plt
         figure, axes = plt.subplots(3, 1, sharex=True, figsize=(10, 7), layout="constrained")
         for result, label in ((left, "Fixed"), (other, "LUT")):
+            if not result.get("tracking_csv"):
+                continue  # Failed case still appears in the CSV/JSON report.
             rows = read_tracking(result["tracking_csv"])
             turns, turn = [], []
             for row in rows:
