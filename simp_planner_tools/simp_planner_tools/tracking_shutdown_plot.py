@@ -141,9 +141,12 @@ def main(args=None):
     from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
     from nav_msgs.msg import Odometry
     from simp_planner_msgs.msg import DriveModeState, TrackingControl
+    from std_msgs.msg import String
+    import json
 
     rclpy.init(args=args)
     node = Node("tracking_shutdown_plot")
+    show_plots = node.declare_parameter("show_plots", True).value
     directory = Path(node.declare_parameter("output_dir", "simp_planner_debug").value).expanduser()
     directory = directory / ("tracking_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
     directory.mkdir(parents=True, exist_ok=True)
@@ -162,13 +165,29 @@ def main(args=None):
     mode_writer = recording("drive_mode.csv", ("stamp_ns", "current_mode", "requested_mode", "status"))
     origin_ns = None
     count = 0
+    last_flush_s = -1.0
 
     def receive_control(message):
-        nonlocal origin_ns, count
+        nonlocal origin_ns, count, last_flush_s
         if origin_ns is None:
             origin_ns = stamp_ns(message.header.stamp)
         writer.writerow(sample_row(message, origin_ns))
         count += 1
+        elapsed = (stamp_ns(message.header.stamp) - origin_ns) * 1e-9
+        if elapsed - last_flush_s >= 0.5:
+            for file in files:
+                file.flush()
+            progress = directory / "progress.json"
+            temporary = progress.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"elapsed_s": elapsed, "samples": count}))
+            temporary.replace(progress)
+            last_flush_s = elapsed
+
+    def receive_status(message, name):
+        destination = directory / name
+        temporary = destination.with_suffix(".tmp")
+        temporary.write_text(message.data)
+        temporary.replace(destination)
 
     def receive_odometry(message):
         p, q, v = message.pose.pose.position, message.pose.pose.orientation, message.twist.twist
@@ -188,6 +207,11 @@ def main(args=None):
     node.create_subscription(Odometry, "/odom", receive_odometry, qos_profile_sensor_data)
     node.create_subscription(DriveModeState, "/vehicle/drive_mode_state", receive_mode,
                              QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+    status_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+    node.create_subscription(String, "/scenario/status",
+                             lambda m: receive_status(m, "scenario_status.json"), status_qos)
+    node.create_subscription(String, "/planner/status",
+                             lambda m: receive_status(m, "planner_status.json"), status_qos)
     node.get_logger().info(f"Ctrl+C 후 추종 플롯 3개 표시 / 기록·spot-turn 분석 저장: {directory}")
     try:
         rclpy.spin(node)
@@ -205,7 +229,7 @@ def main(args=None):
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
-        if count:
+        if count and show_plots:
             # launch의 종료 신호와 분리해 사용자가 창을 닫을 때까지 유지한다.
             with (directory / "viewer.log").open("w") as log:
                 subprocess.Popen(

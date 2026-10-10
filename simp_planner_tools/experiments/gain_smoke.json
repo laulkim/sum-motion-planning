@@ -1,0 +1,88 @@
+{
+  "settings": {
+    "sensor_delay_sec": 0.0,
+    "sensor_noise_enabled": true,
+    "sensor_noise_scale": 1.0,
+    "costmap_resolution": 0.1,
+    "command_frequency_hz": 100.0,
+    "mode_transition_duration_sec": 2.0
+  },
+  "objective": {
+    "scales": {
+      "ex_m": 0.05,
+      "ey_m": 0.05,
+      "etheta_rad": 0.017453292519943295,
+      "delta_vx_mps": 0.1,
+      "delta_vy_mps": 0.1,
+      "delta_yaw_rate_radps": 0.05
+    },
+    "weights": {
+      "position": 1.0,
+      "yaw": 1.0,
+      "control": 0.1
+    },
+    "failure_penalty": 1000000.0,
+    "minimum_samples": 20,
+    "minimum_valid_fraction": 0.95
+  },
+  "optimizer": {
+    "bounds": {
+      "kx": [
+        0.8,
+        1.2
+      ],
+      "ky": [
+        2.0,
+        2.0
+      ],
+      "ktheta": [
+        1.0,
+        1.0
+      ]
+    },
+    "initial_gains": [
+      1.0,
+      2.0,
+      1.0
+    ],
+    "random_seed": 42,
+    "maxiter": 0,
+    "popsize": 2,
+    "tol": 0.01,
+    "max_sweeps": 1,
+    "sweep_tolerance": 0.001,
+    "smoothness_lambda": 0.0,
+    "block_de": {
+      "maxiter": 0,
+      "popsize": 2,
+      "tol": 0.01
+    }
+  },
+  "recorder": {
+    "quantiles": [
+      0.0,
+      0.01,
+      0.05,
+      0.25,
+      0.5,
+      0.75,
+      0.95,
+      0.99,
+      1.0
+    ],
+    "histogram_bins": 30
+  },
+  "cases": [
+    {
+      "id": "straight_smoke",
+      "scenario": "straight_long",
+      "target_speed": 1.0,
+      "sensor_noise_seed": 42,
+      "role": "tuning",
+      "weight": 1.0,
+      "end_condition": "duration",
+      "duration_sec": 3.0,
+      "timeout_sec": 30.0
+    }
+  ]
+}

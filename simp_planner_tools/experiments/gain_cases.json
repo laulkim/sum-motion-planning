@@ -1,0 +1,336 @@
+{
+  "settings": {
+    "sensor_delay_sec": 0.0,
+    "sensor_noise_enabled": true,
+    "sensor_noise_scale": 1.0,
+    "costmap_resolution": 0.1,
+    "command_frequency_hz": 100.0,
+    "mode_transition_duration_sec": 2.0
+  },
+  "objective": {
+    "scales": {
+      "ex_m": 0.05,
+      "ey_m": 0.05,
+      "etheta_rad": 0.017453292519943295,
+      "delta_vx_mps": 0.1,
+      "delta_vy_mps": 0.1,
+      "delta_yaw_rate_radps": 0.05
+    },
+    "weights": {
+      "position": 1.0,
+      "yaw": 1.0,
+      "control": 0.1
+    },
+    "failure_penalty": 1000000.0,
+    "minimum_samples": 20,
+    "minimum_valid_fraction": 0.95
+  },
+  "optimizer": {
+    "bounds": {
+      "kx": [
+        0.05,
+        5.0
+      ],
+      "ky": [
+        0.05,
+        5.0
+      ],
+      "ktheta": [
+        0.05,
+        5.0
+      ]
+    },
+    "initial_gains": [
+      1.0,
+      2.0,
+      1.0
+    ],
+    "random_seed": 42,
+    "maxiter": 10,
+    "popsize": 5,
+    "tol": 0.01,
+    "max_sweeps": 2,
+    "sweep_tolerance": 0.001,
+    "smoothness_lambda": 0.0,
+    "block_de": {
+      "maxiter": 2,
+      "popsize": 3,
+      "tol": 0.01
+    }
+  },
+  "recorder": {
+    "quantiles": [
+      0.0,
+      0.01,
+      0.05,
+      0.25,
+      0.5,
+      0.75,
+      0.95,
+      0.99,
+      1.0
+    ],
+    "histogram_bins": 30
+  },
+  "cases": [
+    {
+      "id": "straight_long_1_s42",
+      "scenario": "straight_long",
+      "target_speed": 1.0,
+      "sensor_noise_seed": 42,
+      "role": "tuning",
+      "weight": 1.0,
+      "end_condition": "duration",
+      "timeout_sec": 120,
+      "duration_sec": 90
+    },
+    {
+      "id": "straight_long_3_s42",
+      "scenario": "straight_long",
+      "target_speed": 3.0,
+      "sensor_noise_seed": 42,
+      "role": "tuning",
+      "weight": 1.0,
+      "end_condition": "duration",
+      "timeout_sec": 120,
+      "duration_sec": 90
+    },
+    {
+      "id": "straight_long_5_s42",
+      "scenario": "straight_long",
+      "target_speed": 5.0,
+      "sensor_noise_seed": 42,
+      "role": "tuning",
+      "weight": 1.0,
+      "end_condition": "duration",
+      "timeout_sec": 120,
+      "duration_sec": 90
+    },
+    {
+      "id": "s_curve_1_s42",
+      "scenario": "s_curve",
+      "target_speed": 1.0,
+      "sensor_noise_seed": 42,
+      "role": "tuning",
+      "weight": 1.0,
+      "end_condition": "complete",
+      "timeout_sec": 600
+    },
+    {
+      "id": "s_curve_3_s42",
+      "scenario": "s_curve",
+      "target_speed": 3.0,
+      "sensor_noise_seed": 42,
+      "role": "tuning",
+      "weight": 1.0,
+      "end_condition": "complete",
+      "timeout_sec": 600
+    },
+    {
+      "id": "s_curve_5_s42",
+      "scenario": "s_curve",
+      "target_speed": 5.0,
+      "sensor_noise_seed": 42,
+      "role": "tuning",
+      "weight": 1.0,
+      "end_condition": "complete",
+      "timeout_sec": 600
+    },
+    {
+      "id": "crab_switch_1_s42",
+      "scenario": "crab_switch",
+      "target_speed": 1.0,
+      "sensor_noise_seed": 42,
+      "role": "tuning",
+      "weight": 1.0,
+      "end_condition": "complete",
+      "timeout_sec": 600
+    },
+    {
+      "id": "reverse_switch_1_s42",
+      "scenario": "reverse_switch",
+      "target_speed": 1.0,
+      "sensor_noise_seed": 42,
+      "role": "tuning",
+      "weight": 1.0,
+      "end_condition": "complete",
+      "timeout_sec": 600
+    },
+    {
+      "id": "spot_turn_course_4p2_s42",
+      "scenario": "spot_turn_course",
+      "target_speed": 4.2,
+      "sensor_noise_seed": 42,
+      "role": "tuning",
+      "weight": 1.0,
+      "end_condition": "complete",
+      "timeout_sec": 600
+    },
+    {
+      "id": "parking_ramp_loop_1p2_s42",
+      "scenario": "parking_ramp_loop",
+      "target_speed": 1.2,
+      "sensor_noise_seed": 42,
+      "role": "tuning",
+      "weight": 1.0,
+      "end_condition": "complete",
+      "timeout_sec": 600
+    },
+    {
+      "id": "winding_obstacle_course_1_s42",
+      "scenario": "winding_obstacle_course",
+      "target_speed": 1.0,
+      "sensor_noise_seed": 42,
+      "role": "tuning",
+      "weight": 1.0,
+      "end_condition": "complete",
+      "timeout_sec": 600
+    },
+    {
+      "id": "winding_obstacle_course_3_s42",
+      "scenario": "winding_obstacle_course",
+      "target_speed": 3.0,
+      "sensor_noise_seed": 42,
+      "role": "tuning",
+      "weight": 1.0,
+      "end_condition": "complete",
+      "timeout_sec": 600
+    },
+    {
+      "id": "winding_obstacle_course_5_s42",
+      "scenario": "winding_obstacle_course",
+      "target_speed": 5.0,
+      "sensor_noise_seed": 42,
+      "role": "tuning",
+      "weight": 1.0,
+      "end_condition": "complete",
+      "timeout_sec": 600
+    },
+    {
+      "id": "stadium_3_s42",
+      "scenario": "stadium",
+      "target_speed": 3.0,
+      "sensor_noise_seed": 42,
+      "role": "validation",
+      "weight": 1.0,
+      "end_condition": "duration",
+      "timeout_sec": 210,
+      "duration_sec": 180
+    },
+    {
+      "id": "hdmap_crab1_switch_1p5_s42",
+      "scenario": "hdmap_crab1_switch",
+      "target_speed": 1.5,
+      "sensor_noise_seed": 42,
+      "role": "validation",
+      "weight": 1.0,
+      "end_condition": "complete",
+      "timeout_sec": 1200
+    },
+    {
+      "id": "fmtc_demo_1p5_s42",
+      "scenario": "fmtc_demo",
+      "target_speed": 1.5,
+      "sensor_noise_seed": 42,
+      "role": "validation",
+      "weight": 1.0,
+      "end_condition": "complete",
+      "timeout_sec": 1800
+    },
+    {
+      "id": "hdmap_lap_switch_1p5_s42",
+      "scenario": "hdmap_lap_switch",
+      "target_speed": 1.5,
+      "sensor_noise_seed": 42,
+      "role": "validation",
+      "weight": 1.0,
+      "end_condition": "complete",
+      "timeout_sec": 3600
+    },
+    {
+      "id": "s_curve_obstacles_1p2_s42",
+      "scenario": "s_curve_obstacles",
+      "target_speed": 1.2,
+      "sensor_noise_seed": 42,
+      "role": "validation",
+      "weight": 1.0,
+      "end_condition": "complete",
+      "timeout_sec": 600
+    },
+    {
+      "id": "curved_gate_maze_1p5_s42",
+      "scenario": "curved_gate_maze",
+      "target_speed": 1.5,
+      "sensor_noise_seed": 42,
+      "role": "validation",
+      "weight": 1.0,
+      "end_condition": "complete",
+      "timeout_sec": 600
+    },
+    {
+      "id": "warehouse_logistics_1p0_s42",
+      "scenario": "warehouse_logistics",
+      "target_speed": 1.0,
+      "sensor_noise_seed": 42,
+      "role": "validation",
+      "weight": 1.0,
+      "end_condition": "complete",
+      "timeout_sec": 3600
+    },
+    {
+      "id": "terminal_safe_region_1_s42",
+      "scenario": "terminal_safe_region",
+      "target_speed": 1.0,
+      "sensor_noise_seed": 42,
+      "role": "safety",
+      "weight": 1.0,
+      "end_condition": "complete",
+      "timeout_sec": 600,
+      "metric_limits": {
+        "max_abs_ex": 0.5,
+        "max_abs_ey": 0.5
+      }
+    },
+    {
+      "id": "narrow_22m_stop_corridor_1_s42",
+      "scenario": "narrow_22m_stop_corridor",
+      "target_speed": 1.0,
+      "sensor_noise_seed": 42,
+      "role": "safety",
+      "weight": 1.0,
+      "end_condition": "safe_stop",
+      "timeout_sec": 600,
+      "stop_hold_sec": 5.0,
+      "stop_speed_mps": 0.01,
+      "maximum_progress_m": 14.0
+    },
+    {
+      "id": "narrow_28m_corridor_1_s42",
+      "scenario": "narrow_28m_corridor",
+      "target_speed": 1.0,
+      "sensor_noise_seed": 42,
+      "role": "safety",
+      "weight": 1.0,
+      "end_condition": "complete",
+      "timeout_sec": 600,
+      "metric_limits": {
+        "max_abs_ex": 0.5,
+        "max_abs_ey": 0.5
+      }
+    },
+    {
+      "id": "narrow_offset_corridor_1_s42",
+      "scenario": "narrow_offset_corridor",
+      "target_speed": 1.0,
+      "sensor_noise_seed": 42,
+      "role": "safety",
+      "weight": 1.0,
+      "end_condition": "complete",
+      "timeout_sec": 600,
+      "metric_limits": {
+        "max_abs_ex": 0.5,
+        "max_abs_ey": 0.5
+      }
+    }
+  ]
+}

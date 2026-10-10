@@ -34,6 +34,14 @@ class TrackingControllerNode final : public rclcpp::Node {
     declare_parameter("ky", 2.0);
     declare_parameter("ktheta", 1.0);
     declare_parameter("base_frame", "base_link");
+    const auto lut_file = declare_parameter<std::string>("gain_lut_file", "");
+#ifdef SIMP_GAIN_LUT
+    if (!lut_file.empty()) gain_lut_ = GainLut::load_csv(lut_file);
+    RCLCPP_INFO(get_logger(), "gain_policy=lut file=%s", lut_file.c_str());
+#else
+    if (!lut_file.empty()) throw std::invalid_argument("fixed controller cannot load a LUT");
+    RCLCPP_INFO(get_logger(), "gain_policy=fixed");
+#endif
 
     auto static_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
     cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
@@ -90,7 +98,11 @@ class TrackingControllerNode final : public rclcpp::Node {
     const Gains gains{parameters[0].as_double(), parameters[1].as_double(),
                       parameters[2].as_double()};
     const auto output = control_cycle(snapshot, now_ns, period_ns_, gains,
-                                      parameters[3].as_string());
+                                      parameters[3].as_string()
+#ifdef SIMP_GAIN_LUT
+                                      , &gain_lut_
+#endif
+                                      );
     if (output.requested_mode) {
       std_msgs::msg::UInt8 mode;
       mode.data = *output.requested_mode;
@@ -125,6 +137,9 @@ class TrackingControllerNode final : public rclcpp::Node {
   }
 
   std::int64_t period_ns_{10000000};
+#ifdef SIMP_GAIN_LUT
+  GainLut gain_lut_;
+#endif
   std::mutex input_mutex_;
   Inputs latest_;
   rclcpp::Subscription<Trajectory>::SharedPtr trajectory_sub_;

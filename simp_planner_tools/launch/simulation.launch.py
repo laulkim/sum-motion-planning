@@ -23,6 +23,7 @@ def _resolved_nodes(context):
     target_speed = float(LaunchConfiguration("target_speed").perform(context))
     save_period = float(LaunchConfiguration("save_period").perform(context))
     debug_output_dir = LaunchConfiguration("debug_output_dir").perform(context)
+    experiment_mode = LaunchConfiguration("experiment_mode").perform(context).lower() == "true"
     path_update_distance = float(
         LaunchConfiguration("path_update_distance").perform(context)
     )
@@ -139,20 +140,24 @@ def _resolved_nodes(context):
             executable="tracking_controller_node",
             name="tracking_controller_node",
             output="screen",
-            parameters=[{"command_frequency_hz": command_frequency_hz}],
+            parameters=[{"command_frequency_hz": command_frequency_hz,
+                         **{name: float(LaunchConfiguration(name).perform(context))
+                            for name in ("kx", "ky", "ktheta")},
+                         "gain_lut_file": LaunchConfiguration("gain_lut_file").perform(context)}],
         ),
         Node(
             package="simp_planner_tools",
             executable="tracking_shutdown_plot",
             name="tracking_shutdown_plot",
             output="screen",
-            parameters=[{"output_dir": debug_output_dir}],
+            parameters=[{"output_dir": debug_output_dir, "show_plots": not experiment_mode}],
         ),
         Node(
             package="simp_planner_tools",
             executable="debug_plot_node",
             name="debug_plot_node",
             output="screen",
+            condition=IfCondition("false" if experiment_mode else "true"),
             parameters=[
                 {
                     "scenario": scenario_name,
@@ -224,6 +229,12 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
             DeclareLaunchArgument("scenario", default_value="stadium"),
+            DeclareLaunchArgument("experiment_mode", default_value="false",
+                                  description="Record CSV without shutdown viewers or periodic debug plots."),
+            DeclareLaunchArgument("kx", default_value="1.0"),
+            DeclareLaunchArgument("ky", default_value="2.0"),
+            DeclareLaunchArgument("ktheta", default_value="1.0"),
+            DeclareLaunchArgument("gain_lut_file", default_value=""),
             DeclareLaunchArgument(
                 "target_speed",
                 default_value="-1.0",
