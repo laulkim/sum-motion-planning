@@ -273,7 +273,7 @@ void test_hold_in_new_mode_uses_that_modes_slip_angle() {
   const auto& hold = trajectory.points.back();
   require(hold.mode == DriveMode::Left, "hold did not carry the requested mode");
   require(std::abs(hold.command.beta - 0.5 * kPi) < 1.0e-12, "hold kept the old mode's slip angle");
-  const auto handover = handover_from_point(hold);
+  const auto handover = handover_from_point(hold, hold);
   require(std::abs(wrap_angle(handover.state.chi - (0.5 + 0.5 * kPi))) < 1.0e-12,
           "handover motion direction does not follow the held mode");
 }

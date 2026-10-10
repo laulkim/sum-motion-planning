@@ -63,6 +63,7 @@ class ScenarioManagerNode(Node):
 
         self.declare_parameter("scenario", "stadium")
         self.declare_parameter("target_speed", -1.0)
+        self.declare_parameter("start_delay_sec", -1.0)   # 음수면 시나리오 기본값
         self.declare_parameter("frame_id", "odom")
         self.declare_parameter("path_back_length", 5.0)
         self.declare_parameter("path_ahead_length", 40.0)
@@ -123,6 +124,12 @@ class ScenarioManagerNode(Node):
 
         target_override = float(self.get_parameter("target_speed").value)
         self.target_override = None if target_override < 0.0 else target_override
+        start_delay_override = float(self.get_parameter("start_delay_sec").value)
+        self.start_delay = (float(self.scenario.start_delay) if start_delay_override < 0.0
+                            else start_delay_override)
+        # 첫 odom을 받은 시각 + start_delay. 그 전까지는 목표 속도 0으로 세워 둔다.
+        self.start_release_ns: Optional[int] = None
+        self.start_released = self.start_delay <= 0.0
         if self.path_back_length < 0.0 or self.path_ahead_length <= 0.0:
             raise ValueError("Invalid local reference lengths")
         if self.path_update_distance <= 0.0:
@@ -221,10 +228,30 @@ class ScenarioManagerNode(Node):
     def active_cruise_speed(self) -> float:
         if self.target_override is not None:
             return float(self.target_override)
-        return float(self.active_phase.cruise_speed)
+        s = 0.0 if self.last_projection is None else float(self.last_projection.s)
+        return self.active_phase.cruise_speed_at(s)
+
+    def start_hold_remaining(self) -> float:
+        """출발 대기 남은 시간(s). 첫 odom을 받기 전에는 대기 시간 전체."""
+        if self.start_released:
+            return 0.0
+        if self.start_release_ns is None:
+            return self.start_delay
+        return max(0.0, (self.start_release_ns - self.get_clock().now().nanoseconds) * 1.0e-9)
+
+    def update_start_hold(self) -> None:
+        if self.start_released:
+            return
+        if self.start_release_ns is None and self.received_odom:
+            self.start_release_ns = (self.get_clock().now().nanoseconds
+                                     + int(self.start_delay * 1.0e9))
+            self.get_logger().info(f"Holding still for {self.start_delay:.1f} s before starting")
+        if self.start_release_ns is not None and self.start_hold_remaining() <= 0.0:
+            self.start_released = True
+            self.get_logger().info(f"Start delay elapsed: starting phase '{self.active_phase.name}'")
 
     def current_target_speed(self) -> float:
-        if self.state == ScenarioState.COMPLETE:
+        if self.state == ScenarioState.COMPLETE or self.start_hold_remaining() > 0.0:
             return 0.0
         return self.active_cruise_speed()
 
@@ -246,6 +273,7 @@ class ScenarioManagerNode(Node):
             self.last_mode = mode
 
     def publish_heartbeat(self) -> None:
+        self.update_start_hold()
         speed_message = Float64()
         speed_message.data = self.current_target_speed()
         self.speed_pub.publish(speed_message)
@@ -483,6 +511,7 @@ class ScenarioManagerNode(Node):
             "phase_name": self.active_phase.name,
             "requested_drive_mode": self.current_mode(),
             "target_speed": self.current_target_speed(),
+            "start_hold_remaining_s": self.start_hold_remaining(),
             "measured_speed": self.current_measured_speed,
             "remaining_to_terminal": self.current_remaining,
             "signed_stop_error": self.current_stop_error,
@@ -541,6 +570,7 @@ class ScenarioManagerNode(Node):
         self.current_motion_yaw = float(projection.yaw)
         self.publish_active_reference(projection.s)
         self.update_scenario_state(projection, speed, x, y, body_yaw)
+        self.update_start_hold()
         self.publish_command()
 
 

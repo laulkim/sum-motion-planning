@@ -360,6 +360,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       chi = last_motion_chi_.value_or(body_yaw);
     }
     last_motion_chi_ = chi;
+    ReferencePathMsg::SharedPtr path_before_odom;
     {
       std::lock_guard<std::mutex> lock(input_mutex_);
       current_state_ = {msg->pose.pose.position.x, msg->pose.pose.position.y,
@@ -369,7 +370,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
       if (current_state_time_ns_ <= 0) current_state_time_ns_ = now_ns();
       odom_frame_ = msg->header.frame_id;
       received_odom_ = true;
+      path_before_odom = std::move(path_before_odom_);
     }
+    if (path_before_odom) path_callback(path_before_odom);
   }
 
   static bool same_reference_path(const ReferencePath& lhs,
@@ -590,6 +593,13 @@ class PlannerNodeCpp final : public rclcpp::Node {
         if (received_odom_ && !odom_frame_.empty() && frame != odom_frame_) {
           throw std::invalid_argument("reference path frame does not match odometry");
         }
+        if (!received_odom_) {
+          // 첫 odom 전에는 current_body_yaw_가 기본값(0)이라 아래 경계 제자리턴
+          // 판별이 틀린다 (예: 남쪽을 보고 출발하는 시나리오에서 가짜 제자리턴이
+          // 잡혀 reference_path_가 빈 채로 남는다). 첫 odom을 받은 뒤 다시 처리한다.
+          path_before_odom_ = msg;
+          return;
+        }
         if (maneuver_.state() != SpotTurnManeuverState::Inactive) {
           if (reference_mode != reference_mode_ || frame != path_frame_) deferred_reference_ = msg;
           return;
@@ -711,7 +721,8 @@ class PlannerNodeCpp final : public rclcpp::Node {
             capture_time_ns < last_capture_time_ns) {
           return;
         }
-        have_path_and_state = received_path_ && received_odom_;
+        // 시작 경계 제자리턴 대기 중에는 received_path_만 서고 reference_path_는 빈다.
+        have_path_and_state = received_path_ && received_odom_ && reference_path_;
         if (have_path_and_state) {
           path_for_crop = reference_path_;
           state_for_crop = current_state_;
@@ -1060,10 +1071,12 @@ class PlannerNodeCpp final : public rclcpp::Node {
     return {CycleAction::Plan, *current, ExecutionState::ActivePlan, "", {}};
   }
 
-  // Plans from `start` at t0. On anything but a usable plan, rewrites
-  // `decision` to what the cycle should send instead and returns nullptr.
+  // Plans from `start` at t0; `previous` is the point commanded just before
+  // it. On anything but a usable plan, rewrites `decision` to what the cycle
+  // should send instead and returns nullptr.
   std::shared_ptr<ExecutablePlan> plan_cycle(const InputSnapshot& input,
                                              const TrackingPoint& start,
+                                             const TrackingPoint& previous,
                                              std::int64_t t0,
                                              CycleDecision& decision) {
     const auto keep = [&decision](std::string status) {
@@ -1078,7 +1091,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       const auto handover_start = std::chrono::steady_clock::now();
       const auto handover = standstill
           ? standstill_handover(start, input.drive_mode)
-          : handover_from_point(start);
+          : handover_from_point(start, previous);
       const double handover_prediction_ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - handover_start).count();
 
@@ -1321,11 +1334,13 @@ class PlannerNodeCpp final : public rclcpp::Node {
       return;
     }
     const TrackingPoint start = committed ? committed->at(t0) : seed_point(*input);
+    // The interval ending at t0, whose rates the new plan's first step continues.
+    const TrackingPoint previous = committed ? committed->at(t0 - committed->period_ns) : start;
     {
       // Odometry only seeds the very first point. From then on the planner's
       // state is the committed trajectory at the next handover time.
       std::lock_guard<std::mutex> lock(input_mutex_);
-      current_state_ = handover_from_point(start).state;
+      current_state_ = handover_from_point(start, previous).state;
       current_body_yaw_ = start.body_yaw;
       current_state_time_ns_ = t0;
     }
@@ -1346,7 +1361,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       // The turn just finished, or a callback ran, while deciding.
       input = snapshot();
       if (!input) return;
-      plan = plan_cycle(*input, start, t0, decision);
+      plan = plan_cycle(*input, start, previous, t0, decision);
     }
     if (decision.action == CycleAction::Continue && !committed) {
       publish_status(decision.status, 0.0, -1);
@@ -1413,7 +1428,9 @@ class PlannerNodeCpp final : public rclcpp::Node {
       publish_trajectory(*plan);
       publish_plan_status(*plan, plan->compute_ms);
     } else {
-      publish_status(decision.status, 0.0, -1);
+      publish_status(decision.status, 0.0, -1,
+                     decision.action == CycleAction::Continue
+                         ? std::nullopt : std::optional<std::int64_t>(t0));
     }
     publish_execution_state_if_changed(
         execution_state_name(trajectory->at(now_ns()).execution));
@@ -1594,6 +1611,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
     stream << std::fixed << std::setprecision(6)
            << "{\"backend\":\"CPP_NATIVE\""
            << ",\"allocation_profile\":\"" << plan.allocation_profile << "\""
+           << ",\"trajectory_start_ns\":" << plan.start_ns
            << ",\"state\":\"RUNNING\""
            << ",\"block_reason\":\"NONE\""
            << ",\"mode_control\":{"
@@ -1716,14 +1734,18 @@ class PlannerNodeCpp final : public rclcpp::Node {
     status_pub_->publish(message);
   }
 
-  void publish_status(const std::string& status, double compute_ms, int candidate_id) {
+  // `trajectory_start_ns` is set when this cycle committed new trajectory
+  // content starting then; such content was not produced by an allocation.
+  void publish_status(const std::string& status, double compute_ms, int candidate_id,
+                      std::optional<std::int64_t> trajectory_start_ns = std::nullopt) {
     const auto mode_status = mode_status_snapshot();
     std_msgs::msg::String message;
     std::ostringstream stream;
     stream << std::fixed << std::setprecision(3)
            << "{\"backend\":\"CPP_NATIVE\""
-           << ",\"allocation_profile\":\"LATERAL_PRIORITY\""
-           << ",\"state\":\"" << status << "\""
+           << ",\"allocation_profile\":\"NONE\"";
+    if (trajectory_start_ns) stream << ",\"trajectory_start_ns\":" << *trajectory_start_ns;
+    stream << ",\"state\":\"" << status << "\""
            << ",\"block_reason\":\"" << status << "\""
            << ",\"mode_control\":{"
            << "\"requested_mode\":" << mode_status.requested_mode
@@ -1774,6 +1796,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
   std::shared_ptr<ReferencePath> pending_post_turn_path_;
   SpotTurnManeuver maneuver_;
   ReferencePathMsg::SharedPtr deferred_reference_;
+  ReferencePathMsg::SharedPtr path_before_odom_;
   bool spot_turn_waiting_clearance_{false};
 
   std::shared_ptr<const ReferencePath> reference_path_;
