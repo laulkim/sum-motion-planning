@@ -7,6 +7,7 @@ from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 from planar_velocity_sim.vehicle_response import RESPONSE_PARAMETER_DEFAULTS
 
@@ -91,6 +92,11 @@ def _resolved_nodes(context):
                     "initial_yaw": initial_body_yaw,
                     "initial_drive_mode": first_mode,
                     "mode_transition_duration_sec": mode_transition_duration,
+                    "sensor_noise_enabled": ParameterValue(
+                        LaunchConfiguration("sensor_noise_enabled"), value_type=bool
+                    ),
+                    "sensor_noise_scale": float(LaunchConfiguration("sensor_noise_scale").perform(context)),
+                    "sensor_noise_seed": int(LaunchConfiguration("sensor_noise_seed").perform(context)),
                 }
             ],
         ),
@@ -261,6 +267,9 @@ def generate_launch_description() -> LaunchDescription:
                 DeclareLaunchArgument(name, default_value=str(default))
                 for name, default in RESPONSE_PARAMETER_DEFAULTS.items()
             ],
+            DeclareLaunchArgument("sensor_noise_enabled", default_value="true"),
+            DeclareLaunchArgument("sensor_noise_scale", default_value="1.0"),
+            DeclareLaunchArgument("sensor_noise_seed", default_value="42"),
             OpaqueFunction(function=_resolved_nodes),
         ]
     )

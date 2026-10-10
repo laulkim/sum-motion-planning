@@ -3,11 +3,12 @@
 Data flow:
 
 `/cmd_vel` body-frame reference → empirical closed-loop response → actual
-`vx, vy, yaw_rate` → ground-truth pose integration → sensor delay → `/odom`.
+`vx, vy, yaw_rate` → ground-truth pose integration → sensor delay → AR(2)
+velocity measurement noise → `/odom`.
 
 The identified response includes the lower velocity controller, actuator and
-vehicle. It is not an open-loop mass/inertia or tire model. No noise or bias is
-added. Each channel uses `tau * dy/dt + y = gain * u(t - delay)` with exact
+vehicle. It is not an open-loop mass/inertia or tire model. Each channel uses
+`tau * dy/dt + y = gain * u(t - delay)` with exact
 exponential discretization. Commands are held from their receipt timestamps;
 updates split at delayed input changes, including changes between timer ticks.
 Ground-truth pose uses the resulting actual velocity and existing midpoint
@@ -36,6 +37,16 @@ add up to one simulation update interval to the age, rather than rounding the
 configured delay to a fixed number of samples. A zero sensor delay publishes
 the current sample. The node's `x, y, yaw` and `applied_*` fields remain current
 ground truth; odometry is the delayed observation.
+
+`sensor_noise_enabled` (true), `sensor_noise_scale` (1.0, finite and non-negative)
+and `sensor_noise_seed` (42) configure zero-mean AR(2) noise added only to delayed
+`/odom` velocity. Pose, actual velocity and mode acceptance are unaffected directly.
+The tracker receives noisy velocity, so its feedback can change subsequent commands.
+Each published sample advances `n = a1*n_prev1 + a2*n_prev2 + w` (normally 100 Hz).
+The scale multiplies all innovation standard deviations; zero disables noise.
+Channel RNGs use seed, seed+1, seed+2 and correlated stationary initial states.
+The fixed residual fits are in `vehicle_response.py` (yaw innovation is rad/s).
+The same three settings are launch arguments, e.g. `sensor_noise_enabled:=false`.
 
 Drive-mode acceptance uses actual translational speed, not delayed odometry.
 ALIGNING sets the response input reference to zero without resetting actual

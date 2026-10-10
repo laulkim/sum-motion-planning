@@ -16,7 +16,8 @@ from std_msgs.msg import UInt8
 from .kinematics import integrate_body_velocity
 from .mode_transition import DriveModeTransitionModel, VALID_DRIVE_MODES
 from .vehicle_response import (
-    FirstOrderResponse, RESPONSE_PARAMETER_DEFAULTS, SensorDelay,
+    AR2Noise, AR2_NOISE_DEFAULTS, FirstOrderResponse, RESPONSE_PARAMETER_DEFAULTS,
+    SensorDelay,
 )
 
 
@@ -40,9 +41,22 @@ class PlanarVelocitySimNode(Node):
         self.declare_parameter("mode_state_topic", "/vehicle/drive_mode_state")
         self.declare_parameter("odom_frame", "odom")
         self.declare_parameter("base_frame", "base_link")
+        self.declare_parameter("sensor_noise_enabled", True)
+        self.declare_parameter("sensor_noise_scale", 1.0)
+        self.declare_parameter("sensor_noise_seed", 42)
 
         for name, default in RESPONSE_PARAMETER_DEFAULTS.items():
             self.declare_parameter(name, default)
+
+        self.sensor_noise_enabled = self.get_parameter("sensor_noise_enabled").value
+        noise_scale = float(self.get_parameter("sensor_noise_scale").value)
+        noise_seed = int(self.get_parameter("sensor_noise_seed").value)
+        if not math.isfinite(noise_scale) or noise_scale < 0.0:
+            raise ValueError("sensor_noise_scale must be finite and non-negative")
+        self.velocity_noise = [
+            AR2Noise(a1, a2, innovation_std * noise_scale, noise_seed + index)
+            for index, (a1, a2, innovation_std) in enumerate(AR2_NOISE_DEFAULTS.values())
+        ]
 
         update_rate_hz = float(self.get_parameter("update_rate_hz").value)
         mode_state_rate_hz = float(self.get_parameter("mode_state_rate_hz").value)
@@ -222,6 +236,11 @@ class PlanarVelocitySimNode(Node):
         if measurement is None:
             return
         measured_sec, (x, y, yaw, vx, vy, yaw_rate) = measurement
+        # Measurement only: actual response, pose integration and delay stay unchanged.
+        if self.sensor_noise_enabled:
+            vx += self.velocity_noise[0].sample()
+            vy += self.velocity_noise[1].sample()
+            yaw_rate += self.velocity_noise[2].sample()
         odom = Odometry()
         # Acquisition time, not delivery time: consumers can see sensor age.
         odom.header.stamp = Time(
