@@ -132,7 +132,7 @@ def run_case(config, case, gains, output, policy, domain, lut_file=None):
                     progress = read_json_if_exists(directory / "progress.json")
                     status = read_json_if_exists(directory / "scenario_status.json")
                     planner = read_json_if_exists(directory / "planner_status.json")
-                    if case["end_condition"] == "duration" and progress.get("elapsed_s", 0) >= case["duration_sec"]:
+                    if case["end_condition"] == "duration" and (progress.get("valid_elapsed_s") or 0) >= case["duration_sec"]:
                         reason = "duration"
                         break
                     if case["end_condition"] == "complete" and status.get("state") == "COMPLETE":
@@ -378,6 +378,28 @@ def compare(fixed, lut, output):
         writer.writerows(records)
     write_json(output / "comparison.json", {"sensor_delay_sec": 0.0, "role": a["role"],
                "fixed_objective": a["objective"], "lut_objective": b["objective"], "cases": records})
+    for left in a["results"]:
+        other = right[left["case"]["id"]]
+        if not max(left["metrics"].get("spot_samples", 0), other["metrics"].get("spot_samples", 0)):
+            continue
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        figure, axes = plt.subplots(3, 1, sharex=True, figsize=(10, 7), layout="constrained")
+        for result, label in ((left, "Fixed"), (other, "LUT")):
+            rows = read_tracking(result["tracking_csv"])
+            for ax, key, scale in zip(axes, ("vx_cmd", "vy_cmd", "etheta"), (1, 1, 180 / math.pi)):
+                values = [r[key] * scale if r["valid"] == 1 and r["vx_ref"] == 0 and r["vy_ref"] == 0 and r["omega_ref"] != 0
+                          else math.nan for r in rows]
+                ax.plot([r["time_s"] for r in rows], values, label=label)
+                ax.legend()
+        for ax, label in zip(axes, ("vx command [m/s]", "vy command [m/s]", "yaw error [deg]")):
+            ax.set_ylabel(label)
+            ax.grid(alpha=0.3)
+        axes[-1].set_xlabel("Elapsed control time [s]; each run uses its own timestamps")
+        figure.suptitle(left["case"]["id"] + " — pure-rotation reference samples")
+        figure.savefig(output / (left["case"]["id"] + "_spot_commands.png"), dpi=160)
+        plt.close(figure)
 
 
 def main(argv=None):
