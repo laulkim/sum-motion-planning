@@ -91,7 +91,8 @@ inline geometry_msgs::msg::Twist lyapunov_control(const Point& reference,
 
 inline Control control_cycle(const Inputs& snapshot, std::int64_t now_ns,
                              std::int64_t period_ns, const Gains& gains,
-                             const std::string& base_frame = "base_link") {
+                             const std::string& base_frame = "base_link",
+                             const GainLut* gain_lut = nullptr) {
   Control output;  // 매 cycle의 기본 출력은 zero command다.
   if (!snapshot.trajectory) return output;
   const auto index = reference_index(*snapshot.trajectory, now_ns, period_ns);
@@ -134,7 +135,7 @@ inline Control control_cycle(const Inputs& snapshot, std::int64_t now_ns,
   pose->y += (s * velocity.linear.x + c * velocity.linear.y) * dt;
   pose->yaw = wrap_angle(pose->yaw + velocity.angular.z * dt);
   const auto error = tracking_error(reference, *pose);
-  const auto scheduled = scheduled_gains(reference, gains);
+  const auto scheduled = scheduled_gains(reference, gains, gain_lut);
   const auto command = lyapunov_control(reference, error, scheduled);
   if (std::isfinite(command.linear.x) && std::isfinite(command.linear.y) &&
       std::isfinite(command.angular.z)) {

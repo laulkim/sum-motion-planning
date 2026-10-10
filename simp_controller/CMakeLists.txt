@@ -13,6 +13,7 @@ find_package(std_msgs REQUIRED)
 find_package(simp_planner_msgs REQUIRED)
 
 add_executable(tracking_controller_node src/tracking_controller_node.cpp)
+target_compile_definitions(tracking_controller_node PRIVATE SIMP_GAIN_LUT)
 target_include_directories(tracking_controller_node PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
@@ -34,6 +35,11 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_control geometry_msgs nav_msgs simp_planner_msgs)
   target_compile_options(test_control PRIVATE -Wall -Wextra -Wpedantic)
   add_test(NAME tracking_control_tests COMMAND test_control)
+  add_executable(test_gain_lut test/test_gain_lut.cpp)
+  target_include_directories(test_gain_lut PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  ament_target_dependencies(test_gain_lut geometry_msgs nav_msgs simp_planner_msgs)
+  target_compile_options(test_gain_lut PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME gain_lut_tests COMMAND test_gain_lut)
 endif()
 
 install(TARGETS
