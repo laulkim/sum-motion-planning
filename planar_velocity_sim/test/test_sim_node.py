@@ -11,12 +11,15 @@ from rclpy.time import Time
 from std_msgs.msg import UInt8
 
 from planar_velocity_sim.planar_velocity_sim_node import PlanarVelocitySimNode
-from planar_velocity_sim.vehicle_response import SensorDelay
+from planar_velocity_sim.vehicle_response import AR2Noise, AR2_NOISE_DEFAULTS, SensorDelay
 
 
 @pytest.fixture
-def simulator(monkeypatch):
-    rclpy.init()
+def simulator(monkeypatch, request):
+    # Existing deterministic response tests explicitly disable measurement noise.
+    rclpy.init(args=getattr(request, "param", [
+        "--ros-args", "-p", "sensor_noise_enabled:=false"
+    ]))
     node = PlanarVelocitySimNode()
     now = SimpleNamespace(sec=0.0)
     clock = SimpleNamespace(now=lambda: Time(
@@ -48,18 +51,37 @@ def tick(node, clock, t):
     node.update()
 
 
+@pytest.mark.parametrize("simulator", [
+    ["--ros-args", "-p", "sensor_noise_enabled:=false"],
+    [],  # default enabled, scale=1, seed=42
+    ["--ros-args", "-p", "sensor_noise_scale:=0.0"],
+], indirect=True)
 def test_actual_pose_and_delayed_odometry(simulator):
     node, clock, odometry = simulator
+    expected_noise = [
+        AR2Noise(a1, a2, std * node.get_parameter("sensor_noise_scale").value, 42 + i)
+        for i, (a1, a2, std) in enumerate(AR2_NOISE_DEFAULTS.values())
+    ]
     command(node, vx=1.0, vy=0.5, yaw_rate=0.2)
     history = {0: node.actual_state()}
     for i in range(1, 31):
         tick(node, clock, i * 0.01)
         history[i] = node.actual_state()
+        # Noisy measurements must never affect the ground-truth FOPDT response.
+        for actual, reference, response in zip(history[i][3:], (1.0, 0.5, 0.2), node.responses):
+            elapsed = max(0.0, i * 0.01 - response.delay_sec)
+            assert actual == pytest.approx(
+                reference * response.gain * (1.0 - math.exp(-elapsed / response.tau_sec))
+            )
         if i < 10:
             assert not odometry
             continue
         msg = odometry[-1]
         x, y, yaw, vx, vy, yaw_rate = history[i - 10]
+        if node.sensor_noise_enabled:
+            vx += expected_noise[0].sample()
+            vy += expected_noise[1].sample()
+            yaw_rate += expected_noise[2].sample()
         assert msg.pose.pose.position.x == pytest.approx(x)
         assert msg.pose.pose.position.y == pytest.approx(y)
         assert msg.pose.pose.orientation.z == pytest.approx(math.sin(yaw / 2))

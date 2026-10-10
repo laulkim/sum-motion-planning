@@ -3,10 +3,46 @@ import math
 import pytest
 
 from planar_velocity_sim.vehicle_response import (
+    AR2Noise,
+    AR2_NOISE_DEFAULTS,
     FirstOrderResponse,
     RESPONSE_PARAMETER_DEFAULTS,
     SensorDelay,
 )
+
+
+@pytest.mark.parametrize("parameters", AR2_NOISE_DEFAULTS.values())
+def test_ar2_seed_reproduces_sequence(parameters):
+    first = AR2Noise(*parameters, seed=42)
+    second = AR2Noise(*parameters, seed=42)
+    other = AR2Noise(*parameters, seed=43)
+    sequence = [first.sample() for _ in range(20)]
+    assert sequence == [second.sample() for _ in range(20)]
+    assert sequence != [other.sample() for _ in range(20)]
+
+
+def test_ar2_zero_innovation():
+    noise = AR2Noise(0.4, 0.5, 0.0, seed=42)
+    assert [noise.sample() for _ in range(20)] == [0.0] * 20
+
+
+def test_ar2_recurrence(monkeypatch):
+    noise = AR2Noise(0.4, 0.5, 0.01, seed=42)
+    previous1, previous2 = noise.previous1, noise.previous2
+    monkeypatch.setattr(noise.rng, "gauss", lambda mean, std: std)
+    expected = 0.4 * previous1 + 0.5 * previous2 + 0.01
+    assert noise.sample() == pytest.approx(expected)
+    assert noise.sample() == pytest.approx(0.4 * expected + 0.5 * previous1 + 0.01)
+
+
+@pytest.mark.parametrize("a1,a2,std", [
+    (0.4, 0.5, -0.01), (0.4, 0.5, math.nan), (0.4, 0.5, math.inf),
+    (math.nan, 0.5, 0.01), (0.4, math.inf, 0.01),
+    (0.5, 0.5, 0.01), (0.4, -1.0, 0.01),
+])
+def test_invalid_ar2_parameters(a1, a2, std):
+    with pytest.raises(ValueError):
+        AR2Noise(a1, a2, std, seed=42)
 
 
 def channel_response(channel, now_sec=0.0):

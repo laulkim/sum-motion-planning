@@ -7,6 +7,7 @@ Inputs are zero-order held from their receipt timestamps.
 
 from collections import deque
 import math
+import random
 
 
 # Shared by the ROS node and simulation launch; times are in seconds.
@@ -22,6 +23,43 @@ RESPONSE_PARAMETER_DEFAULTS = {
     "yaw_rate_delay_sec": 0.020,
     "sensor_delay_sec": 0.100,
 }
+
+
+# Vmax3/Vmax4 residual fits, validated on Vmax5; (a1, a2, sigma_w).
+# Velocity units are m/s, m/s, rad/s respectively; no intercept is added.
+AR2_NOISE_DEFAULTS = {
+    "vx": (0.407455642, 0.589895709, 0.00399662414),
+    "vy": (0.611780077, 0.381494641, 0.00321297667),
+    "yaw_rate": (0.303096072, 0.680895634, 0.00239455092),
+}
+
+
+class AR2Noise:
+    """Zero-mean measurement noise, advanced once per published odometry sample."""
+
+    def __init__(self, a1, a2, innovation_std, seed):
+        if not all(math.isfinite(v) for v in (a1, a2, innovation_std)):
+            raise ValueError("AR(2) parameters must be finite")
+        if innovation_std < 0.0:
+            raise ValueError("innovation_std must be non-negative")
+        if abs(a2) >= 1.0 or abs(a1) >= 1.0 - a2:
+            raise ValueError("AR(2) coefficients must be stationary")
+        self.a1, self.a2, self.innovation_std = a1, a2, innovation_std
+        self.rng = random.Random(seed)
+        # Yule-Walker: rho(1) = a1/(1-a2), variance = sigma_w^2 /
+        # ((1-a2^2)*(1-rho(1)^2)). Draw the correlated stationary state pair.
+        rho = a1 / (1.0 - a2)
+        std = innovation_std / math.sqrt((1.0 - a2 * a2) * (1.0 - rho * rho))
+        self.previous1 = self.rng.gauss(0.0, std)
+        self.previous2 = rho * self.previous1 + self.rng.gauss(
+            0.0, std * math.sqrt(1.0 - rho * rho)
+        )
+
+    def sample(self):
+        noise = (self.a1 * self.previous1 + self.a2 * self.previous2
+                 + self.rng.gauss(0.0, self.innovation_std))
+        self.previous2, self.previous1 = self.previous1, noise
+        return noise
 
 
 class FirstOrderResponse:
