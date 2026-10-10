@@ -124,6 +124,7 @@ def show_recording(path):
     for index, figure in enumerate(analysis):
         name = "spot_turn_summary.png" if index == 0 else f"spot_turn_{index:02d}.png"
         figure.savefig(path.parent / name, dpi=140)
+        plt.close(figure)  # Save analysis for later; only the three tracking windows stay open.
     if interactive:
         plt.show()
     plt.close("all")
@@ -187,7 +188,7 @@ def main(args=None):
     node.create_subscription(Odometry, "/odom", receive_odometry, qos_profile_sensor_data)
     node.create_subscription(DriveModeState, "/vehicle/drive_mode_state", receive_mode,
                              QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
-    node.get_logger().info(f"Ctrl+C 후 추종 플롯 + spot-turn 분석 표시 / 기록: {directory}")
+    node.get_logger().info(f"Ctrl+C 후 추종 플롯 3개 표시 / 기록·spot-turn 분석 저장: {directory}")
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
