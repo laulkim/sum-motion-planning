@@ -166,20 +166,24 @@ def main(args=None):
     origin_ns = None
     count = 0
     last_flush_s = -1.0
+    first_valid_s = None
 
     def receive_control(message):
-        nonlocal origin_ns, count, last_flush_s
+        nonlocal origin_ns, count, last_flush_s, first_valid_s
         if origin_ns is None:
             origin_ns = stamp_ns(message.header.stamp)
         writer.writerow(sample_row(message, origin_ns))
         count += 1
         elapsed = (stamp_ns(message.header.stamp) - origin_ns) * 1e-9
+        if message.valid and first_valid_s is None:
+            first_valid_s = elapsed
         if elapsed - last_flush_s >= 0.5:
             for file in files:
                 file.flush()
             progress = directory / "progress.json"
             temporary = progress.with_suffix(".tmp")
-            temporary.write_text(json.dumps({"elapsed_s": elapsed, "samples": count}))
+            temporary.write_text(json.dumps({"elapsed_s": elapsed, "samples": count,
+                                             "valid_elapsed_s": elapsed - first_valid_s if first_valid_s is not None else None}))
             temporary.replace(progress)
             last_flush_s = elapsed
 

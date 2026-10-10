@@ -1,5 +1,3 @@
-import copy
-import csv
 import json
 import math
 from pathlib import Path
@@ -60,6 +58,11 @@ def test_manifest_and_seed_protocol(tmp_path):
     for gain in ([0, 2, 1], [-1, 2, 1], [1, math.inf, 1], [1, 2, math.nan]):
         with pytest.raises(ValueError):
             validate_gains(gain)
+    config = load_manifest(CONFIG)
+    config["cases"].append(config["cases"][0].copy())
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError):
+        load_manifest(path)
 
 
 def test_lut_initialization_active_neighborhoods_and_smoothness(tmp_path):
@@ -117,3 +120,23 @@ def test_optimizers_checkpoint_cache_and_validation_exclusion(tmp_path, monkeypa
     assert (tmp_path / "lut/optimized_lut.csv").exists()
     assert json.loads((tmp_path / "lut/checkpoint.json").read_text())["sweep"] == 1
     assert json.loads((tmp_path / "lut/active_points.json").read_text())["active"] == [0]
+
+
+def test_compare_rejects_unfair_protocol_and_keeps_metrics(tmp_path):
+    from simp_planner_tools.gain_experiment import compare
+    config = load_manifest(CONFIG)
+    result = {"case": config["cases"][0], "success": True, "objective": 2,
+              "metrics": {"rmse_ex": 0.1, "max_abs_ey": 0.2, "spot_samples": 0}}
+    fixed = {"policy": "fixed", "role": "validation", "sensor_delay_sec": 0,
+             "configuration": {"config": config, "provenance": {"common_signature": "same"}},
+             "objective": 2, "results": [result]}
+    lut = json.loads(json.dumps(fixed))
+    lut["policy"] = "lut"
+    a, b = tmp_path / "fixed.json", tmp_path / "lut.json"
+    a.write_text(json.dumps(fixed)); b.write_text(json.dumps(lut))
+    compare(a, b, tmp_path / "report")
+    assert "fixed_rmse_ex" in (tmp_path / "report/comparison.csv").read_text()
+    lut["configuration"]["provenance"]["common_signature"] = "different_planner"
+    b.write_text(json.dumps(lut))
+    with pytest.raises(ValueError):
+        compare(a, b, tmp_path / "report")

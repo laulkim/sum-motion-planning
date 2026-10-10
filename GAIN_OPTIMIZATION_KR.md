@@ -21,7 +21,7 @@ manifest에 다른 sensor delay를 쓰면 오류로 거부한다. FOPDT actuator
 - `recorder.quantiles`, `histogram_bins`: 분포 출력 설정. knot 수와 무관하다.
 - 각 case: 고유 `id`, `scenario`, `target_speed`, `sensor_noise_seed`, `role`,
   `weight`, `end_condition`, `timeout_sec`.
-- 종료 조건: `complete`는 scenario COMPLETE까지, `duration`은 첫 control
+- 종료 조건: `complete`는 scenario COMPLETE까지, `duration`은 첫 유효 control
   timestamp부터 지정 `duration_sec`까지, `safe_stop`은 안전 정지 확인까지.
 
 기본 구성은 tuning 13개, validation 7개, safety 4개다.
@@ -118,7 +118,8 @@ evaluate/optimize-lut는 파일을 명시적으로 전달한다. fixed branch는
   `operating_histograms.png`.
 - LUT: 사용자가 지정한 `axes.json`, `initial_lut.csv` 및 초기값 출처 `.json`,
   optimizer output의 `active_points.json`, `optimized_lut.csv`.
-- 비교: `comparison.csv`, `comparison.json`.
+- 비교: `comparison.csv`, `comparison.json`, 해당 case에 spot turn이 있으면
+  `<case-id>_spot_commands.png` (command vx/vy와 yaw error).
 
 각 실행 명령/설정/summary/best/checkpoint에 sensor_delay_sec=0.0을 기록한다.
 비교 도구는 manifest와 공통 planner/vehicle/scenario/tooling fingerprint가
@@ -241,7 +242,7 @@ pose로 계산한 정지 속도, 최대 이동거리를 검사한다. 다른 saf
 cd /home/a/ros2_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
-colcon test --packages-select simp_controller planar_velocity_sim
+colcon test --packages-select simp_controller planar_velocity_sim --python-testing pytest
 colcon test-result --verbose
 cd src/sum-motion-planning
 python3 -m pytest -q simp_planner_tools/test/test_gain_experiment.py \
