@@ -233,6 +233,22 @@ def de_options(config, seed):
     return options
 
 
+def read_history(path):
+    """Recover a trailing interrupted append; corruption elsewhere is an error."""
+    if not path.exists():
+        return []
+    lines = path.read_text().splitlines()
+    rows = []
+    for index, line in enumerate(lines):
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            if index != len(lines) - 1:
+                raise
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    return rows
+
+
 def optimize(config, output, domain, initial_lut=None, samples=None):
     from scipy.optimize import differential_evolution
     output = Path(output)
@@ -247,11 +263,24 @@ def optimize(config, output, domain, initial_lut=None, samples=None):
         raise ValueError("resume requires identical manifest, controller build and input files")
     write_json(configuration, identity)
     history_path = output / "history.jsonl"
-    history = [json.loads(line) for line in history_path.read_text().splitlines()] if history_path.exists() else []
+    history = read_history(history_path)
     cache = {row["candidate_key"]: row for row in history}
     checkpoint_path = output / "checkpoint.json"
     checkpoint = read_json_if_exists(checkpoint_path)
     bounds = [settings["bounds"][name] for name in GAIN_NAMES]
+
+    def save_best():
+        feasible = [r for r in history if r["success"]]
+        if feasible:
+            best = min(feasible, key=lambda r: r["objective"])
+            write_json(output / "best.json", {**best, "policy": policy, "configuration": identity})
+            if policy == "lut":
+                best_axes, best_gains = load_lut(best["lut_file"])
+                save_lut(output / "optimized_lut.csv", best_axes, best_gains)
+
+    # Recover best if interruption occurred after history fsync but before its
+    # atomic best/checkpoint write. History is the durable source of truth.
+    save_best()
 
     def trial(gains, lut_gains=None, axes=None):
         validate_gains(gains)
@@ -282,13 +311,7 @@ def optimize(config, output, domain, initial_lut=None, samples=None):
             writer.writerow((row["trial"], key, *gains, row["objective"], row["tracking_objective"], penalty, row["success"]))
         history.append(row)
         cache[key] = row
-        feasible = [r for r in history if r["success"]]
-        if feasible:
-            best = min(feasible, key=lambda r: r["objective"])
-            write_json(output / "best.json", {**best, "policy": policy, "configuration": identity})
-            if policy == "lut":
-                best_axes, best_gains = load_lut(best["lut_file"])
-                save_lut(output / "optimized_lut.csv", best_axes, best_gains)
+        save_best()
         return row
 
     if not initial_lut:

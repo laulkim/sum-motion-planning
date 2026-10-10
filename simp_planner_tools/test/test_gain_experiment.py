@@ -112,6 +112,12 @@ def test_optimizers_checkpoint_cache_and_validation_exclusion(tmp_path, monkeypa
     before = len(calls)
     optimize(config, fixed, 173)
     assert len(calls) == before  # exact cached trials survive restart
+    (fixed / "best.json").unlink()
+    with (fixed / "history.jsonl").open("a") as file:
+        file.write('{"interrupted":')
+    optimize(config, fixed, 173)
+    assert (fixed / "best.json").exists()
+    assert len(calls) == before
     lut = tmp_path / "initial.csv"
     save_lut(lut, {name: [0] for name in ("vx", "vy", "yaw_rate")}, [[1, 2, 1]])
     samples = tmp_path / "samples.csv"
