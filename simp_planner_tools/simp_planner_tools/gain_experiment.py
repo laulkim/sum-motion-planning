@@ -417,15 +417,26 @@ def compare(fixed, lut, output):
         figure, axes = plt.subplots(3, 1, sharex=True, figsize=(10, 7), layout="constrained")
         for result, label in ((left, "Fixed"), (other, "LUT")):
             rows = read_tracking(result["tracking_csv"])
-            for ax, key, scale in zip(axes, ("vx_cmd", "vy_cmd", "etheta"), (1, 1, 180 / math.pi)):
-                values = [r[key] * scale if r["valid"] == 1 and r["vx_ref"] == 0 and r["vy_ref"] == 0 and r["omega_ref"] != 0
-                          else math.nan for r in rows]
-                ax.plot([r["time_s"] for r in rows], values, label=label)
-                ax.legend()
+            turns, turn = [], []
+            for row in rows:
+                pure = row["valid"] == 1 and row["vx_ref"] == 0 and row["vy_ref"] == 0 and row["omega_ref"] != 0
+                if pure:
+                    turn.append(row)
+                elif turn:
+                    turns.append(turn)
+                    turn = []
+            if turn:
+                turns.append(turn)
+            for number, turn in enumerate(turns, 1):
+                for ax, key, scale in zip(axes, ("vx_cmd", "vy_cmd", "etheta"), (1, 1, 180 / math.pi)):
+                    ax.plot([r["time_s"] - turn[0]["time_s"] for r in turn],
+                            [r[key] * scale for r in turn], label=f"{label} turn {number}",
+                            color="tab:blue" if label == "Fixed" else "tab:orange")
+                    ax.legend()
         for ax, label in zip(axes, ("vx command [m/s]", "vy command [m/s]", "yaw error [deg]")):
             ax.set_ylabel(label)
             ax.grid(alpha=0.3)
-        axes[-1].set_xlabel("Elapsed control time [s]; each run uses its own timestamps")
+        axes[-1].set_xlabel("Time from each pure-rotation reference interval start [s]")
         figure.suptitle(left["case"]["id"] + " — pure-rotation reference samples")
         figure.savefig(output / (left["case"]["id"] + "_spot_commands.png"), dpi=160)
         plt.close(figure)
