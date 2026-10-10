@@ -109,6 +109,9 @@ def _resolved_nodes(context):
                 {
                     "scenario": scenario_name,
                     "target_speed": target_speed,
+                    "start_delay_sec": float(
+                        LaunchConfiguration("start_delay_sec").perform(context)
+                    ),
                     "path_update_distance": path_update_distance,
                     "costmap_resolution": costmap_resolution,
                     "costmap_size_m": costmap_size_m,
@@ -193,6 +196,13 @@ def _resolved_nodes(context):
             ],
         ),
         Node(
+            package="simp_planner_tools",
+            executable="scenario_obstacle_visualizer_node",
+            name="scenario_obstacle_visualizer_node",
+            output="screen",
+            parameters=[{"scenario": scenario_name}],
+        ),
+        Node(
             package="rviz2",
             executable="rviz2",
             name="rviz2",
@@ -218,6 +228,12 @@ def generate_launch_description() -> LaunchDescription:
                 "target_speed",
                 default_value="-1.0",
                 description="Negative value uses the scenario default speed.",
+            ),
+            DeclareLaunchArgument(
+                "start_delay_sec",
+                default_value="-1.0",
+                description="Seconds to hold still after the first odometry before starting "
+                            "(negative uses the scenario default, 0 s for every scenario).",
             ),
             DeclareLaunchArgument("path_update_distance", default_value="1.0"),
             DeclareLaunchArgument(
@@ -249,7 +265,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("save_period", default_value="10.0"),
             DeclareLaunchArgument(
                 "debug_output_dir",
-                default_value="/home/sum/Desktop/simp_planner/simp_planner_debug",
+                default_value="~/Desktop/simp_planner/simp_planner_debug",
             ),
             DeclareLaunchArgument(
                 "vehicle_length", default_value="3.0",

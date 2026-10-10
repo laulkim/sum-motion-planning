@@ -288,7 +288,11 @@ BodyCommand hold_command(const BodyCommand& previous, DriveMode previous_mode,
                          DriveMode mode, double body_yaw);
 
 // The handover state a new plan starts from when it begins at `point`.
-PredictedHandoverState handover_from_point(const TrackingPoint& point);
+// `previous` is the point commanded one period earlier: beta is the state at
+// `point`, while the allocator's rates are those of the interval ending there
+// (as AllocationResult::state_at), since the new plan recomputes `point`'s own.
+PredictedHandoverState handover_from_point(const TrackingPoint& point,
+                                           const TrackingPoint& previous);
 
 // Builds a TrackingTrajectory point by point. The pose of each new point is
 // integrated from the previous one with the same body-velocity kinematics the

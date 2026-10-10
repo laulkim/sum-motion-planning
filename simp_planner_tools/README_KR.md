@@ -17,7 +17,7 @@ ros2 launch simp_planner_tools simulation.launch.py \
 ```
 
 저장 위치는 `debug_output_dir/tracking_YYYYMMDD_HHMMSS_microseconds/`입니다.
-`debug_output_dir`의 기본값은 `/home/sum/Desktop/simp_planner/simp_planner_debug`입니다.
+`debug_output_dir`의 기본값은 `~/Desktop/simp_planner/simp_planner_debug`입니다.
 
 | 파일 | 내용 |
 | --- | --- |
