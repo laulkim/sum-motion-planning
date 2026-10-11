@@ -97,32 +97,39 @@ def test_optimizers_checkpoint_cache_and_validation_exclusion(tmp_path, monkeypa
     config = load_manifest(CONFIG)
     config["cases"].append({**config["cases"][0], "id": "held_out", "role": "validation"})
     calls = []
-    monkeypatch.setattr(experiment, "provenance", lambda: {"common_signature": "test"})
-    def evaluation(config, gains, output, policy, domain, role="tuning", lut_file=None):
-        calls.append((policy, role))
+    monkeypatch.setattr(experiment, "load_references", lambda path, config: ([], {"test": "references"}))
+    def evaluation(config, datasets, gains, output, lut=None):
+        calls.append(("lut" if lut else "fixed", "tuning"))
         objective = (gains[0] - 1) ** 2
-        if lut_file:
-            objective = (load_lut(lut_file)[1][0][0] - 1) ** 2
-        return {"objective": objective, "success": True}
-    monkeypatch.setattr(experiment, "evaluate", evaluation)
+        if lut:
+            objective = (lut[1][0][0] - 1) ** 2
+        return {"objective": objective, "success": True, "elapsed_wall_sec": 0.001}
+    monkeypatch.setattr(experiment, "evaluate_offline", evaluation)
+    monkeypatch.setattr(experiment, "evaluate", lambda *args, **kwargs: pytest.fail("optimizer launched ROS"))
     fixed = tmp_path / "fixed"
-    optimize(config, fixed, 173)
+    optimize(config, fixed, "references.json")
     assert all(role == "tuning" for _, role in calls)
+    assert json.loads((fixed / "configuration.json").read_text())["backend"] == "offline_replay"
     assert json.loads((fixed / "best.json").read_text())["gains"][0] == 1
     before = len(calls)
-    optimize(config, fixed, 173)
+    optimize(config, fixed, "references.json")
     assert len(calls) == before  # exact cached trials survive restart
     (fixed / "best.json").unlink()
     with (fixed / "history.jsonl").open("a") as file:
         file.write('{"interrupted":')
-    optimize(config, fixed, 173)
+    optimize(config, fixed, "references.json")
     assert (fixed / "best.json").exists()
     assert len(calls) == before
+    legacy = tmp_path / "legacy_ros"
+    legacy.mkdir()
+    (legacy / "configuration.json").write_text(json.dumps({"policy": "fixed", "provenance": {}}))
+    with pytest.raises(ValueError, match="separate offline output"):
+        optimize(config, legacy, "references.json")
     lut = tmp_path / "initial.csv"
     save_lut(lut, {name: [0] for name in ("vx", "vy", "yaw_rate")}, [[1, 2, 1]])
     samples = tmp_path / "samples.csv"
     samples.write_text("vx,vy,yaw_rate\n0,0,0\n")
-    optimize(config, tmp_path / "lut", 173, lut, samples)
+    optimize(config, tmp_path / "lut", "references.json", lut, samples)
     assert (tmp_path / "lut/optimized_lut.csv").exists()
     assert json.loads((tmp_path / "lut/checkpoint.json").read_text())["sweep"] == 1
     assert json.loads((tmp_path / "lut/active_points.json").read_text())["active"] == [0]

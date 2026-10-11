@@ -1,7 +1,7 @@
-"""Manifest-driven real ROS experiments, fixed/LUT optimization and reports.
+"""Collect ROS references, optimize offline, then validate in full ROS.
 
 Run with python3 -m simp_planner_tools.gain_experiment --help after sourcing ROS.
-No planner, simulator, pose initialization or reference generation is replaced.
+Offline search freezes selected references; ROS evaluation remains final validation.
 """
 import argparse
 import copy
@@ -19,6 +19,7 @@ import time
 from .gain_evaluation import (GAIN_NAMES, aggregate, case_objective, load_manifest,
                               metrics, operating_report, read_tracking, validate_gains, write_json)
 from .gain_lut import (AXIS_NAMES, active_points, load_lut, save_lut, smoothness, validate_axes)
+from .offline_gain_sim import evaluate_offline, load_references, response_parameters
 
 
 def digest(value):
@@ -204,7 +205,8 @@ def evaluate(config, gains, output, policy, domain, role="tuning", lut_file=None
     output.mkdir(parents=True, exist_ok=True)
     identity = {"config": config, "gains": gains, "policy": policy, "role": role,
                 "lut_sha256": hashlib.sha256(Path(lut_file).read_bytes()).hexdigest() if lut_file else None,
-                "provenance": provenance(), "sensor_delay_sec": 0.0}
+                "provenance": provenance(), "sensor_delay_sec": 0.0,
+                "response_parameters": response_parameters()}
     metadata = output / "configuration.json"
     if metadata.exists() and read_json_if_exists(metadata) != identity:
         raise ValueError("output directory belongs to a different evaluation")
@@ -255,18 +257,27 @@ def read_history(path):
     return rows
 
 
-def optimize(config, output, domain, initial_lut=None, samples=None):
+def optimize(config, output, references, initial_lut=None, samples=None):
     from scipy.optimize import differential_evolution
+    datasets, reference_identity = load_references(references, config)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     policy = "lut" if initial_lut else "fixed"
     settings = config["optimizer"]
-    identity = {"manifest": config, "policy": policy, "provenance": provenance(), "sensor_delay_sec": 0.0,
+    from planar_velocity_sim import vehicle_response, kinematics, mode_transition
+    from . import offline_gain_sim, gain_lut, gain_evaluation
+    sources = {module.__name__: hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
+               for module in (vehicle_response, kinematics, mode_transition, offline_gain_sim, gain_lut, gain_evaluation)}
+    sources["optimizer"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    identity = {"manifest": config, "policy": policy, "backend": "offline_replay",
+                "references": reference_identity, "sources": sources, "sensor_delay_sec": 0.0,
                 "initial_lut": hashlib.sha256(Path(initial_lut).read_bytes()).hexdigest() if initial_lut else None,
                 "samples": hashlib.sha256(Path(samples).read_bytes()).hexdigest() if samples else None}
     configuration = output / "configuration.json"
     if configuration.exists() and read_json_if_exists(configuration) != identity:
-        raise ValueError("resume requires identical manifest, controller build and input files")
+        raise ValueError("use a separate offline output directory; resume requires identical manifest, references, model and inputs")
+    if not configuration.exists() and any(output.iterdir()):
+        raise ValueError("new offline optimization requires an empty output directory; preserve old ROS outputs")
     write_json(configuration, identity)
     history_path = output / "history.jsonl"
     history = read_history(history_path)
@@ -298,12 +309,13 @@ def optimize(config, output, domain, initial_lut=None, samples=None):
         if lut_gains is not None:
             lut_file = directory / "candidate_lut.csv"
             save_lut(lut_file, axes, lut_gains)
-        result = evaluate(config, gains, directory, policy, domain, lut_file=lut_file)
+        result = evaluate_offline(config, datasets, gains, directory,
+                                  (axes, lut_gains) if lut_gains is not None else None)
         penalty = smoothness(axes, lut_gains, settings["smoothness_lambda"]) if lut_gains is not None else 0.0
         row = {"trial": len(history), "candidate_key": key, "gains": list(gains),
                "objective": result["objective"] + penalty, "tracking_objective": result["objective"],
                "smoothness": penalty, "success": result["success"], "directory": str(directory.resolve()),
-               "sensor_delay_sec": 0.0}
+               "sensor_delay_sec": 0.0, "backend": "offline_replay", "elapsed_wall_sec": result["elapsed_wall_sec"]}
         if lut_gains is not None:
             row["lut_file"] = str(lut_file.resolve())
         with history_path.open("a") as file:
@@ -447,11 +459,15 @@ def compare(fixed, lut, output):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    for command in ("evaluate", "collect", "optimize-fixed", "optimize-lut"):
+    for command in ("evaluate", "collect", "optimize-fixed", "optimize-lut", "benchmark"):
         p = sub.add_parser(command)
         p.add_argument("--manifest", type=Path, required=True)
         p.add_argument("--output", type=Path, required=True)
-        p.add_argument("--domain", type=int, default=173)
+        if command in ("evaluate", "collect"):
+            p.add_argument("--domain", type=int, default=173)
+            p.add_argument("--sensor-delay-sec", type=float, choices=(0.0,), default=0.0)
+        else:
+            p.add_argument("--references", type=Path, required=True, help="collect output summary.json")
         if command in ("evaluate", "collect"):
             p.add_argument("--gains", type=float, nargs=3)
             p.add_argument("--fixed-result", type=Path)
@@ -461,6 +477,10 @@ def main(argv=None):
         if command == "optimize-lut":
             p.add_argument("--initial-lut", type=Path, required=True)
             p.add_argument("--samples", type=Path, required=True)
+        if command == "benchmark":
+            p.add_argument("--gains", type=float, nargs=3)
+            p.add_argument("--fixed-result", type=Path)
+            p.add_argument("--lut", type=Path)
     p = sub.add_parser("operating-report")
     p.add_argument("--input", type=Path, nargs="+", required=True)
     p.add_argument("--output", type=Path, required=True)
@@ -482,20 +502,29 @@ def main(argv=None):
     p.add_argument("--fixed-result", type=Path)
     p.add_argument("--lut", type=Path)
     args = parser.parse_args(argv)
-    if args.command in ("evaluate", "collect", "optimize-fixed", "optimize-lut"):
+    if args.command in ("evaluate", "collect", "optimize-fixed", "optimize-lut", "benchmark"):
         config = load_manifest(args.manifest)
-        if not 0 <= args.domain <= 232:
+        if hasattr(args, "domain") and not 0 <= args.domain <= 232:
             raise ValueError("ROS domain must be in [0,232]")
         if args.command.startswith("optimize"):
-            optimize(config, args.output, args.domain, getattr(args, "initial_lut", None), getattr(args, "samples", None))
+            optimize(config, args.output, args.references, getattr(args, "initial_lut", None), getattr(args, "samples", None))
+        elif args.command == "benchmark":
+            datasets, _ = load_references(args.references, config)
+            gains = args.gains or (read_json_if_exists(args.fixed_result)["gains"] if args.fixed_result else config["optimizer"]["initial_gains"])
+            result = evaluate_offline(config, datasets, validate_gains(gains), args.output,
+                                      load_lut(args.lut) if args.lut else None, save_history=True)
+            return 0 if result["success"] else 1
         else:
-            gains = args.gains or (read_json_if_exists(args.fixed_result)["gains"] if args.fixed_result else None)
+            gains = args.gains or (read_json_if_exists(args.fixed_result)["gains"] if args.fixed_result else
+                                   config["optimizer"]["initial_gains"] if args.command == "collect" else None)
             if gains is None:
                 raise ValueError("provide --gains or --fixed-result")
             if (args.policy == "lut") != bool(args.lut):
                 raise ValueError("LUT evaluations require --policy lut --lut FILE; fixed cannot load LUT")
+            if args.command == "collect" and (args.role != "tuning" or args.policy != "fixed"):
+                raise ValueError("collect uses fixed nominal gains on tuning cases only")
             result = evaluate(config, validate_gains(gains), args.output, args.policy, args.domain, args.role, args.lut)
-            if args.command == "collect":
+            if args.command == "collect" and result["success"]:
                 paths = [Path(r["tracking_csv"]) for r in result["results"] if r["success"]]
                 operating_report(paths, args.output / "operating", config["recorder"]["quantiles"], config["recorder"]["histogram_bins"])
             if not result["success"]:

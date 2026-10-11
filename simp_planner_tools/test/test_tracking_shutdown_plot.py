@@ -26,7 +26,7 @@ def test_shutdown_figures_use_controller_snapshot(tmp_path):
     assert math.isclose(row[0], 0.014)
     assert row[1:10] == (0.04, 0.0, 0.0, 0.04, 0.0, 0.0, 0.0, 0.0, 0.0)
     assert row[10] == row[13] == row[16] == 2.0
-    assert row[19:] == (1014000000, 1000000000, 1020000000, 1)
+    assert row[19:] == (1014000000, 1000000000, 1020000000, 1, 0)
     # Keep the controller's error verbatim; never select/recompute it in the plotter.
     message.ex, message.ey, message.etheta = 0.1, -0.2, 0.3
     assert sample_row(message, 1000000000)[7:10] == (0.1, -0.2, 0.3)
@@ -35,7 +35,8 @@ def test_shutdown_figures_use_controller_snapshot(tmp_path):
     invalid = sample_row(message, 1000000000)
     assert all(math.isnan(value) for value in invalid[1:16])
     assert invalid[16:19] == (0.0, 0.0, 0.0)
-    assert invalid[-1] == 0
+    assert invalid[-2] == 0
+    assert math.isnan(invalid[-1])
     figures = create_figures(np.asarray([row, invalid]))
     assert [len(figure.axes) for figure in figures] == [3, 6, 3]
     np.testing.assert_allclose(figures[0].axes[0].lines[0].get_ydata(), [0.0, np.nan])

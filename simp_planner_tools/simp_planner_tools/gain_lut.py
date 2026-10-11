@@ -71,15 +71,24 @@ def axis_weights(axis, value):
     return [(lo, 1 - fraction), (hi, fraction)]
 
 
+def interpolation_weights(axes, query):
+    """Clamped trilinear neighborhoods, shared by search and offline replay."""
+    sizes = [len(axes[name]) for name in AXIS_NAMES]
+    neighbors = [axis_weights(axes[name], value) for name, value in zip(AXIS_NAMES, query)]
+    return [((i * sizes[1] + j) * sizes[2] + k, wi * wj * wk)
+            for (i, wi), (j, wj), (k, wk) in itertools.product(*neighbors) if wi * wj * wk > 0]
+
+
+def lookup(axes, gains, query):
+    weights = interpolation_weights(axes, query)
+    return [sum(weight * gains[index][channel] for index, weight in weights) for channel in range(3)]
+
+
 def active_points(axes, samples_path):
     active = set()
-    sizes = [len(axes[name]) for name in AXIS_NAMES]
     with Path(samples_path).open() as file:
         for row in csv.DictReader(file):
-            neighbors = [axis_weights(axes[name], float(row[name])) for name in AXIS_NAMES]
-            for (i, wi), (j, wj), (k, wk) in itertools.product(*neighbors):
-                if wi * wj * wk > 0:
-                    active.add((i * sizes[1] + j) * sizes[2] + k)
+            active.update(index for index, _ in interpolation_weights(axes, [float(row[name]) for name in AXIS_NAMES]))
     if not active:
         raise ValueError("no active interpolation neighborhoods")
     return sorted(active)

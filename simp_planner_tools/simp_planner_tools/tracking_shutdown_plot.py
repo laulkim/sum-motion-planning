@@ -16,7 +16,7 @@ import numpy as np
 COLUMNS = (
     "time_s", "predicted_x", "predicted_y", "predicted_yaw", "xr", "yr", "yaw_r", "ex", "ey", "etheta",
     "vx", "vy", "omega", "vx_ref", "vy_ref", "omega_ref", "vx_cmd", "vy_cmd", "omega_cmd",
-    "control_stamp_ns", "odom_stamp_ns", "reference_stamp_ns", "valid",
+    "control_stamp_ns", "odom_stamp_ns", "reference_stamp_ns", "valid", "requested_mode",
 )
 
 
@@ -40,7 +40,8 @@ def sample_row(message, origin_ns):
             command.linear.x, command.linear.y, command.angular.z,
             stamp_ns(message.header.stamp),
             stamp_ns(message.odom_stamp) if message.valid else math.nan,
-            stamp_ns(message.reference_stamp) if message.valid else math.nan, int(message.valid))
+            stamp_ns(message.reference_stamp) if message.valid else math.nan, int(message.valid),
+            message.reference.requested_mode if message.valid else math.nan)
 
 
 def create_figures(data, predicted=True):
