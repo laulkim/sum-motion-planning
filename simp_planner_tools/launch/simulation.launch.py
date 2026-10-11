@@ -143,7 +143,7 @@ def _resolved_nodes(context):
             parameters=[{"command_frequency_hz": command_frequency_hz,
                          **{name: float(LaunchConfiguration(name).perform(context))
                             for name in ("kx", "ky", "ktheta")},
-                         "gain_lut_file": LaunchConfiguration("gain_lut_file").perform(context)}],
+                         "gain_lut_file": LaunchConfiguration("gain_lut_file")}],
         ),
         Node(
             package="simp_planner_tools",
@@ -231,10 +231,15 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("scenario", default_value="stadium"),
             DeclareLaunchArgument("experiment_mode", default_value="false",
                                   description="Record CSV without shutdown viewers or periodic debug plots."),
-            DeclareLaunchArgument("kx", default_value="1.0"),
-            DeclareLaunchArgument("ky", default_value="2.0"),
-            DeclareLaunchArgument("ktheta", default_value="1.0"),
-            DeclareLaunchArgument("gain_lut_file", default_value=""),
+            DeclareLaunchArgument("kx", default_value="3.844376788449189"),
+            DeclareLaunchArgument("ky", default_value="4.969394258453632"),
+            DeclareLaunchArgument("ktheta", default_value="4.956075837515453"),
+            DeclareLaunchArgument(
+                "gain_lut_file",
+                default_value=os.path.join(get_package_share_directory("simp_planner_tools"),
+                                           "experiments", "optimized_lut.csv"),
+                description="Validated optimized LUT; an empty value uses fixed gains.",
+            ),
             DeclareLaunchArgument(
                 "target_speed",
                 default_value="-1.0",
@@ -291,7 +296,7 @@ def generate_launch_description() -> LaunchDescription:
                 description="Auto-launch rviz2 with the bundled simp_planner.rviz config.",
             ),
             *[
-                DeclareLaunchArgument(name, default_value=str(default))
+                DeclareLaunchArgument(name, default_value=str(0.0 if name == "sensor_delay_sec" else default))
                 for name, default in RESPONSE_PARAMETER_DEFAULTS.items()
             ],
             DeclareLaunchArgument("sensor_noise_enabled", default_value="true"),

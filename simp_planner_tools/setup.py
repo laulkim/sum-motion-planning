@@ -14,7 +14,7 @@ setup(
         ("share/" + package_name, ["package.xml", "README_KR.md"]),
         (join("share", package_name, "maps"), glob("maps/*.csv")),
         (join("share", package_name, "launch"), glob("launch/*.launch.py")),
-        (join("share", package_name, "experiments"), glob("experiments/*.json")),
+        (join("share", package_name, "experiments"), glob("experiments/*.json") + glob("experiments/*.csv")),
         (join("share", package_name, "rviz"), glob("rviz/*.rviz")),
         (join("share", package_name, "meshes"), glob("meshes/*.dae")),
         (join("share", package_name, "HDMap", "HDMAP"), glob("../HDMap/HDMAP/*")),

@@ -63,8 +63,8 @@ def launch_command(config, case, gains, output, lut_file=None):
               "sensor_noise_seed": case["sensor_noise_seed"], "sensor_delay_sec": 0.0,
               "use_rviz": False, "experiment_mode": True, "debug_output_dir": str(Path(output).resolve()),
               **dict(zip(GAIN_NAMES, gains))}
-    if lut_file:
-        values["gain_lut_file"] = str(Path(lut_file).resolve())
+    # Fixed experiments must override the simulation launch's default LUT.
+    values["gain_lut_file"] = str(Path(lut_file).resolve()) if lut_file else '""'
     return ["ros2", "launch", "simp_planner_tools", "simulation.launch.py", *[
         f"{name}:={str(value).lower() if isinstance(value, bool) else value}" for name, value in values.items()]]
 
@@ -557,7 +557,7 @@ def main(argv=None):
             result = read_json_if_exists(args.fixed_result)
             if result["policy"] != "fixed" or result["sensor_delay_sec"] != 0:
                 raise ValueError("invalid fixed result")
-            print(" ".join(f"{n}:={v}" for n, v in zip(GAIN_NAMES, validate_gains(result["gains"]))) + " sensor_delay_sec:=0.0")
+            print(" ".join(f"{n}:={v}" for n, v in zip(GAIN_NAMES, validate_gains(result["gains"]))) + " gain_lut_file:='\"\"' sensor_delay_sec:=0.0")
     return 0
 
 

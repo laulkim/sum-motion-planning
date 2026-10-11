@@ -1,6 +1,11 @@
 # Ctrl+C 후 추종 그래프
 
 `simulation.launch.py`는 `tracking_shutdown_plot` 기록 노드도 실행합니다.
+LUT 브랜치에서는 `experiments/optimized_lut.csv`의 검증된 36개 격자점 LUT를 기본으로
+사용하며 `sensor_delay_sec` 기본값은 `0.0`입니다. 이 CSV는
+`research_offline_v1/lut_offline/optimized_lut.csv`와 동일한 결과로 ROS validation 7개를 통과했습니다.
+`gain_lut_file:='""'`로 LUT를 비우면 최적화된 fixed gain
+`kx=3.844376788449189`, `ky=4.969394258453632`, `ktheta=4.956075837515453`을 사용합니다.
 시뮬레이션을 실행한 뒤 Ctrl+C를 누르면 추종 오차, 상태·제어 입력, 월드프레임 오차의
 세 창만 표시합니다. 원본 CSV 기록과 spot-turn 요약·회전별 분석 CSV/PNG는 계속 저장하므로
 나중에 실제 odometry 기반 footprint overlay를 만들 수 있습니다. 추가 분석창은 표시하지 않습니다.

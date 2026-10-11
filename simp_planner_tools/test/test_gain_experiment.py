@@ -48,6 +48,11 @@ def test_manifest_and_seed_protocol(tmp_path):
     assert "sensor_noise_seed:=42" in command
     assert "sensor_noise_enabled:=true" in command
     assert "kx:=1" in command and "ky:=2" in command and "ktheta:=1" in command
+    assert 'gain_lut_file:=""' in command  # Fixed collection cannot inherit the default LUT.
+    lut = tmp_path / "optimized_lut.csv"
+    scheduled = launch_command(config, case, [1, 2, 1], tmp_path, lut)
+    assert f"gain_lut_file:={lut.resolve()}" in scheduled
+    assert 'gain_lut_file:=""' not in scheduled
     assert not any("initial_" in arg for arg in command)
     assert "sensor_noise_seed:=42" in launch_command(config, case, [2, 3, 4], tmp_path)
     config["settings"]["sensor_delay_sec"] = 0.1
