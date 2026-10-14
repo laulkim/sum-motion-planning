@@ -1,4 +1,4 @@
-"""종료 후 추종 오차와 상태/입력을 두 Matplotlib 창으로 표시한다."""
+"""종료 후 추종 오차, 상태/입력, yaw-rate projection을 Matplotlib 창으로 표시한다."""
 from __future__ import annotations
 
 import csv
@@ -34,6 +34,13 @@ VX_PRIORITY = "MINIMUM_VY"        # body heading follows the motion, vy kept sma
 ALLOCATION_STATES = {"NONE": 0, VY_PRIORITY: 1, VX_PRIORITY: 2}
 ALLOCATION_COLUMNS = ("start_ns", "allocation_profile")
 ALLOCATION_FILE = "allocation.csv"
+# The planner's yaw-rate projection at the reference point each control cycle
+# used, one row per tracking.csv row (TrackingDiagnosticsPoint fields).
+PROJECTION_COLUMNS = ("control_stamp_ns", "projection_yaw_rate_delta", "projection_score",
+                      "projection_yaw_rate_limit")
+PROJECTION_FILE = "projection.csv"
+# Diagnostics kept for the lookup: a few planning cycles of trajectories.
+PROJECTION_HISTORY = 32
 
 
 def stamp_ns(stamp):
@@ -103,6 +110,25 @@ def allocation_profiles(control_ns, events):
     index = np.searchsorted(np.asarray(starts, dtype=float), np.asarray(control_ns, dtype=float),
                             side="right") - 1
     return [profiles[i] if i >= 0 else None for i in index]
+
+
+def projection_at(diagnostics, reference_ns, period_ns):
+    """Projection values of the diagnostics point at `reference_ns`.
+
+    `diagnostics` maps a tracking trajectory's stamp to per-point value lists,
+    one list per PROJECTION_COLUMNS value column. The trajectory in effect is
+    the newest one stamped at or before the reference time; points are one
+    command period apart. NaN when none covers it."""
+    missing = (math.nan,) * (len(PROJECTION_COLUMNS) - 1)
+    stamps = [stamp for stamp in diagnostics if stamp <= reference_ns]
+    if not stamps:
+        return missing
+    stamp = max(stamps)
+    columns = diagnostics[stamp]
+    index = round((reference_ns - stamp) / period_ns)
+    if not 0 <= index < len(columns[0]):
+        return missing
+    return tuple(values[index] for values in columns)
 
 
 def sample_row(message, origin_ns):
@@ -201,6 +227,84 @@ def create_figures(data, predicted=True, allocation=None):
     return errors, states
 
 
+def create_projection_figure(data, projection):
+    """How much the planner's yaw-rate projection acted on the executed commands.
+
+    `data` are tracking.csv rows, `projection` the matching projection.csv rows."""
+    import matplotlib.pyplot as plt
+
+    data = np.atleast_2d(data)
+    projection = np.atleast_2d(projection)
+    time = data[:, 0]
+    deg = 180 / math.pi
+    commanded = data[:, 15] * deg
+    delta = projection[:, 1] * deg
+    score = projection[:, 2]
+    # Recordings before the allowed yaw rate was logged have no exceedance panel.
+    has_limit = projection.shape[1] > 3
+    figure, axes = plt.subplots(4 if has_limit else 3, 1, sharex=True,
+                                figsize=(12, 12 if has_limit else 9), layout="constrained")
+    figure.canvas.manager.set_window_title("Yaw-rate projection")
+    with np.errstate(invalid="ignore"):
+        active = np.abs(delta) > 1.0e-3
+        outside = score > 1.0 + 1.0e-6
+    known = np.isfinite(delta)
+    share = 100.0 * np.count_nonzero(active) / max(np.count_nonzero(known), 1)
+    summary = (f"Planner yaw-rate projection: active {share:.1f}% of recorded time, "
+               f"max |change| {np.nanmax(np.abs(delta), initial=0.0):.2f} deg/s, "
+               f"commands outside the vehicle set {np.count_nonzero(outside)} samples")
+    if has_limit:
+        # How far the commanded yaw rate goes past what the vehicle keeps at
+        # that slip angle; zero inside. An unprojected (spot-turn) command has
+        # an infinite limit and never exceeds.
+        limit = projection[:, 3] * deg
+        with np.errstate(invalid="ignore"):
+            exceedance = np.maximum(np.abs(commanded) - limit, 0.0)
+        summary += f"\nmax yaw-rate exceedance {np.nanmax(exceedance, initial=0.0):.2f} deg/s"
+    figure.suptitle(summary)
+
+    axes[0].plot(time, commanded + delta, color="0.6", label="without projection (reference + change)")
+    axes[0].plot(time, commanded, label="reference (projected)")
+    axes[0].set_ylabel("yaw rate [deg/s]")
+    axes[0].legend(loc="upper right")
+
+    axes[1].plot(time, delta, drawstyle="steps-post")
+    axes[1].axhline(0, color="black", linewidth=0.6)
+    axes[1].set_ylabel("projection change\n(without - with) [deg/s]")
+
+    # A yaw rate at standstill scores infinity (the vehicle zeroes it): show it at the top.
+    axes[2].plot(time, np.clip(score, 0.0, 2.0), drawstyle="steps-post")
+    axes[2].axhline(1.0, color="black", linestyle="--", linewidth=1.0, label="vehicle limit")
+    axes[2].set_ylim(0.0, 2.05)
+    axes[2].set_ylabel("|gamma|/delta_max\n+ |r|/(kappa_max V)")
+    axes[2].legend(loc="upper right")
+    if has_limit:
+        axes[3].plot(time, exceedance, drawstyle="steps-post", color="tab:red")
+        axes[3].axhline(0, color="black", linewidth=0.6)
+        axes[3].set_ylabel("yaw-rate exceedance\n|r| - allowed [deg/s]")
+    axes[-1].set_xlabel("Elapsed time [s]")
+    for ax in axes:
+        ax.grid(True, alpha=0.3)
+        for start, end in _spans(time, active):
+            ax.axvspan(start, end, color="tab:orange", alpha=0.12, linewidth=0)
+    return figure
+
+
+def _spans(time, mask):
+    """(start, end) times of consecutive True runs in `mask`."""
+    spans = []
+    start = None
+    for t, on in zip(time, mask):
+        if on and start is None:
+            start = t
+        elif not on and start is not None:
+            spans.append((start, t))
+            start = None
+    if start is not None:
+        spans.append((start, time[-1]))
+    return spans
+
+
 def show_recording(path):
     import matplotlib
 
@@ -216,9 +320,16 @@ def show_recording(path):
         with allocation_path.open() as file:
             allocation = [(int(row["start_ns"]), row["allocation_profile"])
                           for row in csv.DictReader(file)]
-    figures = create_figures(np.loadtxt(path, delimiter=",", skiprows=1), predicted=predicted,
-                             allocation=allocation)
-    for figure, name in zip(figures, ("tracking_errors.png", "tracking_states_inputs.png")):
+    data = np.loadtxt(path, delimiter=",", skiprows=1)
+    figures = create_figures(data, predicted=predicted, allocation=allocation)
+    names = ["tracking_errors.png", "tracking_states_inputs.png"]
+    projection_path = path.parent / PROJECTION_FILE
+    if projection_path.exists():
+        projection = np.loadtxt(projection_path, delimiter=",", skiprows=1, ndmin=2)
+        if len(projection) == len(np.atleast_2d(data)):
+            figures = (*figures, create_projection_figure(data, projection))
+            names.append("tracking_projection.png")
+    for figure, name in zip(figures, names):
         figure.savefig(path.parent / name, dpi=140)
     if interactive:
         plt.show()
@@ -234,12 +345,14 @@ def main(args=None):
     from rclpy.executors import ExternalShutdownException
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
-    from simp_planner_msgs.msg import TrackingControl
+    from simp_planner_msgs.msg import TrackingControl, TrackingDiagnostics
     from std_msgs.msg import String
 
     rclpy.init(args=args)
     node = Node("tracking_shutdown_plot")
     directory = Path(node.declare_parameter("output_dir", "simp_planner_debug").value).expanduser()
+    # Must match the planner's: tracking trajectory points are one command period apart.
+    period_ns = round(1.0e9 / float(node.declare_parameter("command_frequency_hz", 100.0).value))
     directory = directory / ("tracking_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "tracking.csv"
@@ -249,6 +362,10 @@ def main(args=None):
     allocation_file = (directory / ALLOCATION_FILE).open("w", newline="")
     allocation_writer = csv.writer(allocation_file)
     allocation_writer.writerow(ALLOCATION_COLUMNS)
+    projection_file = (directory / PROJECTION_FILE).open("w", newline="")
+    projection_writer = csv.writer(projection_file)
+    projection_writer.writerow(PROJECTION_COLUMNS)
+    diagnostics = {}
     origin_ns = None
     count = 0
 
@@ -257,7 +374,18 @@ def main(args=None):
         if origin_ns is None:
             origin_ns = stamp_ns(message.header.stamp)
         writer.writerow(sample_row(message, origin_ns))
+        values = (projection_at(diagnostics, stamp_ns(message.reference_stamp), period_ns)
+                  if message.valid else (math.nan,) * (len(PROJECTION_COLUMNS) - 1))
+        projection_writer.writerow((stamp_ns(message.header.stamp), *values))
         count += 1
+
+    def receive_diagnostics(message):
+        diagnostics[stamp_ns(message.header.stamp)] = (
+            [point.projection_yaw_rate_delta for point in message.points],
+            [point.projection_score for point in message.points],
+            [point.projection_yaw_rate_limit for point in message.points])
+        while len(diagnostics) > PROJECTION_HISTORY:
+            diagnostics.pop(min(diagnostics))
 
     def receive_status(message):
         event = allocation_event(message.data)
@@ -269,6 +397,10 @@ def main(args=None):
     # only the latest status, so keep a queue.
     node.create_subscription(String, "/planner/status", receive_status,
                              QoSProfile(depth=50, reliability=ReliabilityPolicy.RELIABLE))
+    # Every trajectory's diagnostics are needed for the lookup, so keep a queue.
+    node.create_subscription(TrackingDiagnostics, "/planner/tracking_diagnostics",
+                             receive_diagnostics,
+                             QoSProfile(depth=50, reliability=ReliabilityPolicy.RELIABLE))
     node.get_logger().info(f"Ctrl+C 후 추종 플롯 표시 / 기록: {path}")
     try:
         rclpy.spin(node)
@@ -279,6 +411,7 @@ def main(args=None):
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         file.close()
         allocation_file.close()
+        projection_file.close()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

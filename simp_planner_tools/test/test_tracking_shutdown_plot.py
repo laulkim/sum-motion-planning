@@ -8,8 +8,9 @@ import numpy as np
 from simp_planner_msgs.msg import TrackingControl, TrackingTrajectoryPoint
 
 from simp_planner_tools.tracking_shutdown_plot import (
-    ALLOCATION_COLUMNS, ALLOCATION_FILE, COLUMNS, VX_PRIORITY, VY_PRIORITY, allocation_event,
-    allocation_profiles, create_figures, motion_heading, motion_heading_rate, sample_row,
+    ALLOCATION_COLUMNS, ALLOCATION_FILE, COLUMNS, PROJECTION_COLUMNS, PROJECTION_FILE,
+    VX_PRIORITY, VY_PRIORITY, allocation_event, allocation_profiles, create_figures,
+    create_projection_figure, motion_heading, motion_heading_rate, projection_at, sample_row,
     show_recording)
 
 
@@ -129,3 +130,54 @@ def test_allocation_state_graph():
     np.testing.assert_allclose(state.lines[0].get_ydata(), [np.nan, 1, 2, 0, 1])
     for figure in figures:
         plt.close(figure)
+
+
+def test_projection_lookup_uses_trajectory_in_effect():
+    period = 10_000_000
+    diagnostics = {
+        1_000_000_000: ([0.1, 0.2, 0.3], [0.5, 0.6, 0.7]),
+        1_010_000_000: ([0.9, 0.8], [1.1, 1.2]),
+    }
+    # Before the newer trajectory's stamp the older one is in effect.
+    assert projection_at(diagnostics, 1_000_000_000, period) == (0.1, 0.5)
+    # From its stamp onward the newer one replaces it.
+    assert projection_at(diagnostics, 1_020_000_000, period) == (0.8, 1.2)
+    assert all(math.isnan(v) for v in projection_at(diagnostics, 990_000_000, period))
+    assert all(math.isnan(v) for v in projection_at(diagnostics, 1_050_000_000, period))
+
+
+def test_projection_figure_is_saved_with_the_recording(tmp_path, monkeypatch):
+    monkeypatch.delenv("DISPLAY", raising=False)
+    message = TrackingControl(valid=True)
+    message.reference = TrackingTrajectoryPoint(vx=3.0, yaw_rate=0.1)
+    path = tmp_path / "tracking.csv"
+    rows = []
+    for k in range(3):
+        message.header.stamp.nanosec = 10_000_000 * k
+        rows.append(sample_row(message, 0))
+    with path.open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(COLUMNS)
+        writer.writerows(rows)
+    # Allowed |yaw rate| per sample: above, below (exceeded by 0.02 rad/s) and
+    # an unprojected spot-turn command (infinite limit).
+    projection = [(10_000_000 * k, 0.02 * k, 0.9 + 0.1 * k, limit)
+                  for k, limit in enumerate((0.2, 0.08, math.inf))]
+    with (tmp_path / PROJECTION_FILE).open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(PROJECTION_COLUMNS)
+        writer.writerows(projection)
+    figure = create_projection_figure(np.asarray(rows), np.asarray(projection))
+    deg = 180 / math.pi
+    np.testing.assert_allclose(figure.axes[1].lines[0].get_ydata(), [0.0, 0.02 * deg, 0.04 * deg])
+    np.testing.assert_allclose(figure.axes[0].lines[1].get_ydata(), [0.1 * deg] * 3)
+    np.testing.assert_allclose(figure.axes[3].lines[0].get_ydata(), [0.0, 0.02 * deg, 0.0],
+                               atol=1e-12)
+    plt.close(figure)
+    # Recordings without the allowed yaw rate keep the three-panel figure.
+    legacy = create_projection_figure(np.asarray(rows), np.asarray(projection)[:, :3])
+    assert len(legacy.axes) == 3
+    plt.close(legacy)
+    show_recording(path)
+    assert (tmp_path / "tracking_projection.png").stat().st_size > 0
+    assert not plt.get_fignums()

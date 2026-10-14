@@ -103,6 +103,8 @@ struct BodyCommand {
   std::size_t yaw_index{0};
   std::size_t action_index{0};
   double trajectory_time{0.0};
+  // Yaw rate the allocator's vehicle projection took away from this command.
+  double projection_yaw_rate_delta{0.0};
 };
 
 BodyCommand sample_body_command(const AllocationResult& allocation,

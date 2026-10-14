@@ -3413,6 +3413,70 @@ PlanResult PathVelocityPlanner::plan(const PlannerState& state,
   return chosen;
 }
 
+namespace {
+
+// Below this speed the vehicle zeroes the yaw rate instead of projecting it.
+constexpr double kProjectionStopSpeed = 1.0e-6;
+
+struct YawRateInterval {
+  double low;
+  double high;
+};
+
+std::optional<YawRateInterval> intersect(YawRateInterval a, YawRateInterval b) {
+  const YawRateInterval both{std::max(a.low, b.low), std::min(a.high, b.high)};
+  if (both.low > both.high) return std::nullopt;
+  return both;
+}
+
+// Yaw rates r with |gamma| / delta_max + |r| / (kappa_max V) <= 1 at a fixed
+// gamma. Past the set's tip (|gamma| >= delta_max, or V = 0) only r = 0 is left.
+YawRateInterval projection_yaw_rate_bound(double gamma, double speed,
+                                          double kappa_max, double delta_max) {
+  const double bound = kappa_max * std::abs(speed)
+      * std::max(0.0, 1.0 - std::abs(gamma) / delta_max);
+  return {-bound, bound};
+}
+
+// Yaw rates that bring the slip-angle offset gamma to rest before |gamma|
+// passes `limit`, decelerating it at most `deceleration`: beta_dot is bounded
+// by +-sqrt(2 a (limit -+ gamma)), which turns into a return once past it.
+YawRateInterval slip_braking_interval(double gamma, double chi_dot, double limit,
+                                      double deceleration) {
+  const auto allowed = [deceleration](double room) {
+    return std::copysign(std::sqrt(2.0 * deceleration * std::abs(room)), room);
+  };
+  return {chi_dot - allowed(limit - gamma), chi_dot + allowed(limit + gamma)};
+}
+
+}  // namespace
+
+double yaw_rate_projection_score(double vx, double vy, double yaw_rate, DriveMode mode,
+                                 const AllocationLimits& limits) {
+  const auto mode_index = static_cast<std::size_t>(mode);
+  if (mode_index >= limits.projection_curvature_max.size()) return 0.0;
+  const double speed = std::hypot(vx, vy);
+  if (speed <= kProjectionStopSpeed) {
+    return std::abs(yaw_rate) > 1.0e-9 ? std::numeric_limits<double>::infinity() : 0.0;
+  }
+  const double gamma = wrap_angle(std::atan2(vy, vx) - drive_mode_heading_offset(mode));
+  return std::abs(gamma) / limits.projection_heading_deviation_max[mode_index]
+      + std::abs(yaw_rate) / (limits.projection_curvature_max[mode_index] * speed);
+}
+
+double yaw_rate_projection_limit(double vx, double vy, DriveMode mode,
+                                 const AllocationLimits& limits) {
+  const auto mode_index = static_cast<std::size_t>(mode);
+  if (mode_index >= limits.projection_curvature_max.size()) {
+    return std::numeric_limits<double>::infinity();
+  }
+  const double speed = std::hypot(vx, vy);
+  if (speed <= kProjectionStopSpeed) return 0.0;
+  const double gamma = wrap_angle(std::atan2(vy, vx) - drive_mode_heading_offset(mode));
+  return projection_yaw_rate_bound(gamma, speed, limits.projection_curvature_max[mode_index],
+                                   limits.projection_heading_deviation_max[mode_index]).high;
+}
+
 AllocatorInitialState AllocationResult::state_at(std::size_t index) const {
   if (beta.empty()) return {};
   index = std::min(index, beta.size() - 1);
@@ -3430,6 +3494,23 @@ AllocationResult allocate_trajectory(
       || trajectory.chi.size() != n || trajectory.speed.size() != n
       || trajectory.acceleration.size() != n || trajectory.drive_mode.size() != n) {
     throw std::invalid_argument("invalid PlannerMotionTrajectory");
+  }
+  if (limits.yaw_rate_projection) {
+    for (std::size_t m = 0; m < limits.projection_curvature_max.size(); ++m) {
+      if (!(limits.projection_curvature_max[m] > 0.0)
+          || !std::isfinite(limits.projection_curvature_max[m])
+          || !(limits.projection_heading_deviation_max[m] > 0.0)
+          || !std::isfinite(limits.projection_heading_deviation_max[m])) {
+        throw std::invalid_argument("yaw-rate projection limits must be finite and positive");
+      }
+    }
+    if (!(limits.projection_slip_margin >= 0.0) || !(limits.projection_slip_deceleration > 0.0)
+        || !(limits.projection_preview_time >= 0.0)
+        || !std::isfinite(limits.projection_slip_margin)
+        || !std::isfinite(limits.projection_slip_deceleration)
+        || !std::isfinite(limits.projection_preview_time)) {
+      throw std::invalid_argument("invalid yaw-rate projection slip settings");
+    }
   }
   AllocationResult result;
   result.trajectory = trajectory;
@@ -3449,6 +3530,8 @@ AllocationResult allocate_trajectory(
   result.vx_jerk.assign(n, 0.0);
   result.vy_jerk.assign(n, 0.0);
   result.fallback_used.assign(n, 0);
+  result.projection_yaw_rate_delta.assign(n, 0.0);
+  result.projection_score.assign(n, 0.0);
   result.speed_reconstruction_error.assign(n, 0.0);
   result.heading_relation_error.assign(n, 0.0);
   result.world_velocity_identity_error.assign(n, 0.0);
@@ -3457,6 +3540,28 @@ AllocationResult allocate_trajectory(
   for (std::size_t i = 0; i < n; ++i) raw_center[i] = drive_mode_heading_offset(trajectory.drive_mode[i]);
   result.beta_center = unwrap_angles(raw_center);
   const auto chi = unwrap_angles(trajectory.chi);
+  // Largest slip-angle offset the projection lets the body hold at each step
+  // (see AllocationLimits), the tightest over the preview time ahead.
+  std::vector<double> slip_limit(n, std::numeric_limits<double>::infinity());
+  if (limits.yaw_rate_projection) {
+    std::vector<double> hold(n, std::numeric_limits<double>::infinity());
+    for (std::size_t i = 0; i < n; ++i) {
+      const auto m = static_cast<std::size_t>(trajectory.drive_mode[i]);
+      if (m >= limits.projection_curvature_max.size()) continue;
+      const double path_curvature = trajectory.kappa.size() == n
+          ? trajectory.kappa[i]
+          : trajectory.motion_heading_rate[i] / std::max(std::abs(trajectory.speed[i]), 1.0e-3);
+      hold[i] = std::max(0.0, limits.projection_heading_deviation_max[m]
+          * (1.0 - std::abs(path_curvature) / limits.projection_curvature_max[m])
+          - limits.projection_slip_margin);
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+      for (std::size_t j = i; j < n
+           && trajectory.t[j] - trajectory.t[i] <= limits.projection_preview_time + 1.0e-9; ++j) {
+        slip_limit[i] = std::min(slip_limit[i], hold[j]);
+      }
+    }
+  }
   result.beta[0] = initial_state ? initial_state->beta : result.beta_center[0];
   double previous_beta_rate = initial_state ? initial_state->beta_rate : 0.0;
   double previous_yaw_rate = initial_state ? initial_state->yaw_rate : 0.0;
@@ -3494,33 +3599,77 @@ AllocationResult allocate_trajectory(
         previous_yaw_acceleration + limits.yaw_jerk_max * dt);
     low = std::max(low, previous_yaw_rate + acceleration_low * dt);
     high = std::min(high, previous_yaw_rate + acceleration_high * dt);
-    double yaw_rate = 0.0;
-    if (next_mode != mode) {
-      yaw_rate = clamp_value(0.0, low, high);
-    } else {
+    // The vehicle projection, when on: this command (beta[k], r) must lie in
+    // the feasible set, and the slip-angle offset must stay where the body can
+    // still yaw at the path rate. Only r is chosen here, so the motion is
+    // unchanged.
+    const bool projected = limits.yaw_rate_projection
+        && mode_index < limits.projection_curvature_max.size();
+    const double kappa_max = projected ? limits.projection_curvature_max[mode_index] : 0.0;
+    const double delta_max = projected ? limits.projection_heading_deviation_max[mode_index] : 0.0;
+    const auto choose_yaw_rate = [&](bool project, bool& fallback) {
+      double hard_low = low;
+      double hard_high = high;
+      std::optional<YawRateInterval> slip_braking;
+      if (project) {
+        // The vehicle clips the command itself, so this bound outranks every
+        // limit below but the yaw dynamics; past those it stays as close as
+        // they allow.
+        const auto bound = projection_yaw_rate_bound(
+            result.beta[k] - result.beta_center[k], trajectory.speed[k], kappa_max, delta_max);
+        if (const auto both = intersect({hard_low, hard_high}, bound)) {
+          hard_low = both->low;
+          hard_high = both->high;
+        } else if (bound.high < hard_low) {
+          hard_high = hard_low;
+        } else {
+          hard_low = hard_high;
+        }
+        slip_braking = slip_braking_interval(
+            result.beta[k] - result.beta_center[k], chi_dot, slip_limit[k],
+            limits.projection_slip_deceleration);
+      }
+      if (next_mode != mode) return clamp_value(0.0, hard_low, hard_high);
       const double beta_error = result.beta[k] - result.beta_center[k];
       const double desired_yaw_rate = speed_activation
           * (alpha * chi_dot + beta_gain * beta_error);
-      double core_low = std::max(low, chi_dot - limits.beta_rate_max);
-      double core_high = std::min(high, chi_dot + limits.beta_rate_max);
+      double core_low = std::max(hard_low, chi_dot - limits.beta_rate_max);
+      double core_high = std::min(hard_high, chi_dot + limits.beta_rate_max);
       const double maximum_beta_rate_change = limits.beta_accel_max * dt;
       core_low = std::max(core_low, chi_dot - (previous_beta_rate + maximum_beta_rate_change));
       core_high = std::min(core_high, chi_dot - (previous_beta_rate - maximum_beta_rate_change));
       if (core_low > core_high) {
-        result.fallback_used[k] = 1;
-        yaw_rate = clamp_value(desired_yaw_rate, low, high);
-      } else {
-        const double beta_low = result.beta_center[k + 1] - limits.beta_max_deviation[next_index];
-        const double beta_high = result.beta_center[k + 1] + limits.beta_max_deviation[next_index];
-        const double envelope_low = std::max(core_low,
-            (result.beta[k] + chi_dot * dt - beta_high) / dt);
-        const double envelope_high = std::min(core_high,
-            (result.beta[k] + chi_dot * dt - beta_low) / dt);
-        yaw_rate = envelope_low <= envelope_high
-            ? clamp_value(desired_yaw_rate, envelope_low, envelope_high)
-            : clamp_value(desired_yaw_rate, core_low, core_high);
+        fallback = true;
+        return clamp_value(desired_yaw_rate, hard_low, hard_high);
       }
+      const YawRateInterval core{core_low, core_high};
+      const double beta_low = result.beta_center[k + 1] - limits.beta_max_deviation[next_index];
+      const double beta_high = result.beta_center[k + 1] + limits.beta_max_deviation[next_index];
+      const YawRateInterval envelope{(result.beta[k] + chi_dot * dt - beta_high) / dt,
+                                     (result.beta[k] + chi_dot * dt - beta_low) / dt};
+      // Envelopes are dropped when they cannot be met, the projection's last.
+      std::optional<YawRateInterval> chosen;
+      if (slip_braking) {
+        if (const auto with_envelope = intersect(core, envelope)) {
+          chosen = intersect(*with_envelope, *slip_braking);
+        }
+        if (!chosen) chosen = intersect(core, *slip_braking);
+      }
+      if (!chosen) chosen = intersect(core, envelope);
+      if (!chosen) chosen = core;
+      return clamp_value(desired_yaw_rate, chosen->low, chosen->high);
+    };
+    bool fallback = false;
+    const double yaw_rate = choose_yaw_rate(projected, fallback);
+    if (fallback) result.fallback_used[k] = 1;
+    if (projected) {
+      bool unprojected_fallback = false;
+      result.projection_yaw_rate_delta[k] =
+          choose_yaw_rate(false, unprojected_fallback) - yaw_rate;
     }
+    result.projection_score[k] = yaw_rate_projection_score(
+        trajectory.speed[k] * std::cos(result.beta[k]),
+        trajectory.speed[k] * std::sin(result.beta[k]), yaw_rate, mode, limits);
     const double beta_rate = chi_dot - yaw_rate;
     result.beta_rate[k] = beta_rate;
     result.yaw_rate[k] = yaw_rate;
@@ -3538,6 +3687,11 @@ AllocationResult allocate_trajectory(
   result.yaw_acceleration.back() = result.yaw_acceleration[n - 2];
   result.yaw_jerk.back() = result.yaw_jerk[n - 2];
   result.beta_desired.back() = result.beta_desired[n - 2];
+  result.projection_yaw_rate_delta.back() = result.projection_yaw_rate_delta[n - 2];
+  result.projection_score.back() = yaw_rate_projection_score(
+      trajectory.speed.back() * std::cos(result.beta.back()),
+      trajectory.speed.back() * std::sin(result.beta.back()), result.yaw_rate.back(),
+      trajectory.drive_mode.back(), limits);
   for (std::size_t i = 0; i < n; ++i) {
     result.psi[i] = chi[i] - result.beta[i];
     const double cos_beta = std::cos(result.beta[i]);
@@ -3590,8 +3744,9 @@ const char* allocation_profile_name(AllocationProfile profile) {
   return "UNKNOWN";
 }
 
-AllocationLimits allocation_limits_for_profile(AllocationProfile profile) {
-  AllocationLimits limits;
+AllocationLimits allocation_limits_for_profile(AllocationProfile profile,
+                                               const AllocationLimits& base) {
+  AllocationLimits limits = base;
   switch (profile) {
     case AllocationProfile::LateralPriority:
       break;
@@ -3694,16 +3849,18 @@ AllocationSelectionResult allocate_with_oriented_collision_search(
     const VehicleConfig& vehicle,
     const CostConfig& cost,
     std::optional<AllocatorInitialState> initial_state,
-    const OrientedFootprintConfig& footprint) {
+    const OrientedFootprintConfig& footprint,
+    const AllocationLimits& base_limits) {
   ++g_planning_call_counts.allocation;
   ScopedBlockTimer allocation_block_timer(g_planning_block_timings.allocation_ms);
   const bool crab_mode = std::any_of(
       trajectory.drive_mode.begin(), trajectory.drive_mode.end(),
       [](DriveMode mode) { return mode == DriveMode::Left || mode == DriveMode::Right; });
   // Evaluate the nominal lateral-priority allocation first.  Only when its
-  // complete four-second trajectory collides, retry the same motion trajectory
-  // once with the minimum-vy profile.  Spatial replanning is intentionally
-  // left to the caller after both profiles fail.
+  // complete trajectory collides, retry the same motion trajectory once with
+  // the minimum-vy profile.  The yaw-rate projection clamps each profile's
+  // commands but never switches profiles.  Spatial replanning is
+  // intentionally left to the caller after both profiles fail.
   const std::array<AllocationProfile, 2> profiles{{
       AllocationProfile::LateralPriority,
       AllocationProfile::MinimumVy}};
@@ -3712,7 +3869,7 @@ AllocationSelectionResult allocate_with_oriented_collision_search(
   for (const auto profile : profiles) {
     if (crab_mode && profile != AllocationProfile::LateralPriority) break;
     auto allocation = allocate_trajectory(
-        trajectory, allocation_limits_for_profile(profile), initial_state);
+        trajectory, allocation_limits_for_profile(profile, base_limits), initial_state);
     if (std::any_of(allocation.fallback_used.begin(), allocation.fallback_used.end(),
                     [](std::uint8_t value) { return value != 0; })) {
       continue;

@@ -617,7 +617,41 @@ struct AllocationLimits {
   double allocation_active_speed{0.30};
   double path_replay_tolerance{0.30};
   double psi_replay_tolerance{1.0 * kPi / 180.0};
+  // Vehicle feasible projection. The vehicle clips each command (vx, vy, r) to
+  // |gamma| / delta_max + |r| / (kappa_max V) <= 1, gamma being the motion
+  // direction's offset from the mode's nominal one (beta - beta_center) and
+  // V = hypot(vx, vy). The allocator keeps every command inside that set by
+  // choosing r alone, so the world velocity, and with it path tracking, is
+  // unchanged. These are vehicle limits: allocation profiles do not alter them.
+  bool yaw_rate_projection{true};
+  std::array<double, 4> projection_curvature_max{{0.20, 0.20, 0.20, 0.20}};
+  std::array<double, 4> projection_heading_deviation_max{{45.0 * kPi / 180.0,
+                                                          40.0 * kPi / 180.0,
+                                                          25.0 * kPi / 180.0,
+                                                          25.0 * kPi / 180.0}};
+  // Inside the set the body can only yaw at the path rate (r = chi_dot, so
+  // beta stops growing) while |gamma| <= delta_max (1 - |kappa_path| / kappa_max).
+  // Past that, the yaw-rate bound falls below chi_dot, beta keeps growing and
+  // the bound keeps shrinking. The allocator therefore keeps |gamma| this
+  // margin below it, over the tightest turn in the next preview time, bringing
+  // gamma to rest at no more than this deceleration.
+  double projection_slip_margin{2.0 * kPi / 180.0};
+  double projection_slip_deceleration{45.0 * kPi / 180.0};
+  double projection_preview_time{1.0};
 };
+
+// The vehicle's feasible-set test for one body-velocity command:
+// |gamma| / delta_max + |r| / (kappa_max V), <= 1 inside. At V <= 1e-6 the
+// vehicle zeroes r, so any yaw rate there scores infinity. The spot-turn mode
+// is not projected and scores zero.
+double yaw_rate_projection_score(double vx, double vy, double yaw_rate, DriveMode mode,
+                                 const AllocationLimits& limits);
+
+// Largest |yaw rate| the vehicle keeps for this body velocity:
+// kappa_max V (1 - |gamma| / delta_max), zero at V <= 1e-6, infinity for the
+// spot-turn mode, which is not projected.
+double yaw_rate_projection_limit(double vx, double vy, DriveMode mode,
+                                 const AllocationLimits& limits);
 
 struct AllocationResult {
   PlannerMotionTrajectory trajectory;
@@ -637,6 +671,11 @@ struct AllocationResult {
   std::vector<double> vx_jerk;
   std::vector<double> vy_jerk;
   std::vector<std::uint8_t> fallback_used;
+  // Yaw rate the vehicle projection took away at each step (the yaw rate the
+  // same step would get without it, minus the chosen one), and the chosen
+  // command's yaw_rate_projection_score.
+  std::vector<double> projection_yaw_rate_delta;
+  std::vector<double> projection_score;
   std::vector<std::uint8_t> mode_change_while_moving;
   std::vector<double> speed_reconstruction_error;
   std::vector<double> heading_relation_error;
@@ -654,7 +693,10 @@ struct AllocationSelectionResult {
   int candidates_evaluated{0};
 };
 
-AllocationLimits allocation_limits_for_profile(AllocationProfile profile);
+// `base` supplies everything the profile does not set, e.g. the vehicle's
+// projection limits.
+AllocationLimits allocation_limits_for_profile(AllocationProfile profile,
+                                               const AllocationLimits& base = AllocationLimits{});
 
 OrientedCollisionResult check_oriented_allocation_collision(
     const AllocationResult& allocation,
@@ -669,7 +711,8 @@ AllocationSelectionResult allocate_with_oriented_collision_search(
     const VehicleConfig& vehicle,
     const CostConfig& cost,
     std::optional<AllocatorInitialState> initial_state = std::nullopt,
-    const OrientedFootprintConfig& footprint = OrientedFootprintConfig{});
+    const OrientedFootprintConfig& footprint = OrientedFootprintConfig{},
+    const AllocationLimits& base_limits = AllocationLimits{});
 
 class PathVelocityPlanner {
  public:

@@ -226,6 +226,32 @@ class PlannerNodeCpp final : public rclcpp::Node {
         footprint_yaw_step_deg_ <= 0.0) {
       throw std::invalid_argument("invalid oriented footprint parameters");
     }
+    // The vehicle's feasible projection, per drive mode (forward, reverse,
+    // left, right). The allocator keeps every command inside it.
+    allocation_limits_.yaw_rate_projection =
+        declare_parameter<bool>("allocation_yaw_rate_projection", true);
+    std::vector<double> default_deviation_deg;
+    for (const double value : allocation_limits_.projection_heading_deviation_max) {
+      default_deviation_deg.push_back(value * 180.0 / kPi);
+    }
+    const auto curvature_max = declare_parameter<std::vector<double>>(
+        "allocation_projection_curvature_max",
+        std::vector<double>(allocation_limits_.projection_curvature_max.begin(),
+                            allocation_limits_.projection_curvature_max.end()));
+    const auto deviation_max_deg = declare_parameter<std::vector<double>>(
+        "allocation_projection_heading_deviation_max_deg", default_deviation_deg);
+    if (curvature_max.size() != allocation_limits_.projection_curvature_max.size() ||
+        deviation_max_deg.size() != allocation_limits_.projection_heading_deviation_max.size()) {
+      throw std::invalid_argument("projection limits must list the four drive modes");
+    }
+    for (std::size_t m = 0; m < curvature_max.size(); ++m) {
+      if (!(curvature_max[m] > 0.0) || !std::isfinite(curvature_max[m]) ||
+          !(deviation_max_deg[m] > 0.0) || !std::isfinite(deviation_max_deg[m])) {
+        throw std::invalid_argument("projection limits must be finite and positive");
+      }
+      allocation_limits_.projection_curvature_max[m] = curvature_max[m];
+      allocation_limits_.projection_heading_deviation_max[m] = deviation_max_deg[m] * kPi / 180.0;
+    }
 
     input_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     environment_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -1131,7 +1157,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
       if (!infeasible) {
         auto allocation_selection = allocate_with_oriented_collision_search(
             attempt_result.motion, *input.costmap, config_.vehicle, config_.cost,
-            handover.allocator_state, footprint_config);
+            handover.allocator_state, footprint_config, allocation_limits_);
         std::vector<int> excluded_candidate_ids;
         std::vector<double> excluded_lateral_targets;
         const int maximum_path_replans = std::max(
@@ -1156,7 +1182,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
           auto replanned_allocation = allocate_with_oriented_collision_search(
               replanned_result.motion, *input.costmap,
               config_.vehicle, config_.cost,
-              handover.allocator_state, footprint_config);
+              handover.allocator_state, footprint_config, allocation_limits_);
           attempt_result = std::move(replanned_result);
           allocation_selection = std::move(replanned_allocation);
         }
@@ -1511,6 +1537,11 @@ class PlannerNodeCpp final : public rclcpp::Node {
       out.beta = command.beta;
       out.beta_rate = command.beta_rate;
       out.yaw_acceleration = command.yaw_acceleration;
+      out.projection_yaw_rate_delta = command.projection_yaw_rate_delta;
+      out.projection_score = yaw_rate_projection_score(
+          command.vx, command.vy, command.yaw_rate, point.mode, allocation_limits_);
+      out.projection_yaw_rate_limit = yaw_rate_projection_limit(
+          command.vx, command.vy, point.mode, allocation_limits_);
     }
     diagnostics_pub_->publish(diagnostics);
   }
@@ -1788,6 +1819,7 @@ class PlannerNodeCpp final : public rclcpp::Node {
   std::uint64_t planner_mode_revision_{std::numeric_limits<std::uint64_t>::max()};
   DriveModeSupervisor mode_supervisor_;
   SpotTurnConfig spot_turn_config_;
+  AllocationLimits allocation_limits_;
   std::optional<double> pending_spot_turn_target_yaw_;
   std::optional<DriveMode> pending_spot_turn_mode_;
   // The pending turn is at the start of a new phase's path, where the vehicle

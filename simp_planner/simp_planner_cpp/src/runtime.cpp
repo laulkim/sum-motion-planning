@@ -181,10 +181,14 @@ BodyCommand sample_body_command(const AllocationResult& allocation,
   const double end_x = (1.0 - next_alpha) * tr.x[interval] + next_alpha * tr.x[interval + 1];
   const double end_y = (1.0 - next_alpha) * tr.y[interval] + next_alpha * tr.y[interval + 1];
   const double end_heading = wrap_interpolate(tr.chi[interval], tr.chi[interval + 1], next_alpha);
+  const double projection_yaw_rate_delta =
+      stopped || interval >= allocation.projection_yaw_rate_delta.size()
+      ? 0.0 : allocation.projection_yaw_rate_delta[interval];
   return {vx, vy, yaw_rate, speed, acceleration, jerk, heading_acceleration,
           motion_heading, kappa, motion_heading_rate, beta, beta_rate,
           yaw_acceleration, start_x, start_y, motion_heading, end_x, end_y,
-          end_heading, interval, interval, action_index, elapsed};
+          end_heading, interval, interval, action_index, elapsed,
+          projection_yaw_rate_delta};
 }
 
 std::int64_t align_time_ns(std::int64_t time_ns, double period_sec) {

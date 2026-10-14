@@ -134,7 +134,8 @@ def _resolved_nodes(context):
             executable="tracking_shutdown_plot",
             name="tracking_shutdown_plot",
             output="screen",
-            parameters=[{"output_dir": debug_output_dir}],
+            parameters=[{"output_dir": debug_output_dir,
+                         "command_frequency_hz": command_frequency_hz}],
         ),
         Node(
             package="simp_planner_tools",

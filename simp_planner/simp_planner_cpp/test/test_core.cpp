@@ -345,6 +345,97 @@ void test_handover_replan_continues_allocation() {
   }
 }
 
+void test_yaw_rate_projection_score() {
+  using simp_planner::DriveMode;
+  const simp_planner::AllocationLimits limits;
+  // Straight ahead at 3 m/s turning at 0.3 rad/s: |r| / (0.2 * 3) = 0.5.
+  require(std::abs(simp_planner::yaw_rate_projection_score(3.0, 0.0, 0.3, DriveMode::Forward,
+                                                           limits) - 0.5) < 1e-12,
+          "projection score yaw-rate share mismatch");
+  // Moving straight sideways is the left mode's nominal direction.
+  require(std::abs(simp_planner::yaw_rate_projection_score(0.0, 2.0, 0.0, DriveMode::Left,
+                                                           limits)) < 1e-12,
+          "projection score ignores the mode's nominal direction");
+  // 22.5 deg off the forward direction is half of the 45 deg limit.
+  const double gamma = 22.5 * simp_planner::kPi / 180.0;
+  require(std::abs(simp_planner::yaw_rate_projection_score(
+              std::cos(gamma), std::sin(gamma), 0.0, DriveMode::Forward, limits) - 0.5) < 1e-12,
+          "projection score slip-angle share mismatch");
+  require(std::isinf(simp_planner::yaw_rate_projection_score(0.0, 0.0, 0.1, DriveMode::Forward,
+                                                             limits)),
+          "a yaw rate at standstill must score as clipped");
+  require(simp_planner::yaw_rate_projection_score(0.0, 0.0, 0.3, DriveMode::SpotTurn,
+                                                  limits) == 0.0,
+          "the spot-turn mode is not projected");
+  // Allowed |yaw rate|: 0.2 * 3 = 0.6 straight ahead, half of it at 22.5 deg off.
+  require(std::abs(simp_planner::yaw_rate_projection_limit(3.0, 0.0, DriveMode::Forward,
+                                                           limits) - 0.6) < 1e-12,
+          "projection yaw-rate limit mismatch");
+  require(std::abs(simp_planner::yaw_rate_projection_limit(
+              3.0 * std::cos(gamma), 3.0 * std::sin(gamma), DriveMode::Forward, limits) - 0.3)
+              < 1e-12,
+          "projection yaw-rate limit ignores the slip angle");
+  require(simp_planner::yaw_rate_projection_limit(0.0, 0.0, DriveMode::Forward, limits) == 0.0,
+          "a standstill command keeps no yaw rate");
+  require(std::isinf(simp_planner::yaw_rate_projection_limit(0.0, 0.0, DriveMode::SpotTurn,
+                                                             limits)),
+          "the spot-turn mode is not projected");
+}
+
+// A sustained turn that the lateral-priority allocation takes with a large slip
+// angle reaches the vehicle's feasible set, and the yaw-rate projection clamps
+// it. The clamp never switches profiles: without a collision the plan stays
+// lateral priority, clamped. Only the yaw rate and slip angle change: the
+// motion itself is followed as before.
+void test_projection_clamps_without_switching_profiles() {
+  constexpr int count = 801;
+  constexpr double dt = 0.01;
+  constexpr double speed = 3.0;
+  simp_planner::PlannerMotionTrajectory trajectory;
+  double chi = 0.0;
+  for (int i = 0; i < count; ++i) {
+    const double t = static_cast<double>(i) * dt;
+    const double heading_rate = 0.3 * std::min(t, 1.0);
+    trajectory.t.push_back(t);
+    trajectory.x.push_back(0.0);
+    trajectory.y.push_back(0.0);
+    trajectory.chi.push_back(chi);
+    trajectory.kappa.push_back(heading_rate / speed);
+    trajectory.kappa_s.push_back(0.0);
+    trajectory.speed.push_back(speed);
+    trajectory.acceleration.push_back(0.0);
+    trajectory.longitudinal_jerk.push_back(0.0);
+    trajectory.motion_heading_rate.push_back(heading_rate);
+    trajectory.motion_heading_acceleration.push_back(t < 1.0 ? 0.3 : 0.0);
+    trajectory.drive_mode.push_back(simp_planner::DriveMode::Forward);
+    chi += heading_rate * dt;
+  }
+  const simp_planner::AllocationLimits limits;
+  const auto lateral = simp_planner::allocate_trajectory(
+      trajectory, simp_planner::allocation_limits_for_profile(
+          simp_planner::AllocationProfile::LateralPriority, limits));
+  require(*std::max_element(lateral.projection_score.begin(), lateral.projection_score.end())
+              > 1.0 + 1.0e-6,
+          "projection test turn stays inside the set under lateral priority");
+  require(std::any_of(lateral.projection_yaw_rate_delta.begin(),
+                      lateral.projection_yaw_rate_delta.end(),
+                      [](double delta) { return std::abs(delta) > 1.0e-6; }),
+          "the yaw-rate projection never clamped the lateral-priority allocation");
+
+  const auto selection = simp_planner::allocate_with_oriented_collision_search(
+      trajectory, empty_costmap(), simp_planner::VehicleConfig{}, simp_planner::CostConfig{},
+      std::nullopt, simp_planner::OrientedFootprintConfig{}, limits);
+  require(selection.profile == simp_planner::AllocationProfile::LateralPriority,
+          "the projection switched profiles without a collision");
+  require(selection.candidates_evaluated == 1, "a collision-free plan was retried");
+  const auto& allocation = selection.allocation;
+  for (std::size_t k = 0; k < allocation.yaw_rate.size(); ++k) {
+    require(allocation.heading_relation_error[k] <= 1.0e-12
+                && std::abs(allocation.speed_reconstruction_error[k]) <= 1.0e-12,
+            "allocation changed the motion");
+  }
+}
+
 
 void test_lateral_priority_allocation() {
   simp_planner::PlannerMotionTrajectory trajectory;
@@ -983,6 +1074,8 @@ int main() {
     test_stationary_hold();
     test_runtime_execution_and_handover();
     test_handover_replan_continues_allocation();
+    test_yaw_rate_projection_score();
+    test_projection_clamps_without_switching_profiles();
     test_lateral_priority_allocation();
     test_drive_mode_feedback_supervisor();
     test_terminal_monotonic_braking_with_positive_jerk();
